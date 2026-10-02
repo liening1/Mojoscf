@@ -1,0 +1,30 @@
+"""mojoscf: Mojo replacements for the Python glue in pyscf's SCF driver.
+
+>>> import mojoscf
+>>> mf = mojoscf.RHF(mol).run()
+
+See :mod:`mojoscf.scf` for details and :mod:`mojoscf.kernels` for the
+individual NumPy-facing kernels.
+"""
+from ._backend import BackendError, backend_info, blas_args, build_extension, set_blas, use_native
+from . import kernels
+from .diis import CDIIS
+from .scf import RHF, accelerate, is_supported, kernel
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "RHF",
+    "CDIIS",
+    "kernel",
+    "accelerate",
+    "is_supported",
+    "kernels",
+    "backend_info",
+    "blas_args",
+    "build_extension",
+    "set_blas",
+    "use_native",
+    "BackendError",
+    "__version__",
+]

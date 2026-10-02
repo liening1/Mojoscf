@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# Compiled Mojo artifacts (rebuilt from mojoscf/_mojo/ on demand)
+mojoscf/_mojoscf.so
+mojoscf/_mojoscf.building.so
+mojoscf/_mojoscf.hash
+__mojocache__/
+
+# pyscf scratch
+*.chk
+tmp*/

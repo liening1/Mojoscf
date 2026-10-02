@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies (including the Mojo compiler)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[build,test]"
+      - name: Build the Mojo kernels
+        run: python -m mojoscf.build --force
+      - name: Backend information
+        run: python -c "import mojoscf, json; print(json.dumps(mojoscf.backend_info(), indent=2))"
+      - name: Test
+        run: python -m pytest -q
+      - name: Smoke benchmark
+        run: python benchmarks/bench_scf.py --repeat 1 --cases 0,1

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mojoscf"
+version = "0.1.0"
+description = "Mojo replacements for the Python glue in pyscf's SCF driver"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "mojoscf developers" }]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pyscf>=2.4",
+]
+
+[project.optional-dependencies]
+# The Mojo compiler is needed to build the kernels (pulled in by `modular`).
+build = ["modular"]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["mojoscf"]
+
+[tool.setuptools.package-data]
+mojoscf = ["_mojo/*.mojo", "_mojoscf.so", "_mojoscf.hash"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
