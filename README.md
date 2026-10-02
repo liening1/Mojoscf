@@ -54,6 +54,36 @@ fixed ~10 µs for the NumPy-to-pointer conversion and the `dlopen` of the BLAS
 library and can then be slower than NumPy.  Use `mojoscf.RHF` /
 `mojoscf.accelerate` rather than the per-kernel API when speed matters.
 
+### Larger systems
+
+With density fitting the two-electron part is cheap enough to see the glue
+(`python benchmarks/bench_large.py`, 4 cores).  "Glue" is total time minus the
+time inside `mf.get_veff`, i.e. exactly the part mojoscf replaces; it is not
+affected by the run-to-run noise (about 10%) of the J/K code both drivers share.
+
+| system                           | nao | cycles | total pyscf [s] | total mojoscf [s] | speed-up | glue pyscf [s] | glue mojoscf [s] | glue speed-up | &#124;ΔE&#124; [Eh] |
+|----------------------------------|----:|-------:|----------:|----------:|--------:|--------:|--------:|--------:|--------:|
+| C10H22 / 6-31G*                  | 184 |    9/9 |       8.4 |       6.6 |   1.27x |    1.78 |    0.36 |   4.95x | 5e-13 |
+| C20H42 / 6-31G                   | 264 |    8/8 |      27.5 |      25.7 |   1.07x |    1.79 |    0.52 |   3.43x | 1e-11 |
+| (H2O)10 / cc-pVDZ                | 240 |  10/10 |      13.3 |      11.5 |   1.16x |    2.23 |    0.54 |   4.11x | 2e-12 |
+| C60 / STO-3G                     | 300 |    8/8 |      94.2 |      92.8 |   1.01x |    1.81 |    0.69 |   2.65x | 2e-10 |
+| (H2O)20 / cc-pVDZ                | 480 |  10/10 |      81.2 |      82.0 |   0.99x |    2.79 |    0.88 |   3.18x | 2e-11 |
+| C20H41 radical / 6-31G, UHF      | 262 |  13/13 |      60.2 |      55.3 |   1.09x |    4.74 |    0.76 |   6.26x | 2e-11 |
+| (H2O)10 cation / cc-pVDZ, UHF    | 240 |  19/19 |      33.2 |      28.3 |   1.18x |    6.84 |    0.91 |   7.48x | 7e-12 |
+
+The glue is 2.7 to 7.5 times faster at every size, but it is only 2 to 15% of
+these runs, so the total improves by 1.0 to 1.3 times: once the integral code
+dominates (C60, 20 waters) the end-to-end gain disappears into the noise.
+Speed-ups of 2 to 3 times overall need the glue to be a large fraction of the
+run, as in the small and medium systems above or with cheaper two-electron
+methods.
+
+Two things in this table were found by running these systems, not the small
+ones, and are fixed: the density handed to `get_veff` must carry pyscf's
+`mo_coeff`/`mo_occ` tags (density fitting then uses a much cheaper exchange
+build; without them the first call was 2x and the SCF up to 6x slower), and the
+BLAS library has to be chosen by matrix size (below).
+
 ### Broken-symmetry UHF
 
 Starting from identical spin-polarised densities (`mojoscf.guess`), pyscf and
@@ -146,8 +176,8 @@ GEMM and the symmetric eigensolvers (`dsygvd`/`dsyevd`) are called through
   the cores and costs up to 40% of the run time.
 * larger matrices: SciPy's bundled OpenBLAS (LP64, threaded, `scipy_` symbol
   prefix).  Measured on 4 cores, the glue (diagonalisation, DIIS error vector,
-  density) is 1.7x faster than pyscf's at 300 orbitals and 3x at 1000 with the
-  threaded library, but 1.5 to 2.5x *slower* with the sequential one.
+  density) is 1.6x faster than pyscf's at 300 orbitals and 2.7x at 1000 with the
+  threaded library, but 1.4 to 2.3x *slower* with the sequential one.
 
 `MOJOSCF_BLAS=/path/lib.so[:prefix]` forces one library for all sizes, and
 `mojoscf.set_blas(small, prefix, large, prefix)` selects them from Python.  A
