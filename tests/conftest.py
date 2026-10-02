@@ -14,17 +14,17 @@ def ext():
 def blas(request, ext):
     """Both the BLAS/LAPACK-backed and the pure-Mojo code paths."""
     if request.param == "blas":
-        path, prefix = mojoscf.blas_args()
-        if not path:
+        small, large = mojoscf.blas_config()
+        if not small[0]:
             pytest.skip("no BLAS/LAPACK library found; only the native path is available")
-        return (path, prefix)
-    return ("", "")
+        return (small, large)
+    return (("", ""), ("", ""))
 
 
 @pytest.fixture
 def use_blas(blas):
     """Temporarily select the given backend for the NumPy-facing wrappers."""
-    saved = mojoscf.blas_args()
+    saved = mojoscf.blas_config()
     mojoscf._backend._blas = blas
     try:
         yield blas

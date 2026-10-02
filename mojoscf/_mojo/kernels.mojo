@@ -71,8 +71,12 @@ def make_rdm1(blas: Blas, nao: Int, nmo: Int, mo_coeff: F64Ptr, mo_occ: F64Ptr, 
     _ = cocc_w^
 
 
-def get_occ(nmo: Int, mo_energy: F64Ptr, nocc: Int, mo_occ: F64Ptr, homo_lumo: F64Ptr) -> Bool:
-    """Aufbau occupations (2 electrons in the ``nocc`` lowest orbitals).
+def get_occ(
+    nmo: Int, mo_energy: F64Ptr, nocc: Int, mo_occ: F64Ptr, homo_lumo: F64Ptr, occ_value: Float64 = 2.0
+) -> Bool:
+    """Aufbau occupations (``occ_value`` electrons in the ``nocc`` lowest orbitals).
+
+    ``occ_value`` is 2 for restricted and 1 for each spin channel of UHF.
 
     Follows pyscf: orbitals are ranked by a *stable* sort of the energies
     rounded to 9 decimals.  Returns True and fills ``homo_lumo`` when both a
@@ -93,7 +97,7 @@ def get_occ(nmo: Int, mo_energy: F64Ptr, nocc: Int, mo_occ: F64Ptr, homo_lumo: F
             j -= 1
     vfill(mo_occ, nmo, 0.0)
     for i in range(min(nocc, nmo)):
-        mo_occ[unsafe_offset=idx[i]] = 2.0
+        mo_occ[unsafe_offset=idx[i]] = occ_value
     if 0 < nocc and nocc < nmo:
         homo_lumo[unsafe_offset=0] = mo_energy[unsafe_offset=idx[nocc - 1]]
         homo_lumo[unsafe_offset=1] = mo_energy[unsafe_offset=idx[nocc]]
@@ -102,11 +106,19 @@ def get_occ(nmo: Int, mo_energy: F64Ptr, nocc: Int, mo_occ: F64Ptr, homo_lumo: F
 
 
 def get_grad(
-    blas: Blas, nao: Int, nmo: Int, mo_coeff: F64Ptr, mo_occ: F64Ptr, fock: F64Ptr, g: F64Ptr
+    blas: Blas,
+    nao: Int,
+    nmo: Int,
+    mo_coeff: F64Ptr,
+    mo_occ: F64Ptr,
+    fock: F64Ptr,
+    g: F64Ptr,
+    prefactor: Float64 = 2.0,
 ) raises -> Int:
-    """RHF orbital gradient g = 2 C_vir^T F C_occ, flattened (nvir x nocc).
+    """Orbital gradient g = prefactor * C_vir^T F C_occ, flattened (nvir x nocc).
 
-    Returns the gradient length; ``g`` must hold at least nvir*nocc values.
+    ``prefactor`` is 2 for RHF and 1 for a UHF spin channel.  Returns the
+    gradient length; ``g`` must hold at least nvir*nocc values.
     """
     var nocc = count_occupied(nmo, mo_occ)
     var nvir = nmo - nocc
@@ -121,23 +133,31 @@ def get_grad(
     gather_columns(nao, nmo, mo_coeff, mo_occ, True, pocc, nocc)
     gather_columns(nao, nmo, mo_coeff, mo_occ, False, pvir, nvir)
     blas.gemm(False, False, nao, nocc, nao, 1.0, fock, pocc, 0.0, pfc)
-    blas.gemm(True, False, nvir, nocc, nao, 2.0, pvir, pfc, 0.0, g)
+    blas.gemm(True, False, nvir, nocc, nao, prefactor, pvir, pfc, 0.0, g)
     _ = cocc^
     _ = cvir^
     _ = fc^
     return nvir * nocc
 
 
-def grad_norm(blas: Blas, nao: Int, nmo: Int, mo_coeff: F64Ptr, mo_occ: F64Ptr, fock: F64Ptr) raises -> Float64:
-    """Frobenius norm of the RHF orbital gradient."""
+def grad_sumsq(
+    blas: Blas,
+    nao: Int,
+    nmo: Int,
+    mo_coeff: F64Ptr,
+    mo_occ: F64Ptr,
+    fock: F64Ptr,
+    prefactor: Float64 = 2.0,
+) raises -> Float64:
+    """Sum of squares of the orbital gradient of one spin channel."""
     var nocc = count_occupied(nmo, mo_occ)
     var nvir = nmo - nocc
     if nocc == 0 or nvir == 0:
         return 0.0
     var g = List[Float64](length=nvir * nocc, fill=0.0)
     var pg = list_ptr(g)
-    var ng = get_grad(blas, nao, nmo, mo_coeff, mo_occ, fock, pg)
-    var result = sqrt(vdot(pg, pg, ng))
+    var ng = get_grad(blas, nao, nmo, mo_coeff, mo_occ, fock, pg, prefactor)
+    var result = vdot(pg, pg, ng)
     _ = g^
     return result
 
@@ -147,14 +167,27 @@ def damping(n2: Int, f: F64Ptr, f_prev: F64Ptr, factor: Float64, dst: F64Ptr):
     vlincomb(dst, n2, 1.0 - factor, f, factor, f_prev)
 
 
-def level_shift(blas: Blas, nao: Int, s: F64Ptr, dm: F64Ptr, f: F64Ptr, factor: Float64, dst: F64Ptr) raises:
-    """dst = f + factor * (s - s (dm/2) s)   (pyscf.scf.hf.level_shift)."""
+def level_shift(
+    blas: Blas,
+    nao: Int,
+    s: F64Ptr,
+    dm: F64Ptr,
+    f: F64Ptr,
+    factor: Float64,
+    dst: F64Ptr,
+    dm_scale: Float64 = 0.5,
+) raises:
+    """dst = f + factor * (s - s (dm_scale * dm) s)   (pyscf.scf.hf.level_shift).
+
+    pyscf passes ``dm * 0.5`` for RHF (``dm_scale = 0.5``) and the plain spin
+    density for UHF (``dm_scale = 1``).
+    """
     var n2 = nao * nao
     var sd = List[Float64](length=n2, fill=0.0)
     var sds = List[Float64](length=n2, fill=0.0)
     var psd = list_ptr(sd)
     var psds = list_ptr(sds)
-    blas.gemm(False, False, nao, nao, nao, 0.5, s, dm, 0.0, psd)
+    blas.gemm(False, False, nao, nao, nao, dm_scale, s, dm, 0.0, psd)
     blas.gemm(False, False, nao, nao, nao, 1.0, psd, s, 0.0, psds)
     # dst = f + factor*s - factor*sds
     vlincomb(dst, n2, 1.0, f, factor, s)

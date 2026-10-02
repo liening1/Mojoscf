@@ -24,5 +24,7 @@ jobs:
         run: python -c "import mojoscf, json; print(json.dumps(mojoscf.backend_info(), indent=2))"
       - name: Test
         run: python -m pytest -q
-      - name: Smoke benchmark
-        run: python benchmarks/bench_scf.py --repeat 1 --cases 0,1
+      - name: Smoke benchmarks
+        run: |
+          python benchmarks/bench_scf.py --repeat 1 --cases 0,1
+          python benchmarks/bench_bs.py

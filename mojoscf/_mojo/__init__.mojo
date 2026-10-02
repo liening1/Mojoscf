@@ -23,9 +23,9 @@ from _mojo.kernels import (
     jk_dense,
 )
 from _mojo.diis import diis_update_buffers, diis_init_hmat
-from _mojo.driver import rhf_kernel, f64ptr
+from _mojo.driver import scf_kernel, f64ptr
 
-comptime VERSION = "0.1.0"
+comptime VERSION = "0.2.0"
 
 
 @export
@@ -41,16 +41,16 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_make_rdm1]("make_rdm1", docstring="make_rdm1(mo_coeff, mo_occ, dm_out, path, prefix).")
         m.def_function[py_trace_prod]("trace_prod", docstring="trace_prod(a, b) -> sum_ij a[i,j] b[j,i].")
         m.def_function[py_energy_elec]("energy_elec", docstring="energy_elec(h1e, vhf, dm) -> (e1, e2) with e2 = tr(vhf dm)/2.")
-        m.def_function[py_get_occ]("get_occ", docstring="get_occ(mo_energy, nocc, mo_occ_out) -> (homo, lumo) or None.")
-        m.def_function[py_get_grad]("get_grad", docstring="get_grad(mo_coeff, mo_occ, fock, g_out, path, prefix) -> gradient length.")
+        m.def_function[py_get_occ]("get_occ", docstring="get_occ(mo_energy, nocc, mo_occ_out, occ_value) -> (homo, lumo) or None.")
+        m.def_function[py_get_grad]("get_grad", docstring="get_grad(mo_coeff, mo_occ, fock, g_out, prefactor, path, prefix) -> gradient length.")
         m.def_function[py_damping]("damping", docstring="damping(f, f_prev, factor, dst).")
-        m.def_function[py_level_shift]("level_shift", docstring="level_shift(s, dm, f, factor, dst, path, prefix): dst = f + factor (s - s dm/2 s).")
+        m.def_function[py_level_shift]("level_shift", docstring="level_shift(s, dm, f, factor, dst, dm_scale, path, prefix): dst = f + factor (s - s (dm_scale dm) s).")
         m.def_function[py_diis_errvec]("diis_errvec", docstring="diis_errvec(s, dm, f, x_or_None, err_out, path, prefix) -> length.")
         m.def_function[py_diis_init]("diis_init", docstring="diis_init(hmat, state): reset DIIS buffers.")
         m.def_function[py_diis_update]("diis_update", docstring="diis_update(x, xerr, bufx, bufe, hmat, state, space, min_space, dst) -> nd.")
         m.def_function[py_norm_diff]("norm_diff", docstring="norm_diff(a, b) -> ||a - b||_F.")
         m.def_function[py_jk_dense]("jk_dense", docstring="jk_dense(eri, dm, vj_out, vk_out) from a full (n,n,n,n) ERI tensor.")
-        m.def_function[rhf_kernel]("rhf_kernel", docstring="Native RHF SCF driver; see mojoscf.scf.kernel.")
+        m.def_function[scf_kernel]("scf_kernel", docstring="Native RHF/UHF SCF driver; see mojoscf.scf.kernel.")
         return m.finalize()
     except e:
         abort(String("error creating the mojoscf._mojoscf module: ", e))
@@ -141,11 +141,13 @@ def py_energy_elec(h1e: PythonObject, vhf: PythonObject, dm: PythonObject) raise
     return Python.tuple(PythonObject(e1), PythonObject(e2))
 
 
-def py_get_occ(mo_energy: PythonObject, nocc: PythonObject, mo_occ: PythonObject) raises -> PythonObject:
+def py_get_occ(
+    mo_energy: PythonObject, nocc: PythonObject, mo_occ: PythonObject, occ_value: PythonObject
+) raises -> PythonObject:
     var nmo = Int(py=mo_energy.shape[0])
     var hl = List[Float64](length=2, fill=0.0)
     var phl = F64Ptr(unsafe_from_address=Int(hl.unsafe_ptr()))
-    var ok = get_occ(nmo, f64ptr(mo_energy), Int(py=nocc), f64ptr(mo_occ), phl)
+    var ok = get_occ(nmo, f64ptr(mo_energy), Int(py=nocc), f64ptr(mo_occ), phl, Float64(py=occ_value))
     var result = PythonObject(None)
     if ok:
         result = Python.tuple(PythonObject(hl[0]), PythonObject(hl[1]))
@@ -158,13 +160,16 @@ def py_get_grad(
     mo_occ: PythonObject,
     fock: PythonObject,
     g: PythonObject,
+    prefactor: PythonObject,
     path: PythonObject,
     prefix: PythonObject,
 ) raises -> PythonObject:
     var blas = _blas(path, prefix)
     var nao = Int(py=mo_coeff.shape[0])
     var nmo = Int(py=mo_coeff.shape[1])
-    var ng = get_grad(blas, nao, nmo, f64ptr(mo_coeff), f64ptr(mo_occ), f64ptr(fock), f64ptr(g))
+    var ng = get_grad(
+        blas, nao, nmo, f64ptr(mo_coeff), f64ptr(mo_occ), f64ptr(fock), f64ptr(g), Float64(py=prefactor)
+    )
     return PythonObject(ng)
 
 
@@ -180,12 +185,13 @@ def py_level_shift(
     f: PythonObject,
     factor: PythonObject,
     dst: PythonObject,
+    dm_scale: PythonObject,
     path: PythonObject,
     prefix: PythonObject,
 ) raises -> PythonObject:
     var blas = _blas(path, prefix)
     var nao = Int(py=s.shape[0])
-    level_shift(blas, nao, f64ptr(s), f64ptr(dm), f64ptr(f), Float64(py=factor), f64ptr(dst))
+    level_shift(blas, nao, f64ptr(s), f64ptr(dm), f64ptr(f), Float64(py=factor), f64ptr(dst), Float64(py=dm_scale))
     return PythonObject(None)
 
 

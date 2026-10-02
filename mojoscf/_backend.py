@@ -6,7 +6,9 @@ the sources changed, unless ``MOJOSCF_SKIP_BUILD=1`` is set.
 
 Environment variables
 ---------------------
-MOJOSCF_BLAS        ``/path/to/libblas.so[:symbol_prefix]`` to force a library.
+MOJOSCF_BLAS        ``/path/to/libblas.so[:symbol_prefix]`` to force one library for all sizes.
+MOJOSCF_THREADED_MIN  matrix dimension from which the multi-threaded BLAS is used
+                    (default 200); smaller matrices use the sequential library.
 MOJOSCF_NATIVE      ``1`` to use the pure-Mojo fallbacks instead of BLAS/LAPACK.
 MOJOSCF_SKIP_BUILD  ``1`` to never invoke the Mojo compiler.
 MOJOSCF_MOJO        Path of the ``mojo`` executable (default: ``mojo`` on PATH).
@@ -40,7 +42,9 @@ _EXT_PATH = _PKG_DIR / f"{_EXT_NAME}.so"
 _STAMP_PATH = _PKG_DIR / f"{_EXT_NAME}.hash"
 
 _ext = None
-_blas: tuple[str, str] | None = None
+# (small-matrix library, large-matrix library), each ``(path, symbol_prefix)``.
+_blas: tuple[tuple[str, str], tuple[str, str]] | None = None
+THREADED_MIN_DEFAULT = 200
 
 
 class BackendError(RuntimeError):
@@ -149,25 +153,25 @@ def _preload_dependencies(libdir: str) -> None:
                 pass
 
 
-def _candidate_libraries() -> list[tuple[str, str]]:
-    """BLAS/LAPACK libraries to try, best first.
+def _bundled_libraries() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Bundled/system BLAS+LAPACK libraries, as ``(sequential, threaded)`` lists.
 
-    The OpenBLAS bundled with pyscf wheels is a *sequential* build.  That is
-    what we want inside the SCF loop: the glue matrices are small and a
-    threaded BLAS whose workers spin between calls competes with pyscf's
-    OpenMP integral code for the cores (measured: up to 40% slower SCF runs
-    with the threaded library).  SciPy's bundled OpenBLAS (LP64, pthreads,
-    symbols prefixed ``scipy_``) is the second choice and the better one for
-    large stand-alone kernel calls; select it with ``MOJOSCF_BLAS``.  NumPy's
-    copy is skipped because it uses 64-bit integers.
+    The OpenBLAS shipped inside pyscf wheels is a *sequential* build.  For the
+    small matrices of a small-molecule SCF it is the better choice: a threaded
+    BLAS then competes with pyscf's OpenMP integral code for the cores
+    (measured: up to 40% slower SCF runs).  From a few hundred orbitals on,
+    the threaded OpenBLAS bundled with SciPy (LP64, symbols prefixed
+    ``scipy_``) makes the glue 2-4x faster than the sequential one.  NumPy's
+    own copy is skipped because it uses 64-bit integers.
     """
-    cands: list[tuple[str, str]] = []
+    seq: list[tuple[str, str]] = []
+    thr: list[tuple[str, str]] = []
     try:
         import pyscf  # noqa: F401
 
         libdir = os.path.join(os.path.dirname(pyscf.__file__), "lib")
         for path in sorted(glob.glob(os.path.join(libdir, "libopenblas*.so*"))):
-            cands.append((path, ""))
+            seq.append((path, ""))
     except ImportError:
         pass
     try:
@@ -175,12 +179,11 @@ def _candidate_libraries() -> list[tuple[str, str]]:
 
         libdir = os.path.join(os.path.dirname(os.path.dirname(scipy.__file__)), "scipy.libs")
         for path in sorted(glob.glob(os.path.join(libdir, "libscipy_openblas-*.so*"))):
-            cands.append((path, "scipy_"))
+            thr.append((path, "scipy_"))
     except ImportError:
         pass
-    for name in ("libopenblas.so.0", "libopenblas.so", "liblapack.so.3", "liblapack.so"):
-        cands.append((name, ""))
-    return cands
+    system = [(name, "") for name in ("libopenblas.so.0", "libopenblas.so", "liblapack.so.3", "liblapack.so")]
+    return seq + system, thr + system
 
 
 def _probe(ext, path: str, prefix: str) -> bool:
@@ -193,41 +196,75 @@ def _probe(ext, path: str, prefix: str) -> bool:
         return False
 
 
-def _discover_blas() -> tuple[str, str]:
+def _first_working(ext, candidates) -> tuple[str, str] | None:
+    for path, prefix in candidates:
+        if _probe(ext, path, prefix):
+            return (path, prefix)
+    return None
+
+
+def _discover_blas() -> tuple[tuple[str, str], tuple[str, str]]:
+    native = ("", "")
     if _env_flag("MOJOSCF_NATIVE"):
-        return ("", "")
+        return (native, native)
     ext = get_extension()
     spec = os.environ.get("MOJOSCF_BLAS")
     if spec:
         path, _, prefix = spec.partition(":")
         if _probe(ext, path, prefix):
-            return (path, prefix)
+            return ((path, prefix), (path, prefix))
         raise BackendError(f"MOJOSCF_BLAS={spec!r} does not provide dgemm_/dsygvd_/dsyevd_")
-    for path, prefix in _candidate_libraries():
-        if _probe(ext, path, prefix):
-            return (path, prefix)
-    return ("", "")
+    seq_c, thr_c = _bundled_libraries()
+    small = _first_working(ext, seq_c)
+    large = _first_working(ext, thr_c)
+    if small is None:
+        small = large
+    if large is None:
+        large = small
+    if small is None:
+        return (native, native)
+    return (small, large)
 
 
-def blas_args() -> tuple[str, str]:
-    """``(library_path, symbol_prefix)`` handed to every kernel call.
+def threaded_min() -> int:
+    """Matrix dimension from which the large-matrix (threaded) library is used."""
+    try:
+        return int(os.environ.get("MOJOSCF_THREADED_MIN", THREADED_MIN_DEFAULT))
+    except ValueError:
+        return THREADED_MIN_DEFAULT
 
-    An empty path selects the native Mojo fallbacks.
-    """
+
+def blas_config() -> tuple[tuple[str, str], tuple[str, str]]:
+    """``((small_path, prefix), (large_path, prefix))``; empty path = native Mojo."""
     global _blas
     if _blas is None:
         _blas = _discover_blas()
     return _blas
 
 
-def set_blas(path: str, prefix: str = "") -> None:
-    """Force a specific BLAS/LAPACK shared library (empty path = native)."""
+def blas_args(n: int = 0) -> tuple[str, str]:
+    """``(library_path, symbol_prefix)`` to use for matrices of dimension ``n``.
+
+    An empty path selects the native Mojo fallbacks.
+    """
+    small, large = blas_config()
+    return large if n >= threaded_min() else small
+
+
+def set_blas(path: str, prefix: str = "", large_path: str | None = None, large_prefix: str = "") -> None:
+    """Force BLAS/LAPACK shared libraries (empty path = native Mojo kernels).
+
+    With one argument the library is used for all sizes; ``large_path`` selects
+    a different (threaded) library for matrices at or above ``threaded_min()``.
+    """
     global _blas
-    if path:
-        ext = get_extension()
-        if not _probe(ext, path, prefix):
-            raise BackendError(f"{path!r} does not provide dgemm_/dsygvd_/dsyevd_ (prefix {prefix!r})")
-    _blas = (path, prefix)
+    ext = get_extension() if (path or large_path) else None
+    for p, pre in ((path, prefix), (large_path or "", large_prefix)):
+        if p and not _probe(ext, p, pre):
+            raise BackendError(f"{p!r} does not provide dgemm_/dsygvd_/dsyevd_ (prefix {pre!r})")
+    small = (path, prefix)
+    large = small if large_path is None else (large_path, large_prefix)
+    _blas = (small, large)
 
 
 def use_native() -> None:
@@ -237,13 +274,16 @@ def use_native() -> None:
 
 def backend_info() -> dict:
     ext = get_extension()
-    path, prefix = blas_args()
+    (path, prefix), (lpath, lprefix) = blas_config()
     level, width = ext.runtime_info()
     return {
         "extension": str(_EXT_PATH),
         "kernels_version": ext.version(),
         "blas_library": path or None,
         "blas_symbol_prefix": prefix,
+        "blas_library_large": lpath or None,
+        "blas_symbol_prefix_large": lprefix,
+        "threaded_min": threaded_min(),
         "native_fallback": not path,
         "parallelism_level": int(level),
         "simd_width_f64": int(width),

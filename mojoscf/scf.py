@@ -1,12 +1,13 @@
-"""RHF with the SCF iterations executed in Mojo.
+"""RHF and UHF with the SCF iterations executed in Mojo.
 
 Two ways to use it::
 
     import mojoscf
     mf = mojoscf.RHF(mol).run()          # a pyscf RHF object with a Mojo SCF loop
+    mf = mojoscf.UHF(mol).run()          # same for UHF (open shell, broken symmetry)
 
     mf = pyscf.scf.RHF(mol).density_fit()
-    mojoscf.accelerate(mf)               # upgrade an existing RHF object in place
+    mojoscf.accelerate(mf)               # upgrade an existing RHF/UHF object in place
     mf.kernel()
 
 The driver :func:`kernel` is a port of :func:`pyscf.scf.hf.kernel`: it computes
@@ -14,8 +15,9 @@ the same quantities in the same order, so energies, orbitals and iteration
 counts agree with pyscf to numerical precision.  Only the two-electron part
 (``mf.get_veff``) is still evaluated by pyscf, since that is compiled C code
 already.  Whatever the Mojo driver cannot handle (custom DIIS objects, custom
-convergence checks, ...) falls back to pyscf's own loop, with the small glue
-functions still replaced by their Mojo versions.
+convergence checks, overridden Fock/occupation methods, ...) falls back to
+pyscf's own loop, with the small glue functions still replaced by their Mojo
+versions.
 """
 from __future__ import annotations
 
@@ -26,12 +28,13 @@ from pyscf.lib import logger
 from pyscf.scf import chkfile
 from pyscf.scf import diis as pyscf_diis
 from pyscf.scf import hf as pyscf_hf
+from pyscf.scf import uhf as pyscf_uhf
 
 from . import kernels
 from ._backend import blas_args, get_extension
 from .diis import CDIIS
 
-__all__ = ["RHF", "kernel", "accelerate", "is_supported"]
+__all__ = ["RHF", "UHF", "kernel", "accelerate", "is_supported"]
 
 
 def _c(a):
@@ -42,10 +45,45 @@ def _is_real(*arrays) -> bool:
     return all(not np.iscomplexobj(a) for a in arrays if a is not None)
 
 
+def _pair(value):
+    """``(alpha, beta)`` from a scalar or a two-element sequence (pyscf convention)."""
+    if isinstance(value, (tuple, list, np.ndarray)):
+        a, b = value
+        return float(a), float(b)
+    return float(value), float(value)
+
+
+# Methods the native loop re-implements instead of calling: if any of them has
+# been replaced by something other than pyscf's or mojoscf's version, the native
+# loop would silently ignore the replacement, so it must not be used.
+_BYPASSED = ("get_fock", "eig", "_eigh", "get_occ", "make_rdm1", "energy_elec", "energy_tot", "get_grad")
+_TRUSTED_MODULES = ("pyscf.scf.hf", "pyscf.scf.uhf", "mojoscf.")
+
+
+def _overridden_glue(mf, include_instance=True):
+    """Name of a bypassed method that ``mf`` overrides, or None."""
+    if include_instance:
+        for name in _BYPASSED:
+            if name in vars(mf):
+                return name
+    for name in _BYPASSED:
+        for klass in type(mf).__mro__:
+            if name in klass.__dict__:
+                if not klass.__module__.startswith(_TRUSTED_MODULES):
+                    return name
+                break
+    return None
+
+
+def _is_uhf(mf) -> bool:
+    return isinstance(mf, pyscf_uhf.UHF)
+
+
 def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
     """Mojo SCF driver with the signature and return value of ``pyscf.scf.hf.kernel``.
 
-    Returns ``(scf_conv, e_tot, mo_energy, mo_coeff, mo_occ)``.
+    Handles closed-shell RHF and UHF objects.  Returns
+    ``(scf_conv, e_tot, mo_energy, mo_coeff, mo_occ)``.
     """
     if "init_dm" in kwargs:
         raise RuntimeError('Keyword argument "init_dm" is replaced by "dm0"')
@@ -62,6 +100,7 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, call
             mf, conv_tol, conv_tol_grad, dump_chk=dump_chk, dm0=dm0, callback=callback, conv_check=conv_check, **kwargs
         )
 
+    uhf = _is_uhf(mf)
     mol = mf.mol
     s1e = mf.get_ovlp(mol)
     if dm0 is None:
@@ -69,25 +108,43 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, call
     else:
         dm = dm0
     h1e = mf.get_hcore(mol)
-    if not _is_real(s1e, h1e, dm):
-        log.info("mojoscf: complex integrals; running the pyscf SCF loop with Mojo glue kernels")
+    if not _is_real(s1e, h1e, dm) or np.ndim(h1e) != 2:
+        log.info("mojoscf: complex or spin-dependent integrals; running the pyscf SCF loop with Mojo glue kernels")
         return pyscf_hf.kernel(
             mf, conv_tol, conv_tol_grad, dump_chk=dump_chk, dm0=dm0, callback=callback, conv_check=conv_check, **kwargs
         )
+    # The initial guess usually carries its orbitals (pyscf tags it in make_rdm1);
+    # keep them for the first get_veff call, which is by far the most expensive one
+    # for density fitting.
+    init_tags = (getattr(dm, "mo_coeff", None), getattr(dm, "mo_occ", None))
+    if init_tags[0] is not None:
+        init_tags = (np.asarray(init_tags[0]), np.asarray(init_tags[1]))
     s1e = _c(s1e)
     h1e = _c(h1e)
     dm = _c(dm)
-    if dm.ndim != 2:
-        raise ValueError("mojoscf RHF expects a single (nao, nao) density matrix")
+    if uhf:
+        if dm.ndim == 2:  # a closed-shell density given as guess: split it evenly
+            dm = np.array((dm * 0.5, dm * 0.5))
+            init_tags = (None, None)
+        if dm.ndim != 3 or dm.shape[0] != 2:
+            raise ValueError("mojoscf UHF expects a (2, nao, nao) density matrix")
+        nspin = 2
+        nocc_a, nocc_b = (int(n) for n in mf.nelec)
+    else:
+        if dm.ndim != 2:
+            raise ValueError("mojoscf RHF expects a single (nao, nao) density matrix")
+        nspin = 1
+        nocc_a, nocc_b = mol.nelectron // 2, 0
 
     x_orth = _c(mf.check_linear_dependency(s1e, log))
-    nocc = mol.nelectron // 2
     e_nuc = float(mf.energy_nuc())
     mf.scf_summary["nuc"] = e_nuc
 
     if dump_chk and mf.chkfile:
         chkfile.save_mol(mol, mf.chkfile)
 
+    shift_a, shift_b = _pair(mf.level_shift) if uhf else (float(mf.level_shift), 0.0)
+    damp_a, damp_b = _pair(mf.damp) if uhf else (float(mf.damp), 0.0)
     opts = {
         "conv_tol": float(conv_tol),
         "conv_tol_grad": float(conv_tol_grad),
@@ -96,12 +153,21 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, call
         "diis_space": int(mf.diis_space),
         "diis_start_cycle": int(mf.diis_start_cycle),
         "diis_damp": float(mf.diis_damp),
-        "damp": float(mf.damp),
-        "level_shift": float(mf.level_shift),
+        "damp": damp_a,
+        "damp_b": damp_b,
+        "level_shift": shift_a,
+        "level_shift_b": shift_b,
         "conv_check": bool(conv_check),
     }
 
-    def get_veff(dm, dm_last, vhf_last):
+    def get_veff(dm, dm_last, vhf_last, mo_coeff=None, mo_occ=None):
+        # pyscf's make_rdm1 tags the density matrix with its orbitals and several
+        # J/K builders (density fitting in particular) switch to a much cheaper
+        # occupied-orbital algorithm when they find the tags, so keep them.
+        if mo_coeff is None and dm_last is None and init_tags[0] is not None:
+            mo_coeff, mo_occ = init_tags
+        if mo_coeff is not None:
+            dm = lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
         if dm_last is None:
             return mf.get_veff(mol, dm)
         return mf.get_veff(mol, dm, dm_last, vhf_last)
@@ -126,19 +192,31 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, call
     if callable(callback):
 
         def cb(env):
+            env["dm"] = lib.tag_array(env["dm"], mo_coeff=env["mo_coeff"], mo_occ=env["mo_occ"])
             env["mf"] = mf
             env["mol"] = mol
             callback(env)
 
     cput1 = log.timer("initialize scf", *cput0)
-    path, prefix = blas_args()
-    res = get_extension().rhf_kernel(h1e, s1e, dm, nocc, e_nuc, get_veff, x_orth, opts, log_cb, cb, path, prefix)
+    path, prefix = blas_args(s1e.shape[0])
+    res = get_extension().scf_kernel(
+        h1e, s1e, dm, nspin, nocc_a, nocc_b, e_nuc, get_veff, x_orth, opts, log_cb, cb, path, prefix
+    )
     log.timer("scf iterations", *cput1)
 
     mf.cycles = int(res["cycles"])
     mf.scf_summary["e1"] = res["e1"]
     mf.scf_summary["e2"] = res["e2"]
-    if "homo" in res:
+    scf_conv = bool(res["converged"])
+    e_tot = float(res["e_tot"])
+    mo_energy = res["mo_energy"]
+    mo_coeff = res["mo_coeff"]
+    mo_occ = res["mo_occ"]
+    if uhf:
+        # pyscf updates scf_summary['gap'] and logs the HOMO/LUMO energies inside
+        # get_occ; do it once for the final orbitals.
+        mf.get_occ(mo_energy)
+    elif "homo" in res:
         homo, lumo = res["homo"], res["lumo"]
         gap = (lumo - homo) * nist.HARTREE2EV
         mf.scf_summary["gap"] = gap
@@ -146,11 +224,6 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, call
             log.warn("HOMO %.15g == LUMO %.15g", homo, lumo)
         else:
             log.info("  HOMO = %.15g  LUMO = %.15g  gap/eV = %.5f", homo, lumo, gap)
-    scf_conv = bool(res["converged"])
-    e_tot = float(res["e_tot"])
-    mo_energy = res["mo_energy"]
-    mo_coeff = res["mo_coeff"]
-    mo_occ = res["mo_occ"]
 
     if dump_chk and mf.chkfile:
         mf.dump_chk({"e_tot": e_tot, "mo_energy": mo_energy, "mo_coeff": mo_coeff, "mo_occ": mo_occ})
@@ -172,11 +245,14 @@ def _fallback_reason(mf):
         return "diis_file is not supported"
     if getattr(mf, "disp", None):
         return "dispersion corrections are not supported"
+    name = _overridden_glue(mf)
+    if name is not None:
+        return f"mf.{name} is overridden"
     return None
 
 
-class _MojoRHFMixin:
-    """Mojo implementations of the RHF glue; mixed in front of a pyscf RHF class."""
+class _MojoGlueMixin:
+    """Pieces shared by the RHF and UHF mixins: driver entry point and eigensolver."""
 
     DIIS = CDIIS
 
@@ -201,6 +277,17 @@ class _MojoRHFMixin:
         return self.e_tot
 
     scf = kernel
+
+    def _eigh(self, h, s, overwrite=False, x=None):
+        if not _is_real(h, s, x):
+            return super()._eigh(h, s, overwrite, x)
+        if x is None:
+            return kernels.eigh(h, s)
+        return kernels.eigh(h, x=x)
+
+
+class _MojoRHFMixin(_MojoGlueMixin):
+    """Mojo implementations of the RHF glue; mixed in front of a pyscf RHF class."""
 
     def make_rdm1(self, mo_coeff=None, mo_occ=None, **kwargs):
         if mo_occ is None:
@@ -267,12 +354,60 @@ class _MojoRHFMixin:
             return super().get_grad(mo_coeff, mo_occ, fock)
         return kernels.get_grad(mo_coeff, mo_occ, fock)
 
-    def _eigh(self, h, s, overwrite=False, x=None):
-        if not _is_real(h, s, x):
-            return super()._eigh(h, s, overwrite, x)
-        if x is None:
-            return kernels.eigh(h, s)
-        return kernels.eigh(h, x=x)
+
+class _MojoUHFMixin(_MojoGlueMixin):
+    """Mojo implementations of the UHF glue; mixed in front of a pyscf UHF class.
+
+    ``get_occ`` is left to pyscf: it is cheap and carries UHF-specific HOMO/LUMO
+    bookkeeping that is not worth duplicating.
+    """
+
+    def make_rdm1(self, mo_coeff=None, mo_occ=None, **kwargs):
+        if mo_coeff is None:
+            mo_coeff = self.mo_coeff
+        if mo_occ is None:
+            mo_occ = self.mo_occ
+        if not _is_real(mo_coeff, mo_occ):
+            return super().make_rdm1(mo_coeff, mo_occ, **kwargs)
+        dm_a = kernels.make_rdm1(mo_coeff[0], mo_occ[0])
+        dm_b = kernels.make_rdm1(mo_coeff[1], mo_occ[1])
+        return lib.tag_array((dm_a, dm_b), mo_coeff=mo_coeff, mo_occ=mo_occ)
+
+    def energy_elec(self, dm=None, h1e=None, vhf=None):
+        if dm is None:
+            dm = self.make_rdm1()
+        if h1e is None:
+            h1e = self.get_hcore()
+        if isinstance(dm, np.ndarray) and dm.ndim == 2:
+            dm = np.array((dm * 0.5, dm * 0.5))
+        if vhf is None:
+            vhf = self.get_veff(self.mol, dm)
+        dm_arr = np.asarray(dm)
+        if not _is_real(dm_arr, h1e, vhf) or np.ndim(h1e) != 2 or dm_arr.ndim != 3 or np.ndim(vhf) != 3:
+            return super().energy_elec(dm, h1e, vhf)
+        e1 = kernels.trace_prod(h1e, dm_arr[0]) + kernels.trace_prod(h1e, dm_arr[1])
+        e2 = 0.5 * (kernels.trace_prod(vhf[0], dm_arr[0]) + kernels.trace_prod(vhf[1], dm_arr[1]))
+        self.scf_summary["e1"] = e1
+        self.scf_summary["e2"] = e2
+        if hasattr(vhf, "ecoul"):
+            ecoul = vhf.ecoul.real
+            exx = e2 - ecoul
+            self.scf_summary["coul"] = ecoul
+            self.scf_summary["exc"] = exx
+            logger.debug(self, "E1 = %s  E2 = %s  Ecoul = %s  Exc = %s", e1, e2, ecoul, exx)
+        else:
+            logger.debug(self, "E1 = %s  E2 = %s", e1, e2)
+        return e1 + e2, e2
+
+    def get_grad(self, mo_coeff, mo_occ, fock=None):
+        if fock is None:
+            dm1 = self.make_rdm1(mo_coeff, mo_occ)
+            fock = self.get_hcore(self.mol) + self.get_veff(self.mol, dm1)
+        if not _is_real(mo_coeff, mo_occ, fock):
+            return super().get_grad(mo_coeff, mo_occ, fock)
+        ga = kernels.get_grad(mo_coeff[0], mo_occ[0], fock[0], 1.0)
+        gb = kernels.get_grad(mo_coeff[1], mo_occ[1], fock[1], 1.0)
+        return np.hstack((ga, gb))
 
 
 class RHF(_MojoRHFMixin, pyscf_hf.RHF):
@@ -283,53 +418,79 @@ class RHF(_MojoRHFMixin, pyscf_hf.RHF):
     """
 
 
+class UHF(_MojoUHFMixin, pyscf_uhf.UHF):
+    """Unrestricted Hartree-Fock whose SCF loop and glue run in Mojo.
+
+    Behaves like :class:`pyscf.scf.uhf.UHF`, including ``init_guess_breaksym``,
+    spin-dependent ``level_shift`` and broken-symmetry initial densities passed
+    through ``dm0``.
+    """
+
+
 _accelerated_classes: dict[type, type] = {}
 
 
-def is_supported(mf) -> bool:
-    """True if ``mf`` is a closed-shell RHF object the Mojo driver can run."""
-    if not isinstance(mf, pyscf_hf.RHF):
-        return False
-    from pyscf.scf import rohf
+def unsupported_reason(mf):
+    """Why :func:`accelerate` rejects ``mf`` (None if it is supported)."""
+    if isinstance(mf, (_MojoRHFMixin, _MojoUHFMixin)):
+        return None
+    if isinstance(mf, pyscf_uhf.UHF):
+        kind = "UHF"
+    elif isinstance(mf, pyscf_hf.RHF):
+        kind = "RHF"
+        from pyscf.scf import rohf
 
-    if isinstance(mf, rohf.ROHF):
-        return False
+        if isinstance(mf, rohf.ROHF):
+            return "ROHF is not supported"
+    else:
+        return f"{type(mf).__name__} is neither a closed-shell RHF nor a UHF object"
     try:
         from pyscf.dft.rks import KohnShamDFT
 
         if isinstance(mf, KohnShamDFT):
-            return False
+            return "Kohn-Sham DFT is not supported"
     except ImportError:  # pragma: no cover
         pass
     try:
         from pyscf.soscf.newton_ah import _CIAH_SOSCF
 
         if isinstance(mf, _CIAH_SOSCF):
-            return False
+            return "second-order SCF is not supported"
     except ImportError:  # pragma: no cover
         pass
     if getattr(mf.mol, "symmetry", False):
-        return False
-    return True
+        return "point-group symmetry is not supported"
+    name = _overridden_glue(mf)
+    if name is not None:
+        return f"{kind} object overrides {name}, which the native loop re-implements"
+    return None
+
+
+def is_supported(mf) -> bool:
+    """True if ``mf`` is a closed-shell RHF or a UHF object the Mojo driver can run."""
+    return unsupported_reason(mf) is None
 
 
 def accelerate(mf):
-    """Replace the SCF loop and glue methods of an RHF object with Mojo versions.
+    """Replace the SCF loop and glue methods of an RHF/UHF object with Mojo versions.
 
     The object is modified in place (its class becomes a subclass of the
-    original one with :class:`_MojoRHFMixin` in front) and returned.  Density
-    fitting, X2C and other decorations that only change ``get_jk``/``get_hcore``
-    are preserved.  ROHF, Kohn-Sham, symmetry-adapted and second-order SCF
-    objects are rejected with ``TypeError``.
+    original one with the Mojo mixin in front) and returned.  Density fitting,
+    X2C and other decorations that only change ``get_jk``/``get_hcore`` are
+    preserved.  ROHF, Kohn-Sham, symmetry-adapted, second-order SCF objects and
+    objects that override the glue methods (smearing, constrained UHF, ...) are
+    rejected with ``TypeError``.
     """
-    if isinstance(mf, _MojoRHFMixin):
+    if isinstance(mf, (_MojoRHFMixin, _MojoUHFMixin)):
         return mf
-    if not is_supported(mf):
-        raise TypeError(f"mojoscf.accelerate supports closed-shell RHF objects only, got {type(mf).__name__}")
+    reason = unsupported_reason(mf)
+    if reason is not None:
+        raise TypeError(f"mojoscf.accelerate cannot accelerate {type(mf).__name__}: {reason}")
+    mixin = _MojoUHFMixin if _is_uhf(mf) else _MojoRHFMixin
     cls = type(mf)
     new_cls = _accelerated_classes.get(cls)
     if new_cls is None:
-        new_cls = type("Mojo" + cls.__name__, (_MojoRHFMixin, cls), {"__module__": __name__})
+        new_cls = type("Mojo" + cls.__name__, (mixin, cls), {"__module__": __name__})
         _accelerated_classes[cls] = new_cls
     mf.__class__ = new_cls
     return mf

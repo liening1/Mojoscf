@@ -41,7 +41,10 @@ class CDIIS(lib.diis.DIIS):
 
     def update(self, s, d, f, *args, **kwargs):
         f = np.ascontiguousarray(f, dtype=np.float64)
-        errvec = kernels.diis_errvec(s, d, f, self.Corth)
+        if f.ndim == 3:  # UHF: error vectors of the spin channels are concatenated
+            errvec = np.concatenate([kernels.diis_errvec(s, d[i], f[i], self.Corth) for i in range(f.shape[0])])
+        else:
+            errvec = kernels.diis_errvec(s, d, f, self.Corth)
         f_prev = kwargs.get("f_prev", None)
         if abs(self.damp) < 1e-6 or f_prev is None:
             xin = f

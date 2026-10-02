@@ -132,14 +132,14 @@ def test_accelerate_density_fitting(h2o_dz):
 def test_accelerate_rejects_unsupported(h2o):
     from pyscf import dft
 
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="ROHF"):
         mojoscf.accelerate(scf.ROHF(h2o))
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="Kohn-Sham"):
         mojoscf.accelerate(dft.RKS(h2o))
     with pytest.raises(TypeError):
-        mojoscf.accelerate(scf.UHF(h2o))
-    assert not mojoscf.is_supported(scf.UHF(h2o))
-    assert mojoscf.is_supported(scf.RHF(h2o))
+        mojoscf.accelerate(scf.GHF(h2o))
+    assert not mojoscf.is_supported(scf.GHF(h2o))
+    assert mojoscf.is_supported(scf.RHF(h2o)) and mojoscf.is_supported(scf.UHF(h2o))
 
 
 def test_fallback_to_pyscf_loop(h2o):
@@ -172,12 +172,16 @@ def test_glue_methods_match_pyscf(h2o_dz):
     e, c = mf.eig(fock, mf.get_ovlp())
     e_ref, c_ref = ref.eig(fock, ref.get_ovlp())
     assert np.allclose(e, e_ref, atol=1e-9)
-    assert np.allclose(c, c_ref, atol=1e-6)
+    # In a symmetric molecule two coefficients of an orbital can have equal
+    # magnitude to 1e-16, so the "largest component positive" phase convention may
+    # legitimately flip with rounding noise: compare up to a sign per orbital.
+    sign = np.sign(np.einsum("ij,ij->j", c, c_ref))
+    assert np.allclose(c * sign, c_ref, atol=1e-6)
 
 
 def test_native_fallback_full_scf(h2o):
-    saved = mojoscf.blas_args()
-    mojoscf._backend._blas = ("", "")
+    saved = mojoscf.blas_config()
+    mojoscf.use_native()
     try:
         mf = _mojo(h2o)
     finally:
