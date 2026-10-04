@@ -27,8 +27,9 @@ from _mojo.dfjk import df_jk_core, factorize_density, block_size
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, eri_s8_core, int3c2e_core, int2c2e_core
+from _mojo.directjk import DirectJK, basis_from_py
 
-comptime VERSION = "0.5.0"
+comptime VERSION = "0.6.0"
 
 
 @export
@@ -62,6 +63,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_int2e_s8]("int2e_s8", docstring="int2e_s8(basis, eri_out, schwarz_tol, table): 8-fold packed electron repulsion integrals.")
         m.def_function[py_int3c2e]("int3c2e", docstring="int3c2e(basis, auxbasis, out, table): (ab|P) as a (naux, npair) array.")
         m.def_function[py_int2c2e]("int2c2e", docstring="int2c2e(auxbasis, out, table): (P|Q) as a dense (naux, naux) array.")
+        m.def_function[py_direct_jk]("direct_jk", docstring="direct_jk(basis, table, dms, vj, vk, with_j, with_k, tol): integral-direct J/K of symmetric densities.")
         return m.finalize()
     except e:
         abort(String("error creating the mojoscf._mojoscf module: ", e))
@@ -370,15 +372,7 @@ def i64ptr(arr: PythonObject) raises -> Pointer[Int64, MutAnyOrigin]:
 
 def _basis(b: PythonObject) raises -> Basis:
     """``b`` is the tuple (atm, bas, env, nf, c2s) prepared by mojoscf.integrals."""
-    var atm = b[0]
-    var bas = b[1]
-    var env = b[2]
-    var nf = b[3]
-    var c2s = b[4]
-    return Basis(
-        Int(py=atm.shape[0]), i64ptr(atm), Int(py=bas.shape[0]), i64ptr(bas), Int(py=env.shape[0]), f64ptr(env),
-        Int(py=nf.shape[0]), i64ptr(nf), f64ptr(c2s),
-    )
+    return basis_from_py(b)
 
 
 def _boys(table: PythonObject) raises -> BoysTable:
@@ -430,4 +424,28 @@ def py_int2c2e(auxbasis: PythonObject, dst: PythonObject, table: PythonObject) r
     int2c2e_core(aux, boys, f64ptr(dst))
     _ = aux^
     _ = boys^
+    return PythonObject(None)
+
+
+def py_direct_jk(
+    basis: PythonObject, table: PythonObject, dms: PythonObject, vj: PythonObject, vk: PythonObject,
+    with_j: PythonObject, with_k: PythonObject, tol: PythonObject,
+) raises -> PythonObject:
+    """vj[s] = J[dms[s]], vk[s] = K[dms[s]] for a stack of symmetric densities (outputs overwritten)."""
+    var jk = DirectJK(_basis(basis), _boys(table))
+    var nset = Int(py=dms.shape[0])
+    var nao = Int(py=dms.shape[1])
+    var n2 = nao * nao
+    var pd = f64ptr(dms)
+    var pj = f64ptr(vj)
+    var pk = f64ptr(vk)
+    var wj = Bool(py=with_j)
+    var wk = Bool(py=with_k)
+    var t = Float64(py=tol)
+    for s in range(nset):
+        jk.jk(
+            1 if wj else 0, pd.unsafe_offset(s * n2), pj.unsafe_offset(s * n2),
+            1 if wk else 0, pd.unsafe_offset(s * n2), pk.unsafe_offset(s * n2), t,
+        )
+    _ = jk^
     return PythonObject(None)

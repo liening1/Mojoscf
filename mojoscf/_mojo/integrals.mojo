@@ -288,6 +288,11 @@ struct BoysTable(Movable):
         for i in range(Self.NT * Self.NROWS):
             dst[unsafe_offset=i] = src[unsafe_offset=i]
 
+    def __init__(out self, *, empty: Bool):
+        """A placeholder without data (for objects that never evaluate integrals)."""
+        self.table = List[Float64]()
+        self.inv_odd = List[Float64]()
+
     def write(self, dst: F64Ptr):
         for i in range(Self.NT * Self.NROWS):
             dst[unsafe_offset=i] = self.table[i]
@@ -1685,6 +1690,34 @@ def pair_shells(sp: Int) -> Tuple[Int, Int]:
 # --------------------------------------------------------------------------
 
 
+def schwarz_bounds(boys: BoysTable, tab: PairTable, ht: HermTable) -> List[Float64]:
+    """sqrt(max |(ab|ab)|) for every pair of ``tab`` (0 for pairs without primitive pairs)."""
+    var npairs = tab.npairs
+    var qb = List[Float64](length=max(npairs, 1), fill=0.0)
+    var pq = list_ptr(qb)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+    var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
+
+    def schwarz(w: Int) {imm boys, imm tab, imm ht, imm pq, imm pcount, imm npairs}:
+        var ws = EriWork(tab.maxcomp, tab.maxlab, tab.maxcomp, tab.maxlab)
+        while True:
+            var sp = Int(pcount[].fetch_add(1))
+            if sp >= npairs:
+                break
+            if eri_quartet(tab, sp, tab, sp, ht, boys, ws):
+                var nab = tab.get(sp, I_NCOMP)
+                pq[unsafe_offset=sp] = sqrt(block_max_abs(ws, nab * nab))
+        _ = ws^
+
+    if nworkers <= 1:
+        schwarz(0)
+    else:
+        parallelize(schwarz, nworkers)
+    _ = counter^
+    return qb^
+
+
 def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64):
     """8-fold packed ERIs of ``basis`` into ``eri`` (length npair (npair + 1) / 2).
 
@@ -1726,27 +1759,10 @@ def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64
     var tab = PairTable(basis, basis, sa, sb, ht)
 
     # Schwarz bounds per shell pair.
-    var qb = List[Float64](length=npairs, fill=0.0)
+    var qb = schwarz_bounds(boys, tab, ht)
     var pq = list_ptr(qb)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
-
-    def schwarz(w: Int) {imm basis, imm boys, imm tab, imm ht, imm pq, imm pcount, imm npairs}:
-        var ws = EriWork(tab.maxcomp, tab.maxlab, tab.maxcomp, tab.maxlab)
-        while True:
-            var sp = Int(pcount[].fetch_add(1))
-            if sp >= npairs:
-                break
-            if eri_quartet(tab, sp, tab, sp, ht, boys, ws):
-                var nab = tab.get(sp, I_NCOMP)
-                pq[unsafe_offset=sp] = sqrt(block_max_abs(ws, nab * nab))
-        _ = ws^
-
-    if nworkers == 1:
-        schwarz(0)
-    else:
-        parallelize(schwarz, nworkers)
-    counter.store(0)
 
     def work(w: Int) {imm basis, imm boys, imm tab, imm ht, imm pq, imm eri, imm schwarz_tol, imm npairs, imm pcount}:
         var ws = EriWork(tab.maxcomp, tab.maxlab, tab.maxcomp, tab.maxlab)

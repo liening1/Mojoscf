@@ -22,6 +22,8 @@ from _mojo.kernels import make_rdm1, get_occ, grad_sumsq, level_shift, diis_errv
 from _mojo.diis import DIIS
 from _mojo.dfjk import df_jk_core, factorize_density, orbitals_from_mo, block_size
 from _mojo.erijk import jk_s8_core
+from _mojo.integrals import BoysTable
+from _mojo.directjk import DirectJK, basis_from_py
 
 
 def f64ptr(arr: PythonObject) raises -> F64Ptr:
@@ -65,10 +67,13 @@ def _vectors(np: PythonObject, ns: Int, n: Int) raises -> PythonObject:
 
 
 struct VeffBuilder(Movable):
-    """Two-electron potential from in-core integrals, without leaving Mojo.
+    """Two-electron potential built without leaving Mojo.
 
     mode 1: density fitting, ``data`` is the (naux, npair) cderi tensor.
     mode 2: 8-fold packed ERIs, ``data`` is pyscf's ``int2e`` ``aosym='s8'`` vector.
+    mode 3: integral-direct J/K from the Mojo integral engine (``direct``); with
+            ``incremental`` the potential is updated from the density change, as
+            pyscf does for ``direct_scf`` (vhf = vhf_last + J/K[dm - dm_last]).
     ``kscale`` is 0.5 for RHF (vhf = J - K/2) and 1 for UHF (vhf_s = J - K_s).
     """
 
@@ -86,10 +91,14 @@ struct VeffBuilder(Movable):
     var orb: List[Float64]
     var sign: List[Float64]
     var ms: List[Int64]
+    var direct: DirectJK
+    var direct_tol: Float64
+    var incremental: Bool
+    var ddm: List[Float64]
 
     def __init__(
         out self, mode: Int, data: F64Ptr, naux: Int, nao: Int, ns: Int, kscale: Float64,
-        budget_bytes: Int, fact_tol: Float64,
+        budget_bytes: Int, fact_tol: Float64, var direct: DirectJK, direct_tol: Float64, incremental: Bool,
     ):
         self.mode = mode
         self.data_addr = Int(data)
@@ -106,6 +115,34 @@ struct VeffBuilder(Movable):
         self.orb = List[Float64](length=ns * n2, fill=0.0)
         self.sign = List[Float64](length=ns * nao, fill=0.0)
         self.ms = List[Int64](length=ns, fill=0)
+        self.direct = direct^
+        self.direct_tol = direct_tol
+        self.incremental = incremental
+        self.ddm = List[Float64](length=ns * n2 if mode == 3 else 0, fill=0.0)
+
+    def build_direct(mut self, dm: F64Ptr, dm_last: F64Ptr, has_last: Bool, vhf_last: F64Ptr, vhf: F64Ptr):
+        """vhf for ``dm`` by integral-direct J/K (mode 3), incremental when enabled and ``has_last``."""
+        var nao = self.nao
+        var n2 = nao * nao
+        var ns = self.ns
+        var inc = self.incremental and has_last
+        var pddm = list_ptr(self.ddm)
+        if inc:
+            vlincomb(pddm, ns * n2, 1.0, dm, -1.0, dm_last)
+        else:
+            vcopy(pddm, dm, ns * n2)
+        var pdm_tot = list_ptr(self.dm_tot)
+        vcopy(pdm_tot, pddm, n2)
+        for sp in range(1, ns):
+            vaxpy(pdm_tot, n2, 1.0, pddm.unsafe_offset(sp * n2))
+        var pvj = list_ptr(self.vj)
+        var pvk = list_ptr(self.vk)
+        self.direct.jk(1, pdm_tot, pvj, ns, pddm, pvk, self.direct_tol)
+        for sp in range(ns):
+            var out = vhf.unsafe_offset(sp * n2)
+            vlincomb(out, n2, 1.0, pvj, -self.kscale, pvk.unsafe_offset(sp * n2))
+            if inc:
+                vaxpy(out, n2, 1.0, vhf_last.unsafe_offset(sp * n2))
 
     def build(
         mut self, blas: Blas, blas_seq: Blas, dm: F64Ptr, has_orb: Bool, nmo: Int, mo_coeff: F64Ptr, mo_occ: F64Ptr, vhf: F64Ptr
@@ -195,7 +232,8 @@ def scf_kernel(
     blas_seq_path, blas_seq_prefix : library safe to call from several threads at
                 once (a sequential build), for the per-Q transforms of mode 1
     veff_mode : 0 = call ``get_veff``; 1 = native density fitting from ``veff_data``
-                (naux, npair); 2 = native J/K from ``veff_data``, 8-fold packed ERIs
+                (naux, npair); 2 = native J/K from ``veff_data``, 8-fold packed ERIs;
+                3 = integral-direct J/K, ``veff_data`` = (basis tables, Boys table)
     veff_opts : dict with ``block_mb`` (DF work-buffer budget) and ``fact_tol``
                 (relative eigenvalue cutoff when a density has to be factorised)
     dm0_mo_coeff, dm0_mo_occ : orbitals of ``dm0`` (or None), used by modes 1/2
@@ -252,17 +290,24 @@ def scf_kernel(
     var mode = Int(py=veff_mode)
     var pdata = ph
     var naux = 0
-    if mode != 0:
+    if mode == 1 or mode == 2:
         pdata = f64ptr(veff_data)
         if mode == 1:
             naux = Int(py=veff_data.shape[0])
+    var direct = DirectJK(inactive=True)
+    if mode == 3:
+        direct = DirectJK(basis_from_py(veff_data[0]), BoysTable(f64ptr(veff_data[1])))
     var builder = VeffBuilder(
         mode, pdata, naux, nao, ns, 0.5 if ns == 1 else 1.0,
         _opt_int(veff_opts, "block_mb", 512) * 1024 * 1024, _opt_float(veff_opts, "fact_tol", 1e-14),
+        direct^, _opt_float(veff_opts, "direct_tol", 1e-13), _opt_bool(veff_opts, "incremental", True),
     )
     var vhf: PythonObject
     if mode == 0:
         vhf = np.ascontiguousarray(get_veff(dm, None, None, None, None), dtype=np.float64)
+    elif mode == 3:
+        vhf = _matrices(np, ns, nao, nao)
+        builder.build_direct(pdm, pdm, False, pdm, f64ptr(vhf))
     else:
         vhf = _matrices(np, ns, nao, nao)
         var has0 = not (dm0_mo_coeff is None)
@@ -393,6 +438,10 @@ def scf_kernel(
         # --- two-electron part and energy ---
         if mode == 0:
             vhf = np.ascontiguousarray(get_veff(dm, dm_last, vhf, mo_coeff, mo_occ), dtype=np.float64)
+        elif mode == 3:
+            var vhf_new = _matrices(np, ns, nao, nao)
+            builder.build_direct(pdm, f64ptr(dm_last), True, f64ptr(vhf), f64ptr(vhf_new))
+            vhf = vhf_new
         else:
             vhf = _matrices(np, ns, nao, nao)
             builder.build(blas, blas_seq, pdm, True, nmo, pc, po, f64ptr(vhf))
@@ -466,6 +515,10 @@ def scf_kernel(
             make_rdm1(blas, nao, nmo, pc.unsafe_offset(sp * nmo2), po.unsafe_offset(sp * nmo), pdm.unsafe_offset(sp * n2))
         if mode == 0:
             vhf = np.ascontiguousarray(get_veff(dm, dm_last, vhf, mo_coeff, mo_occ), dtype=np.float64)
+        elif mode == 3:
+            var vhf_new = _matrices(np, ns, nao, nao)
+            builder.build_direct(pdm, f64ptr(dm_last), True, f64ptr(vhf), f64ptr(vhf_new))
+            vhf = vhf_new
         else:
             vhf = _matrices(np, ns, nao, nao)
             builder.build(blas, blas_seq, pdm, True, nmo, pc, po, f64ptr(vhf))

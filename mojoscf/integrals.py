@@ -21,6 +21,8 @@ potentials.  :func:`attach` makes a mojoscf SCF object use these integrals.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from pyscf import gto, lib
 from pyscf.df import addons as df_addons
@@ -28,6 +30,9 @@ from pyscf.df import addons as df_addons
 from ._backend import get_extension
 
 __all__ = [
+    "engine",
+    "set_engine",
+    "available",
     "basis_tables",
     "int1e",
     "get_ovlp",
@@ -40,6 +45,8 @@ __all__ = [
     "int2c2e",
     "cholesky_eri",
     "attach",
+    "build_df",
+    "get_jk",
     "unsupported_reason",
 ]
 
@@ -47,6 +54,36 @@ LMAX = 8
 NUC_POINT = 1
 # libcint's CINTcommon_fac_sp: the factor its s and p "spherical" functions carry.
 _FAC_SP = {0: 0.282094791773878143, 1: 0.488602511902919921}
+
+
+_ENGINES = ("mojo", "libcint")
+_ENGINE = os.environ.get("MOJOSCF_INTEGRALS", "mojo").strip().lower() or "mojo"
+if _ENGINE not in _ENGINES:
+    raise ValueError(f"MOJOSCF_INTEGRALS must be one of {_ENGINES}, got {_ENGINE!r}")
+
+
+def engine() -> str:
+    """Integral engine the mojoscf SCF driver uses: ``"mojo"`` (default) or ``"libcint"``."""
+    return _ENGINE
+
+
+def set_engine(name: str) -> None:
+    """Select the integral engine of the SCF driver (also ``MOJOSCF_INTEGRALS=libcint``).
+
+    With ``"mojo"`` the driver builds in-core ERIs, in-core density-fitting
+    tensors and integral-direct J/K with this module whenever the molecule is
+    supported (see ``unsupported_reason``) and falls back to libcint otherwise.
+    """
+    global _ENGINE
+    name = name.strip().lower()
+    if name not in _ENGINES:
+        raise ValueError(f"integral engine must be one of {_ENGINES}, got {name!r}")
+    _ENGINE = name
+
+
+def available(mol) -> bool:
+    """True when the SCF driver will use the Mojo engine for ``mol``."""
+    return _ENGINE == "mojo" and unsupported_reason(mol) is None
 
 
 def unsupported_reason(mol) -> str | None:
@@ -59,6 +96,8 @@ def unsupported_reason(mol) -> str | None:
         return f"angular momentum above l = {LMAX}"
     if (mol._atm[:, gto.NUC_MOD_OF] != NUC_POINT).any():
         return "only point nuclei are supported"
+    if getattr(mol, "omega", 0.0):
+        return "range-separated Coulomb operator (mol.omega) is not supported"
     return None
 
 
@@ -200,6 +239,34 @@ def cholesky_eri(mol, auxbasis="weigend+etb", auxmol=None, lindep=1e-12):
         return lib.dot(v.T, j3c)
 
 
+def build_df(with_df) -> bool:
+    """Build ``with_df._cderi`` in core with the Mojo engine, as ``pyscf.df.DF.build`` would.
+
+    Follows pyscf's decision: only when the tensor fits in 90% of the free
+    memory and no file storage was requested.  Returns False (leaving the
+    object untouched) otherwise, or when the molecule is not supported.
+    """
+    from pyscf import lib as pyscf_lib
+
+    mol = with_df.mol
+    if with_df._cderi is not None or not available(mol):
+        return False
+    if isinstance(getattr(with_df, "_cderi_to_save", None), str):
+        return False
+    auxmol = with_df.auxmol
+    if auxmol is None:
+        auxmol = df_addons.make_auxmol(mol, with_df.auxbasis)
+    if unsupported_reason(auxmol) is not None:
+        return False
+    nao = mol.nao_nr()
+    max_memory = with_df.max_memory - pyscf_lib.current_memory()[0]
+    if nao * (nao + 1) // 2 * auxmol.nao_nr() * 8 / 1e6 >= 0.9 * max_memory:
+        return False
+    with_df.auxmol = auxmol
+    with_df._cderi = cholesky_eri(mol, auxmol=auxmol)
+    return True
+
+
 def attach(mf, schwarz_tol: float = 1e-14, auxbasis=None):
     """Make the SCF object ``mf`` take its integrals from the Mojo engine.
 
@@ -223,3 +290,22 @@ def attach(mf, schwarz_tol: float = 1e-14, auxbasis=None):
     elif getattr(mf, "_eri", None) is None and (mol.incore_anyway or mf._is_mem_enough()):
         mf._eri = int2e_s8(mol, schwarz_tol)
     return mf
+
+
+def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13):
+    """Integral-direct J and K of symmetric density matrices, like ``pyscf.scf.hf.get_jk``.
+
+    ``dm`` is (nao, nao) or (n, nao, nao); returns (vj, vk) of the same shape
+    (None for a matrix that was not requested).  Shell quartets are screened
+    with the Schwarz bounds times the density, as pyscf's ``direct_scf_tol``.
+    """
+    dm = np.asarray(dm, dtype=np.float64)
+    single = dm.ndim == 2
+    dms = np.ascontiguousarray(dm.reshape(-1, dm.shape[-2], dm.shape[-1]))
+    vj = np.empty_like(dms)
+    vk = np.empty_like(dms)
+    get_extension().direct_jk(basis_tables(mol), _boys_table(), dms, vj, vk, bool(with_j), bool(with_k), float(direct_scf_tol))
+    shape = dm.shape
+    vj = vj.reshape(shape) if with_j else None
+    vk = vk.reshape(shape) if with_k else None
+    return vj, vk

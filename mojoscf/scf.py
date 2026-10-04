@@ -102,9 +102,17 @@ def native_veff(mf):
 
     mode 1: density fitting with pyscf's in-core ``(naux, npair)`` tensor.
     mode 2: in-core 8-fold packed ERIs (built here if pyscf would build them).
+    mode 3: integral-direct J/K from the Mojo integral engine (direct SCF).
     mode 0: not possible; ``reason`` says why and ``mf.get_veff`` is called instead.
+
+    Integrals that have to be computed are computed by the Mojo engine
+    (``mojoscf.integrals``) when it supports the molecule and is enabled
+    (``integrals.engine() == "mojo"``), otherwise by pyscf/libcint.
     """
-    nao = mf.mol.nao_nr()
+    from . import integrals
+
+    mol = mf.mol
+    nao = mol.nao_nr()
     npair = nao * (nao + 1) // 2
     for name in ("get_veff", "get_jk"):
         if not _standard_method(mf, name):
@@ -117,7 +125,7 @@ def native_veff(mf):
             return 0, None, "only_dfj (exact exchange with DF Coulomb)"
         if type(with_df) is not pyscf_df.DF:
             return 0, None, f"{type(with_df).__name__} is not the plain pyscf DF object"
-        if with_df._cderi is None:
+        if with_df._cderi is None and not integrals.build_df(with_df):
             with_df.build()
         cderi = with_df._cderi
         if (
@@ -128,11 +136,17 @@ def native_veff(mf):
         return 0, None, "DF tensor is not an in-core float64 array"
     eri = getattr(mf, "_eri", None)
     if eri is None:
-        if mf.mol.incore_anyway or mf._is_mem_enough():
-            # exactly what pyscf.scf.hf.RHF.get_jk does on its first call
-            eri = mf._eri = mf.mol.intor("int2e", aosym="s8")
+        if mol.incore_anyway or mf._is_mem_enough():
+            # what pyscf.scf.hf.RHF.get_jk does on its first call (with the Mojo engine if possible)
+            if integrals.available(mol):
+                eri = mf._eri = integrals.int2e_s8(mol)
+            else:
+                eri = mf._eri = mol.intor("int2e", aosym="s8")
+        elif integrals.available(mol):
+            return 3, (integrals.basis_tables(mol), integrals._boys_table()), None
         else:
-            return 0, None, "direct SCF (integrals recomputed every cycle)"
+            reason = integrals.unsupported_reason(mol) or "Mojo integral engine disabled"
+            return 0, None, f"direct SCF with libcint ({reason})"
     if isinstance(eri, np.ndarray) and eri.dtype == np.float64 and eri.ndim == 1 and eri.size == npair * (npair + 1) // 2:
         return 2, np.ascontiguousarray(eri), None
     return 0, None, "ERI tensor is not the 8-fold packed float64 vector"
@@ -261,10 +275,17 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, call
         log.info("mojoscf: density-fitted J/K built natively (naux = %d)", veff_data.shape[0])
     elif veff_mode == 2:
         log.info("mojoscf: in-core J/K built natively from 8-fold packed ERIs")
+    elif veff_mode == 3:
+        log.info("mojoscf: integral-direct J/K from the Mojo integral engine (direct_scf_tol = %g)", mf.direct_scf_tol)
     else:
         log.info("mojoscf: J/K from mf.get_veff (%s)", reason)
     mf.scf_summary["mojoscf_veff_mode"] = veff_mode
-    veff_opts = {"block_mb": df_block_mb(), "fact_tol": 1e-14}
+    veff_opts = {
+        "block_mb": df_block_mb(),
+        "fact_tol": 1e-14,
+        "direct_tol": float(mf.direct_scf_tol),
+        "incremental": bool(mf.direct_scf),
+    }
     dm0_coeff = dm0_occ = None
     if init_tags[0] is not None:
         dm0_coeff = np.ascontiguousarray(init_tags[0], dtype=np.float64)

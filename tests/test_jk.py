@@ -166,7 +166,18 @@ def test_scf_native_incore_uhf():
     assert abs(mf.spin_square()[0] - ref.spin_square()[0]) < 1e-6
 
 
-def test_scf_direct_falls_back_to_callback(h2o_dz):
+@pytest.fixture
+def libcint_engine():
+    """Run a test with the Mojo integral engine disabled."""
+    saved = mojoscf.integrals.engine()
+    mojoscf.integrals.set_engine("libcint")
+    try:
+        yield
+    finally:
+        mojoscf.integrals.set_engine(saved)
+
+
+def test_scf_direct_falls_back_to_callback(h2o_dz, libcint_engine):
     mf = mojoscf.RHF(h2o_dz)
     mf.verbose = 0
     mf.max_memory = 1  # pyscf would not keep the ERIs in core either
@@ -177,6 +188,76 @@ def test_scf_direct_falls_back_to_callback(h2o_dz):
     ref.max_memory = 1
     ref.kernel()
     _ref_and_mojo(ref, mf)
+
+
+def test_scf_direct_native_rhf(h2o_dz):
+    """Direct SCF (ERIs do not fit in memory) runs the integral-direct Mojo J/K."""
+    ref = scf.RHF(h2o_dz)
+    ref.verbose = 0
+    ref.max_memory = 1
+    ref.conv_tol = 1e-11
+    ref.kernel()
+    mf = mojoscf.RHF(h2o_dz)
+    mf.verbose = 0
+    mf.max_memory = 1
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    assert mf.scf_summary["mojoscf_veff_mode"] == 3
+    assert mf._eri is None
+    assert mf.converged and abs(mf.e_tot - ref.e_tot) < 1e-10
+    assert mf.cycles == ref.cycles
+
+
+def test_scf_direct_native_uhf_and_non_incremental():
+    mol = gto.M(atom="O 0 0 0; H 0 0 0.97", basis="cc-pvdz", spin=1, verbose=0)
+    ref = scf.UHF(mol)
+    ref.max_memory = 1
+    ref.conv_tol = 1e-11
+    ref.kernel()
+    mf = mojoscf.UHF(mol)
+    mf.max_memory = 1
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    assert mf.scf_summary["mojoscf_veff_mode"] == 3
+    assert mf.converged and abs(mf.e_tot - ref.e_tot) < 1e-10
+    # full rebuild every cycle instead of the incremental update
+    mf2 = mojoscf.UHF(mol)
+    mf2.max_memory = 1
+    mf2.direct_scf = False
+    mf2.conv_tol = 1e-11
+    mf2.kernel()
+    assert mf2.converged and abs(mf2.e_tot - ref.e_tot) < 1e-10
+
+
+def test_direct_get_jk_matches_pyscf(h2o_dz, rng):
+    n = h2o_dz.nao_nr()
+    a = rng.standard_normal((3, n, n))
+    dms = a + a.transpose(0, 2, 1)
+    vj, vk = mojoscf.integrals.get_jk(h2o_dz, dms, direct_scf_tol=0.0)
+    rj, rk = scf.hf.get_jk(h2o_dz, dms)
+    assert abs(vj - rj).max() < 1e-11
+    assert abs(vk - rk).max() < 1e-11
+    vj1, vk1 = mojoscf.integrals.get_jk(h2o_dz, dms[0], with_k=False)
+    assert vk1 is None and abs(vj1 - rj[0]).max() < 1e-10
+
+
+def test_incore_eris_and_df_tensor_from_mojo_engine(h2o_dz):
+    mf = mojoscf.RHF(h2o_dz)
+    mode, eri, _ = mojoscf.native_veff(mf)
+    assert mode == 2
+    assert abs(eri - h2o_dz.intor("int2e", aosym="s8")).max() < 1e-12
+    mfd = mojoscf.RHF(h2o_dz).density_fit()
+    mode, cderi, _ = mojoscf.native_veff(mfd)
+    assert mode == 1 and mfd.with_df.auxmol is not None
+    from pyscf.df import incore
+
+    assert abs(cderi - incore.cholesky_eri(h2o_dz, auxmol=mfd.with_df.auxmol)).max() < 1e-9
+
+
+def test_engine_switch_validation():
+    with pytest.raises(ValueError):
+        mojoscf.integrals.set_engine("fortran")
+    assert mojoscf.integrals.engine() in ("mojo", "libcint")
 
 
 def test_native_veff_rejects_custom_jk(h2o_dz):

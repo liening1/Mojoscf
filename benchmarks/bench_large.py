@@ -1,6 +1,8 @@
 """Large systems: pyscf driver versus mojoscf driver, each run in its own process.
 
-Density-fitted RHF/UHF plus in-core non-DF cases.  Running every (system, driver)
+Density-fitted RHF/UHF, in-core non-DF cases and direct-SCF cases (run with
+``max_memory=1`` so that neither code keeps the 4-index integrals: pyscf
+recomputes them with libcint/libcvhf every cycle, mojoscf with its own engine).  Running every (system, driver)
 pair in a fresh process keeps the timings independent of one another (BLAS thread
 pools, memory, caches).  The script reports the total wall time, the time inside
 ``mf.get_veff`` for pyscf (for mojoscf the two-electron part is built natively and
@@ -27,6 +29,11 @@ CASES = {
     "bz": ("benzene / cc-pVDZ (in-core)", "BENZENE", "cc-pvdz", 0, 0, "rhf", False),
     "bz+": ("benzene cation / cc-pVDZ (UHF)", "BENZENE", "cc-pvdz", 1, 1, "uhf", False),
     "w5": ("(H2O)5 / cc-pVDZ (in-core)", "water_cluster_atoms(5)", "cc-pvdz", 0, 0, "rhf", False),
+    "bz-d": ("benzene / cc-pVDZ (direct)", "BENZENE", "cc-pvdz", 0, 0, "rhf", "direct"),
+    "C8-d": ("C8H18 / cc-pVDZ (direct)", "alkane_atoms(8)", "cc-pvdz", 0, 0, "rhf", "direct"),
+    "w10-d": ("(H2O)10 / cc-pVDZ (direct)", "water_cluster_atoms(10)", "cc-pvdz", 0, 0, "rhf", "direct"),
+    "w5+-d": ("(H2O)5 cation / cc-pVDZ (direct, UHF)", "water_cluster_atoms(5)", "cc-pvdz", 1, 1, "uhf", "direct"),
+    "bzt-d": ("benzene / def2-TZVP (direct)", "BENZENE", "def2-tzvp", 0, 0, "rhf", "direct"),
 }
 
 WORKER = r'''
@@ -44,7 +51,9 @@ if driver == "mojoscf":
     mojoscf.UHF(gto.M(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)).run()  # start the runtime
 cls = scf.RHF if %(kind)r == "rhf" else scf.UHF
 mf = cls(mol)
-if %(df)r:
+if %(df)r == "direct":
+    mf.max_memory = 1          # the 4-index integrals are recomputed every cycle
+elif %(df)r:
     mf = mf.density_fit()
 mf.verbose = 0; mf.conv_tol = 1e-9; mf.max_cycle = 100
 veff = [0.0]

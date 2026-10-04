@@ -131,6 +131,9 @@ def test_unsupported_molecules():
     mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", nucmod="G", verbose=0)
     assert "point nuclei" in mi.unsupported_reason(mol)
     assert mi.unsupported_reason(_mol("sto-3g")) is None
+    mol = _mol("sto-3g")
+    mol.omega = 0.3
+    assert "omega" in mi.unsupported_reason(mol)
 
 
 def test_basis_tables_layout():
