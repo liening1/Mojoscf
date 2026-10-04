@@ -9,6 +9,7 @@ Environment variables
 MOJOSCF_BLAS        ``/path/to/libblas.so[:symbol_prefix]`` to force one library for all sizes.
 MOJOSCF_THREADED_MIN  matrix dimension from which the multi-threaded BLAS is used
                     (default 200); smaller matrices use the sequential library.
+MOJOSCF_DF_BLOCK_MB work-buffer budget of the density-fitting J/K build (default 512).
 MOJOSCF_NATIVE      ``1`` to use the pure-Mojo fallbacks instead of BLAS/LAPACK.
 MOJOSCF_SKIP_BUILD  ``1`` to never invoke the Mojo compiler.
 MOJOSCF_MOJO        Path of the ``mojo`` executable (default: ``mojo`` on PATH).
@@ -29,6 +30,7 @@ __all__ = [
     "build_extension",
     "get_extension",
     "blas_args",
+    "df_block_mb",
     "set_blas",
     "use_native",
     "backend_info",
@@ -224,6 +226,14 @@ def _discover_blas() -> tuple[tuple[str, str], tuple[str, str]]:
     if small is None:
         return (native, native)
     return (small, large)
+
+
+def df_block_mb() -> int:
+    """Work-buffer budget (MB) for the density-fitting exchange build."""
+    try:
+        return max(16, int(os.environ.get("MOJOSCF_DF_BLOCK_MB", 512)))
+    except ValueError:
+        return 512
 
 
 def threaded_min() -> int:

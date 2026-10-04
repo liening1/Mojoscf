@@ -11,7 +11,7 @@ from std.math import sqrt
 from std.os import abort
 from std.runtime import initialize_runtime, parallelism_level
 from std.sys import simd_width_of
-from _mojo.linalg import F64Ptr, Blas, vnorm2diff, trace_prod, vdot
+from _mojo.linalg import F64Ptr, Blas, list_ptr, vnorm2diff, trace_prod, vdot
 from _mojo.kernels import (
     make_rdm1,
     get_occ,
@@ -23,6 +23,8 @@ from _mojo.kernels import (
     jk_dense,
 )
 from _mojo.diis import diis_update_buffers, diis_init_hmat
+from _mojo.dfjk import df_jk_core, factorize_density, block_size
+from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 
 comptime VERSION = "0.2.0"
@@ -50,6 +52,9 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_diis_update]("diis_update", docstring="diis_update(x, xerr, bufx, bufe, hmat, state, space, min_space, dst) -> nd.")
         m.def_function[py_norm_diff]("norm_diff", docstring="norm_diff(a, b) -> ||a - b||_F.")
         m.def_function[py_jk_dense]("jk_dense", docstring="jk_dense(eri, dm, vj_out, vk_out) from a full (n,n,n,n) ERI tensor.")
+        m.def_function[py_df_jk]("df_jk", docstring="df_jk(cderi, dms, orbs_or_None, ms_or_None, signs_or_None, vj, vk, with_j, with_k, block_mb, fact_tol, path, prefix, seq_path, seq_prefix).")
+        m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k): J/K from 8-fold packed ERIs.")
+        m.def_function[py_factorize_density]("factorize_density", docstring="factorize_density(dm, orb_out, sign_out, rel_tol, path, prefix) -> m.")
         m.def_function[scf_kernel]("scf_kernel", docstring="Native RHF/UHF SCF driver; see mojoscf.scf.kernel.")
         return m.finalize()
     except e:
@@ -254,4 +259,95 @@ def py_norm_diff(a: PythonObject, b: PythonObject) raises -> PythonObject:
 def py_jk_dense(eri: PythonObject, dm: PythonObject, vj: PythonObject, vk: PythonObject) raises -> PythonObject:
     var nao = Int(py=dm.shape[0])
     jk_dense(nao, f64ptr(eri), f64ptr(dm), f64ptr(vj), f64ptr(vk))
+    return PythonObject(None)
+
+
+def py_factorize_density(
+    dm: PythonObject, orb: PythonObject, sign: PythonObject, rel_tol: PythonObject, path: PythonObject, prefix: PythonObject
+) raises -> PythonObject:
+    var blas = _blas(path, prefix)
+    var nao = Int(py=dm.shape[0])
+    var m = factorize_density(blas, nao, f64ptr(dm), f64ptr(orb), f64ptr(sign), Float64(py=rel_tol))
+    return PythonObject(m)
+
+
+def py_df_jk(
+    cderi: PythonObject,
+    dms: PythonObject,
+    orbs: PythonObject,
+    ms: PythonObject,
+    signs: PythonObject,
+    vj: PythonObject,
+    vk: PythonObject,
+    with_j: PythonObject,
+    with_k: PythonObject,
+    block_mb: PythonObject,
+    fact_tol: PythonObject,
+    path: PythonObject,
+    prefix: PythonObject,
+    seq_path: PythonObject,
+    seq_prefix: PythonObject,
+) raises -> PythonObject:
+    """J and K of every density, with pyscf semantics: vj[s] = J(dms[s]), vk[s] = K(dms[s]).
+
+    ``orbs`` (nset, nao, nao; column k of set s = weighted orbital, zero padded),
+    ``ms`` (nset, int64) and ``signs`` (nset, nao) describe the factorisation of
+    each density; pass None to let the kernel diagonalise the densities.
+    """
+    var blas = _blas(path, prefix)
+    var blas_seq = _blas(seq_path, seq_prefix)
+    var naux = Int(py=cderi.shape[0])
+    var nset = Int(py=dms.shape[0])
+    var nao = Int(py=dms.shape[1])
+    var n2 = nao * nao
+    var pdm = f64ptr(dms)
+    var nj = nset if Bool(py=with_j) else 0
+    var nk = nset if Bool(py=with_k) else 0
+    var orb = List[Float64](length=max(nk, 1) * n2, fill=0.0)
+    var sgn = List[Float64](length=max(nk, 1) * nao, fill=0.0)
+    var mlist = List[Int64](length=max(nk, 1), fill=0)
+    var porb = list_ptr(orb)
+    var psgn = list_ptr(sgn)
+    var pms = Pointer[Int64, MutAnyOrigin](unsafe_from_address=Int(mlist.unsafe_ptr()))
+    var mmax = 0
+    if nk > 0:
+        if orbs is None:
+            for s in range(nk):
+                var m = factorize_density(
+                    blas, nao, pdm.unsafe_offset(s * n2), porb.unsafe_offset(s * n2),
+                    psgn.unsafe_offset(s * nao), Float64(py=fact_tol),
+                )
+                pms[unsafe_offset=s] = Int64(m)
+                if m > mmax:
+                    mmax = m
+        else:
+            var po = f64ptr(orbs)
+            var psg = f64ptr(signs)
+            var pm = Pointer[Int64, MutAnyOrigin](unsafe_from_address=Int(py=ms.__array_interface__["data"][0]))
+            for s in range(nk):
+                var m = Int(pm[unsafe_offset=s])
+                pms[unsafe_offset=s] = Int64(m)
+                if m > mmax:
+                    mmax = m
+                for i in range(nao):
+                    for k in range(m):
+                        porb[unsafe_offset=s * n2 + i * nao + k] = po[unsafe_offset=s * n2 + i * nao + k]
+                for k in range(m):
+                    psgn[unsafe_offset=s * nao + k] = psg[unsafe_offset=s * nao + k]
+    var blk = block_size(naux, nao, nk, mmax, Int(py=block_mb) * 1024 * 1024)
+    df_jk_core(blas, blas_seq, f64ptr(cderi), naux, nao, blk, nj, pdm, f64ptr(vj), nk, porb, n2, pms, psgn, f64ptr(vk))
+    _ = orb^
+    _ = sgn^
+    _ = mlist^
+    return PythonObject(None)
+
+
+def py_jk_s8(
+    eri: PythonObject, dms: PythonObject, vj: PythonObject, vk: PythonObject, with_j: PythonObject, with_k: PythonObject
+) raises -> PythonObject:
+    var nset = Int(py=dms.shape[0])
+    var nao = Int(py=dms.shape[1])
+    var nj = nset if Bool(py=with_j) else 0
+    var nk = nset if Bool(py=with_k) else 0
+    jk_s8_core(f64ptr(eri), nao, nj, f64ptr(dms), f64ptr(vj), nk, f64ptr(dms), f64ptr(vk))
     return PythonObject(None)

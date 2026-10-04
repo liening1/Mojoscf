@@ -1,5 +1,10 @@
 """RHF and UHF with the SCF iterations executed in Mojo.
 
+The two-electron part is built natively too whenever the integrals are in core:
+density fitting from pyscf's ``(naux, npair)`` tensor, or the 8-fold packed ERIs
+pyscf keeps for molecules that fit in memory.  Only direct SCF (integrals
+recomputed every cycle by libcint) still goes through ``mf.get_veff``.
+
 Two ways to use it::
 
     import mojoscf
@@ -31,10 +36,10 @@ from pyscf.scf import hf as pyscf_hf
 from pyscf.scf import uhf as pyscf_uhf
 
 from . import kernels
-from ._backend import blas_args, get_extension
+from ._backend import blas_args, blas_config, df_block_mb, get_extension
 from .diis import CDIIS
 
-__all__ = ["RHF", "UHF", "kernel", "accelerate", "is_supported"]
+__all__ = ["RHF", "UHF", "kernel", "accelerate", "is_supported", "native_veff"]
 
 
 def _c(a):
@@ -77,6 +82,60 @@ def _overridden_glue(mf, include_instance=True):
 
 def _is_uhf(mf) -> bool:
     return isinstance(mf, pyscf_uhf.UHF)
+
+
+_STANDARD_JK_MODULES = ("pyscf.scf.hf", "pyscf.scf.uhf", "pyscf.df.df_jk", "mojoscf.")
+
+
+def _standard_method(mf, name) -> bool:
+    """True if ``mf.<name>`` is pyscf's (or mojoscf's) own implementation."""
+    if name in vars(mf):
+        return False
+    for klass in type(mf).__mro__:
+        if name in klass.__dict__:
+            return klass.__module__.startswith(_STANDARD_JK_MODULES)
+    return True
+
+
+def native_veff(mf):
+    """How the Mojo driver can build J and K itself: ``(mode, data, reason)``.
+
+    mode 1: density fitting with pyscf's in-core ``(naux, npair)`` tensor.
+    mode 2: in-core 8-fold packed ERIs (built here if pyscf would build them).
+    mode 0: not possible; ``reason`` says why and ``mf.get_veff`` is called instead.
+    """
+    nao = mf.mol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    for name in ("get_veff", "get_jk"):
+        if not _standard_method(mf, name):
+            return 0, None, f"mf.{name} is not pyscf's implementation"
+    with_df = getattr(mf, "with_df", None)
+    if with_df is not None:
+        from pyscf.df import df as pyscf_df
+
+        if getattr(mf, "only_dfj", False):
+            return 0, None, "only_dfj (exact exchange with DF Coulomb)"
+        if type(with_df) is not pyscf_df.DF:
+            return 0, None, f"{type(with_df).__name__} is not the plain pyscf DF object"
+        if with_df._cderi is None:
+            with_df.build()
+        cderi = with_df._cderi
+        if (
+            isinstance(cderi, np.ndarray) and cderi.ndim == 2 and cderi.dtype == np.float64
+            and cderi.shape[1] == npair
+        ):
+            return 1, np.ascontiguousarray(cderi), None
+        return 0, None, "DF tensor is not an in-core float64 array"
+    eri = getattr(mf, "_eri", None)
+    if eri is None:
+        if mf.mol.incore_anyway or mf._is_mem_enough():
+            # exactly what pyscf.scf.hf.RHF.get_jk does on its first call
+            eri = mf._eri = mf.mol.intor("int2e", aosym="s8")
+        else:
+            return 0, None, "direct SCF (integrals recomputed every cycle)"
+    if isinstance(eri, np.ndarray) and eri.dtype == np.float64 and eri.ndim == 1 and eri.size == npair * (npair + 1) // 2:
+        return 2, np.ascontiguousarray(eri), None
+    return 0, None, "ERI tensor is not the 8-fold packed float64 vector"
 
 
 def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
@@ -197,10 +256,26 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, call
             env["mol"] = mol
             callback(env)
 
+    veff_mode, veff_data, reason = native_veff(mf)
+    if veff_mode == 1:
+        log.info("mojoscf: density-fitted J/K built natively (naux = %d)", veff_data.shape[0])
+    elif veff_mode == 2:
+        log.info("mojoscf: in-core J/K built natively from 8-fold packed ERIs")
+    else:
+        log.info("mojoscf: J/K from mf.get_veff (%s)", reason)
+    mf.scf_summary["mojoscf_veff_mode"] = veff_mode
+    veff_opts = {"block_mb": df_block_mb(), "fact_tol": 1e-14}
+    dm0_coeff = dm0_occ = None
+    if init_tags[0] is not None:
+        dm0_coeff = np.ascontiguousarray(init_tags[0], dtype=np.float64)
+        dm0_occ = np.ascontiguousarray(init_tags[1], dtype=np.float64)
+
     cput1 = log.timer("initialize scf", *cput0)
     path, prefix = blas_args(s1e.shape[0])
+    (seq_path, seq_prefix), _ = blas_config()
     res = get_extension().scf_kernel(
-        h1e, s1e, dm, nspin, nocc_a, nocc_b, e_nuc, get_veff, x_orth, opts, log_cb, cb, path, prefix
+        h1e, s1e, dm, nspin, nocc_a, nocc_b, e_nuc, get_veff, x_orth, opts, log_cb, cb, path, prefix,
+        seq_path, seq_prefix, veff_mode, veff_data, veff_opts, dm0_coeff, dm0_occ,
     )
     log.timer("scf iterations", *cput1)
 

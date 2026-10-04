@@ -4,8 +4,10 @@
 RHF (one spin channel) and UHF (two spin channels).  Everything pyscf does in
 Python/NumPy between two ``get_veff`` calls (Fock assembly, damping, DIIS, level
 shift, diagonalisation, occupations, density, energies, convergence tests) runs
-here; the only Python call per iteration is the ``get_veff`` callback which
-builds the two-electron contribution with pyscf's C integral code.
+here.  The two-electron part is either built natively as well (density fitting
+from an in-core 3-index tensor, or in-core 8-fold packed ERIs; ``veff_mode`` 1
+and 2) or obtained from the ``get_veff`` callback, pyscf's C integral code
+(``veff_mode`` 0).
 
 Array layout: for RHF every matrix is ``(nao, nao)``, orbitals ``(nao, nmo)``,
 energies and occupations ``(nmo,)``.  For UHF a leading spin axis of length 2 is
@@ -15,9 +17,11 @@ the basis were projected out with the orthogonaliser ``x_orth``.
 from std.python import Python, PythonObject
 from std.memory import Pointer
 from std.math import sqrt
-from _mojo.linalg import F64Ptr, Blas, list_ptr, vcopy, vlincomb, vnorm2diff, trace_prod
+from _mojo.linalg import F64Ptr, Blas, list_ptr, vcopy, vlincomb, vaxpy, vnorm2diff, trace_prod
 from _mojo.kernels import make_rdm1, get_occ, grad_sumsq, level_shift, diis_errvec, eigh_fock
 from _mojo.diis import DIIS
+from _mojo.dfjk import df_jk_core, factorize_density, orbitals_from_mo, block_size
+from _mojo.erijk import jk_s8_core
 
 
 def f64ptr(arr: PythonObject) raises -> F64Ptr:
@@ -60,6 +64,94 @@ def _vectors(np: PythonObject, ns: Int, n: Int) raises -> PythonObject:
     return np.zeros(n)
 
 
+struct VeffBuilder(Movable):
+    """Two-electron potential from in-core integrals, without leaving Mojo.
+
+    mode 1: density fitting, ``data`` is the (naux, npair) cderi tensor.
+    mode 2: 8-fold packed ERIs, ``data`` is pyscf's ``int2e`` ``aosym='s8'`` vector.
+    ``kscale`` is 0.5 for RHF (vhf = J - K/2) and 1 for UHF (vhf_s = J - K_s).
+    """
+
+    var mode: Int
+    var data_addr: Int  # struct fields cannot hold an AnyOrigin pointer; keep the address
+    var naux: Int
+    var nao: Int
+    var ns: Int
+    var kscale: Float64
+    var budget: Int
+    var fact_tol: Float64
+    var dm_tot: List[Float64]
+    var vj: List[Float64]
+    var vk: List[Float64]
+    var orb: List[Float64]
+    var sign: List[Float64]
+    var ms: List[Int64]
+
+    def __init__(
+        out self, mode: Int, data: F64Ptr, naux: Int, nao: Int, ns: Int, kscale: Float64,
+        budget_bytes: Int, fact_tol: Float64,
+    ):
+        self.mode = mode
+        self.data_addr = Int(data)
+        self.naux = naux
+        self.nao = nao
+        self.ns = ns
+        self.kscale = kscale
+        self.budget = budget_bytes
+        self.fact_tol = fact_tol
+        var n2 = nao * nao
+        self.dm_tot = List[Float64](length=n2, fill=0.0)
+        self.vj = List[Float64](length=n2, fill=0.0)
+        self.vk = List[Float64](length=ns * n2, fill=0.0)
+        self.orb = List[Float64](length=ns * n2, fill=0.0)
+        self.sign = List[Float64](length=ns * nao, fill=0.0)
+        self.ms = List[Int64](length=ns, fill=0)
+
+    def build(
+        mut self, blas: Blas, blas_seq: Blas, dm: F64Ptr, has_orb: Bool, nmo: Int, mo_coeff: F64Ptr, mo_occ: F64Ptr, vhf: F64Ptr
+    ) raises:
+        """vhf (ns x nao x nao) for the density ``dm`` (ns x nao x nao).
+
+        With ``has_orb`` the occupied orbitals are used for the exchange part,
+        otherwise the density is factorised by diagonalisation.
+        """
+        var nao = self.nao
+        var n2 = nao * nao
+        var pdm_tot = list_ptr(self.dm_tot)
+        vcopy(pdm_tot, dm, n2)
+        for sp in range(1, self.ns):
+            vaxpy(pdm_tot, n2, 1.0, dm.unsafe_offset(sp * n2))
+        var porb = list_ptr(self.orb)
+        var psign = list_ptr(self.sign)
+        var pms = Pointer[Int64, MutAnyOrigin](unsafe_from_address=Int(self.ms.unsafe_ptr()))
+        var mmax = 0
+        for sp in range(self.ns):
+            var m: Int
+            if has_orb:
+                m = orbitals_from_mo(
+                    nao, nmo, mo_coeff.unsafe_offset(sp * nao * nmo), mo_occ.unsafe_offset(sp * nmo),
+                    porb.unsafe_offset(sp * n2), psign.unsafe_offset(sp * nao),
+                )
+            else:
+                m = factorize_density(
+                    blas, nao, dm.unsafe_offset(sp * n2), porb.unsafe_offset(sp * n2),
+                    psign.unsafe_offset(sp * nao), self.fact_tol,
+                )
+            pms[unsafe_offset=sp] = Int64(m)
+            if m > mmax:
+                mmax = m
+        var pvj = list_ptr(self.vj)
+        var pvk = list_ptr(self.vk)
+        var data = F64Ptr(unsafe_from_address=self.data_addr)
+        if self.mode == 1:
+            var blk = block_size(self.naux, nao, self.ns, mmax, self.budget)
+            df_jk_core(blas, blas_seq, data, self.naux, nao, blk, 1, pdm_tot, pvj, self.ns, porb, n2, pms, psign, pvk)
+        else:
+            jk_s8_core(data, nao, 1, pdm_tot, pvj, self.ns, dm, pvk)
+        for sp in range(self.ns):
+            vlincomb(vhf.unsafe_offset(sp * n2), n2, 1.0, pvj, -self.kscale, pvk.unsafe_offset(sp * n2))
+
+
 def scf_kernel(
     h1e: PythonObject,
     s1e: PythonObject,
@@ -75,6 +167,13 @@ def scf_kernel(
     callback: PythonObject,
     blas_path: PythonObject,
     blas_prefix: PythonObject,
+    blas_seq_path: PythonObject,
+    blas_seq_prefix: PythonObject,
+    veff_mode: PythonObject,
+    veff_data: PythonObject,
+    veff_opts: PythonObject,
+    dm0_mo_coeff: PythonObject,
+    dm0_mo_occ: PythonObject,
 ) raises -> PythonObject:
     """Run the SCF iterations; returns a dict with the pyscf result fields.
 
@@ -93,9 +192,18 @@ def scf_kernel(
     log       : None or callable(cycle, e_tot, delta_e, norm_g, norm_ddm)
     callback  : None or callable(dict) invoked after every cycle
     blas_path, blas_prefix : BLAS/LAPACK library (empty path -> native kernels)
+    blas_seq_path, blas_seq_prefix : library safe to call from several threads at
+                once (a sequential build), for the per-Q transforms of mode 1
+    veff_mode : 0 = call ``get_veff``; 1 = native density fitting from ``veff_data``
+                (naux, npair); 2 = native J/K from ``veff_data``, 8-fold packed ERIs
+    veff_opts : dict with ``block_mb`` (DF work-buffer budget) and ``fact_tol``
+                (relative eigenvalue cutoff when a density has to be factorised)
+    dm0_mo_coeff, dm0_mo_occ : orbitals of ``dm0`` (or None), used by modes 1/2
+                for the first exchange build
     """
     var np = Python.import_module("numpy")
     var blas = Blas(String(blas_path), String(blas_prefix))
+    var blas_seq = Blas(String(blas_seq_path), String(blas_seq_prefix))
 
     var ns = Int(py=nspin_py)
     var ph = f64ptr(h1e)
@@ -139,7 +247,33 @@ def scf_kernel(
 
     var dm = np.array(dm0, dtype=np.float64, order="C", copy=True)
     var pdm = f64ptr(dm)
-    var vhf = np.ascontiguousarray(get_veff(dm, None, None, None, None), dtype=np.float64)
+
+    # --- two-electron builder ---
+    var mode = Int(py=veff_mode)
+    var pdata = ph
+    var naux = 0
+    if mode != 0:
+        pdata = f64ptr(veff_data)
+        if mode == 1:
+            naux = Int(py=veff_data.shape[0])
+    var builder = VeffBuilder(
+        mode, pdata, naux, nao, ns, 0.5 if ns == 1 else 1.0,
+        _opt_int(veff_opts, "block_mb", 512) * 1024 * 1024, _opt_float(veff_opts, "fact_tol", 1e-14),
+    )
+    var vhf: PythonObject
+    if mode == 0:
+        vhf = np.ascontiguousarray(get_veff(dm, None, None, None, None), dtype=np.float64)
+    else:
+        vhf = _matrices(np, ns, nao, nao)
+        var has0 = not (dm0_mo_coeff is None)
+        var pc0 = ph
+        var po0 = ph
+        var nmo0 = nmo
+        if has0:
+            pc0 = f64ptr(dm0_mo_coeff)
+            po0 = f64ptr(dm0_mo_occ)
+            nmo0 = Int(py=dm0_mo_occ.shape[-1])
+        builder.build(blas, blas_seq, pdm, has0, nmo0, pc0, po0, f64ptr(vhf))
     var pvhf = f64ptr(vhf)
 
     var e1 = 0.0
@@ -256,8 +390,12 @@ def scf_kernel(
                 has_gap = gap_s
             make_rdm1(blas, nao, nmo, pc.unsafe_offset(sp * nmo2), po.unsafe_offset(sp * nmo), pdm.unsafe_offset(sp * n2))
 
-        # --- two-electron part (pyscf C code) and energy ---
-        vhf = np.ascontiguousarray(get_veff(dm, dm_last, vhf, mo_coeff, mo_occ), dtype=np.float64)
+        # --- two-electron part and energy ---
+        if mode == 0:
+            vhf = np.ascontiguousarray(get_veff(dm, dm_last, vhf, mo_coeff, mo_occ), dtype=np.float64)
+        else:
+            vhf = _matrices(np, ns, nao, nao)
+            builder.build(blas, blas_seq, pdm, True, nmo, pc, po, f64ptr(vhf))
         pvhf = f64ptr(vhf)
         e1 = 0.0
         e2 = 0.0
@@ -326,7 +464,11 @@ def scf_kernel(
             if sp == 0:
                 has_gap = gap_s
             make_rdm1(blas, nao, nmo, pc.unsafe_offset(sp * nmo2), po.unsafe_offset(sp * nmo), pdm.unsafe_offset(sp * n2))
-        vhf = np.ascontiguousarray(get_veff(dm, dm_last, vhf, mo_coeff, mo_occ), dtype=np.float64)
+        if mode == 0:
+            vhf = np.ascontiguousarray(get_veff(dm, dm_last, vhf, mo_coeff, mo_occ), dtype=np.float64)
+        else:
+            vhf = _matrices(np, ns, nao, nao)
+            builder.build(blas, blas_seq, pdm, True, nmo, pc, po, f64ptr(vhf))
         pvhf = f64ptr(vhf)
         last_e = e_tot
         e1 = 0.0
@@ -372,4 +514,5 @@ def scf_kernel(
         res["lumo"] = PythonObject(homo_lumo[1])
     _ = errbuf^
     _ = homo_lumo^
+    _ = builder^
     return res

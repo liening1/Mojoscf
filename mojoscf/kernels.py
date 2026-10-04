@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._backend import blas_args, get_extension
+from ._backend import blas_args, blas_config, df_block_mb, get_extension
 
 __all__ = [
     "gemm",
@@ -24,6 +24,9 @@ __all__ = [
     "diis_errvec",
     "norm_diff",
     "jk_dense",
+    "df_jk",
+    "jk_s8",
+    "factorize_density",
 ]
 
 
@@ -212,4 +215,90 @@ def jk_dense(eri, dm):
     vj = np.empty((n, n))
     vk = np.empty((n, n))
     get_extension().jk_dense(eri, dm, vj, vk)
+    return vj, vk
+
+
+def factorize_density(dm, rel_tol: float = 1e-14):
+    """Weighted orbitals of a symmetric density: ``dm = (orb * sign) @ orb.T``.
+
+    Returns ``(orb, sign)`` with ``orb`` of shape ``(nao, m)``; eigenvalues below
+    ``rel_tol`` times the largest one are dropped.  Used to build the exchange
+    matrix of a density that does not come with occupied orbitals.
+    """
+    dm = _square(dm, "dm")
+    nao = dm.shape[0]
+    orb = np.zeros((nao, nao))
+    sign = np.zeros(nao)
+    path, prefix = blas_args(nao)
+    m = int(get_extension().factorize_density(dm, orb, sign, float(rel_tol), path, prefix))
+    return orb[:, :m].copy(), sign[:m].copy()
+
+
+def df_jk(cderi, dm, mo_coeff=None, mo_occ=None, with_j=True, with_k=True, block_mb=None, fact_tol=1e-14):
+    """Density-fitted ``(vj, vk)`` with the semantics of ``pyscf.df.df_jk.get_jk``.
+
+    ``cderi`` is pyscf's in-core ``(naux, nao*(nao+1)//2)`` tensor; ``dm`` is one
+    symmetric density or a stack of them.  When ``mo_coeff``/``mo_occ`` are
+    given (stacked like ``dm``) the exchange part uses the occupied orbitals;
+    otherwise each density is factorised.  Returns arrays shaped like ``dm``
+    (``None`` for a part that was not requested).
+    """
+    cderi = _c(cderi)
+    dm_in = np.asarray(dm, dtype=np.float64)
+    dms = np.ascontiguousarray(dm_in.reshape(-1, dm_in.shape[-1], dm_in.shape[-1]))
+    nset, nao, _ = dms.shape
+    if cderi.ndim != 2 or cderi.shape[1] != nao * (nao + 1) // 2:
+        raise ValueError("cderi must have shape (naux, nao*(nao+1)//2)")
+    vj = np.zeros((nset, nao, nao))
+    vk = np.zeros((nset, nao, nao))
+    orbs = ms = signs = None
+    if with_k and mo_coeff is not None:
+        if mo_occ is None:
+            raise ValueError("mo_occ is required with mo_coeff")
+        c_all = np.asarray(mo_coeff, dtype=np.float64)
+        o_all = np.asarray(mo_occ, dtype=np.float64)
+        c_all = c_all.reshape(-1, c_all.shape[-2], c_all.shape[-1])
+        o_all = o_all.reshape(-1, o_all.shape[-1])
+        if c_all.shape[0] != nset or o_all.shape[0] != nset:
+            raise ValueError("mo_coeff/mo_occ must be stacked like dm")
+        orbs = np.zeros((nset, nao, nao))
+        signs = np.zeros((nset, nao))
+        ms = np.zeros(nset, dtype=np.int64)
+        for s in range(nset):
+            occ = o_all[s] > 0
+            m = int(occ.sum())
+            orbs[s, :, :m] = c_all[s][:, occ] * np.sqrt(o_all[s][occ])
+            signs[s, :m] = 1.0
+            ms[s] = m
+    if block_mb is None:
+        block_mb = df_block_mb()
+    path, prefix = blas_args(nao)
+    (seq_path, seq_prefix), _ = blas_config()
+    get_extension().df_jk(
+        cderi, dms, orbs, ms, signs, vj, vk, bool(with_j), bool(with_k), int(block_mb), float(fact_tol),
+        path, prefix, seq_path, seq_prefix,
+    )
+    vj = vj.reshape(dm_in.shape) if with_j else None
+    vk = vk.reshape(dm_in.shape) if with_k else None
+    return vj, vk
+
+
+def jk_s8(eri, dm, with_j=True, with_k=True):
+    """``(vj, vk)`` from 8-fold packed ERIs (``mol.intor('int2e', aosym='s8')``).
+
+    Same semantics as ``pyscf.scf.hf.dot_eri_dm(eri, dm, hermi=1)``: ``dm`` must be
+    symmetric (one matrix or a stack); the outputs are shaped like ``dm``.
+    """
+    eri = _c(eri)
+    dm_in = np.asarray(dm, dtype=np.float64)
+    dms = np.ascontiguousarray(dm_in.reshape(-1, dm_in.shape[-1], dm_in.shape[-1]))
+    nset, nao, _ = dms.shape
+    npair = nao * (nao + 1) // 2
+    if eri.ndim != 1 or eri.size != npair * (npair + 1) // 2:
+        raise ValueError("eri must be the 8-fold packed int2e vector for this nao")
+    vj = np.zeros((nset, nao, nao))
+    vk = np.zeros((nset, nao, nao))
+    get_extension().jk_s8(eri, dms, vj, vk, bool(with_j), bool(with_k))
+    vj = vj.reshape(dm_in.shape) if with_j else None
+    vk = vk.reshape(dm_in.shape) if with_k else None
     return vj, vk

@@ -203,6 +203,13 @@ def trace_prod(a: F64Ptr, b: F64Ptr, n: Int) -> Float64:
     return total
 
 
+def symmetrize_upper(c: F64Ptr, n: Int):
+    """Copy the row-major upper triangle (i <= j) of c onto the lower one."""
+    for i in range(n):
+        for j in range(i):
+            c[unsafe_offset=i * n + j] = c[unsafe_offset=j * n + i]
+
+
 def adjust_phase(c: F64Ptr, nrow: Int, ncol: Int):
     """Make the largest-magnitude component of every column positive.
 
@@ -424,6 +431,7 @@ struct Blas(Movable):
                 var h = OwnedDLHandle(path)
                 if not verify or (
                     h.check_symbol(prefix + "dgemm_")
+                    and h.check_symbol(prefix + "dsyrk_")
                     and h.check_symbol(prefix + "dsygvd_")
                     and h.check_symbol(prefix + "dsyevd_")
                 ):
@@ -479,6 +487,29 @@ struct Blas(Movable):
             anyptr(tb), anyptr(ta), anyptr(nn), anyptr(mm), anyptr(kk),
             anyptr(al), b, anyptr(ldb), a, anyptr(lda), anyptr(be), c, anyptr(ldc),
         )
+
+    def syrk_upper(self, n: Int, k: Int, alpha: Float64, a: F64Ptr, beta: Float64, c: F64Ptr) raises:
+        """Symmetric rank-k update C (n x n) = alpha * A^T A + beta * C, A (k x n) row-major.
+
+        Only the row-major *upper* triangle (i <= j) of C is guaranteed to be
+        written (BLAS does half the work of a GEMM); mirror it with
+        ``symmetrize_upper`` once all updates are accumulated.
+        """
+        if n == 0:
+            return
+        if not self.handle:
+            gemm_native(True, False, n, n, k, alpha, a, a, beta, c)
+            return
+        # Column-major view: the buffer of A is A^T (n x k), so C = (A^T)(A^T)^T
+        # with trans = 'N'; the column-major lower triangle is the row-major upper one.
+        var uplo = c_char(ord("L"))
+        var trans = c_char(ord("N"))
+        var nn = c_int(n)
+        var kk = c_int(k)
+        var al = alpha
+        var be = beta
+        var f = self.handle.value().get_function[NoneType](self.prefix + "dsyrk_")
+        f(anyptr(uplo), anyptr(trans), anyptr(nn), anyptr(kk), anyptr(al), a, anyptr(nn), anyptr(be), c, anyptr(nn))
 
     def eigh(self, n: Int, h: F64Ptr, w: F64Ptr, c: F64Ptr) raises:
         """Standard symmetric eigenproblem H C = C diag(w); H is preserved.

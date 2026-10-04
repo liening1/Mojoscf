@@ -1,88 +1,94 @@
-"""Large systems: density-fitted RHF/UHF, pyscf driver versus mojoscf driver.
+"""Large systems: pyscf driver versus mojoscf driver, each run in its own process.
 
-Density fitting keeps the two-electron part cheap enough that the SCF glue
-(DIIS, diagonalisation, density, ...) remains visible; the integral/J/K code is
-identical in both drivers.  Besides the total time the script reports the "glue"
-time, i.e. total minus the time spent inside ``mf.get_veff``, which is the part
-mojoscf replaces and which is not affected by run-to-run noise of the shared
-J/K code.  Usage:
+Density-fitted RHF/UHF plus in-core non-DF cases.  Running every (system, driver)
+pair in a fresh process keeps the timings independent of one another (BLAS thread
+pools, memory, caches).  The script reports the total wall time, the time inside
+``mf.get_veff`` for pyscf (for mojoscf the two-electron part is built natively and
+is included in "glue"), and the agreement of the energies.  Usage:
 
-    python benchmarks/bench_large.py [--cases name,name,...] [--list]
+    python benchmarks/bench_large.py [--cases a,b,...] [--list]
 """
 from __future__ import annotations
 
 import argparse
+import json
+import subprocess
+import sys
 import time
 
-from pyscf import gto, lib, scf
-
-import mojoscf
-from systems import alkane_atoms, atoms_to_str, c60_atoms, water_cluster_atoms
-
 CASES = {
-    "C10H22": ("C10H22 / 6-31G*", lambda: alkane_atoms(10), "6-31g*", 0, 0, "rhf"),
-    "C20H42": ("C20H42 / 6-31G", lambda: alkane_atoms(20), "6-31g", 0, 0, "rhf"),
-    "w10": ("(H2O)10 / cc-pVDZ", lambda: water_cluster_atoms(10), "cc-pvdz", 0, 0, "rhf"),
-    "C60": ("C60 / STO-3G", c60_atoms, "sto-3g", 0, 0, "rhf"),
-    "w20": ("(H2O)20 / cc-pVDZ", lambda: water_cluster_atoms(20), "cc-pvdz", 0, 0, "rhf"),
-    "C20H41": ("C20H41 radical / 6-31G (UHF)", lambda: alkane_atoms(20)[:-1], "6-31g", 0, 1, "uhf"),
-    "w10+": ("(H2O)10 cation / cc-pVDZ (UHF)", lambda: water_cluster_atoms(10), "cc-pvdz", 1, 1, "uhf"),
+    "C10H22": ("C10H22 / 6-31G* (DF)", "alkane_atoms(10)", "6-31g*", 0, 0, "rhf", True),
+    "C20H42": ("C20H42 / 6-31G (DF)", "alkane_atoms(20)", "6-31g", 0, 0, "rhf", True),
+    "w10": ("(H2O)10 / cc-pVDZ (DF)", "water_cluster_atoms(10)", "cc-pvdz", 0, 0, "rhf", True),
+    "C60": ("C60 / STO-3G (DF)", "c60_atoms()", "sto-3g", 0, 0, "rhf", True),
+    "w20": ("(H2O)20 / cc-pVDZ (DF)", "water_cluster_atoms(20)", "cc-pvdz", 0, 0, "rhf", True),
+    "C20H41": ("C20H41 radical / 6-31G (DF, UHF)", "alkane_atoms(20)[:-1]", "6-31g", 0, 1, "uhf", True),
+    "w10+": ("(H2O)10 cation / cc-pVDZ (DF, UHF)", "water_cluster_atoms(10)", "cc-pvdz", 1, 1, "uhf", True),
+    "bz": ("benzene / cc-pVDZ (in-core)", "BENZENE", "cc-pvdz", 0, 0, "rhf", False),
+    "bz+": ("benzene cation / cc-pVDZ (UHF)", "BENZENE", "cc-pvdz", 1, 1, "uhf", False),
+    "w5": ("(H2O)5 / cc-pVDZ (in-core)", "water_cluster_atoms(5)", "cc-pvdz", 0, 0, "rhf", False),
 }
 
-
-def run(factory, mol, accelerate):
-    mf = factory(mol).density_fit()
-    mf.verbose = 0
-    mf.conv_tol = 1e-9
-    mf.max_cycle = 100
-    if accelerate:
-        mojoscf.accelerate(mf)
-    veff = [0.0]
+WORKER = r'''
+import json, sys, time
+sys.path.insert(0, %(bench_dir)r)
+from pyscf import gto, lib, scf
+from systems import *
+from bench_scf import BENZENE
+atoms = %(atoms)s
+atom = atoms if isinstance(atoms, str) else atoms_to_str(atoms)
+mol = gto.M(atom=atom, basis=%(basis)r, charge=%(charge)d, spin=%(spin)d, verbose=0, max_memory=12000)
+driver = %(driver)r
+if driver == "mojoscf":
+    import mojoscf
+    mojoscf.UHF(gto.M(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)).run()  # start the runtime
+cls = scf.RHF if %(kind)r == "rhf" else scf.UHF
+mf = cls(mol)
+if %(df)r:
+    mf = mf.density_fit()
+mf.verbose = 0; mf.conv_tol = 1e-9; mf.max_cycle = 100
+veff = [0.0]
+if driver == "mojoscf":
+    mojoscf.accelerate(mf)   # J/K built natively: nothing to time separately
+else:
     orig = mf.get_veff
-
-    def timed(*args, **kwargs):
-        t = time.perf_counter()
-        out = orig(*args, **kwargs)
-        veff[0] += time.perf_counter() - t
-        return out
-
-    mf.get_veff = timed
-    t0 = time.perf_counter()
-    mf.kernel()
-    total = time.perf_counter() - t0
-    return total, total - veff[0], mf
+    def timed(*a, **k):
+        t = time.perf_counter(); r = orig(*a, **k); veff[0] += time.perf_counter() - t; return r
+    mf.get_veff = timed      # (an instance-level get_veff would disable mojoscf's native J/K)
+t0 = time.perf_counter(); mf.kernel(); total = time.perf_counter() - t0
+print(json.dumps(dict(total=total, veff=veff[0], e=mf.e_tot, cycles=mf.cycles, conv=bool(mf.converged),
+                      nao=mol.nao_nr(), mode=mf.scf_summary.get("mojoscf_veff_mode", -1))))
+'''
 
 
-def warm_up():
-    """Start the Mojo runtime and load the BLAS library before anything is timed."""
-    mol = gto.M(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)
-    mojoscf.UHF(mol).run()
+def run(case, driver, bench_dir):
+    name, atoms, basis, charge, spin, kind, df = CASES[case]
+    code = WORKER % dict(bench_dir=bench_dir, atoms=atoms, basis=basis, charge=charge, spin=spin,
+                         driver=driver, kind=kind, df=df)
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    return json.loads(out.stdout.strip().splitlines()[-1])
 
 
 def main():
+    import os
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", default=",".join(CASES))
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
-    warm_up()
     if args.list:
         print("\n".join(f"{k:8s} {v[0]}" for k, v in CASES.items()))
         return
-    info = mojoscf.backend_info()
-    print(f"threads: pyscf={lib.num_threads()} mojo={info['parallelism_level']}; BLAS small/large: "
-          f"{(info['blas_library'] or 'native').split('/')[-1]} / {(info['blas_library_large'] or 'native').split('/')[-1]} "
-          f"(threaded from n >= {info['threaded_min']})")
-    print(f"{'system':32s} {'nao':>5s} {'cycles':>7s} | {'total [s]':>17s} {'speedup':>8s} | {'glue [s]':>17s} {'speedup':>8s} | {'|dE| [Eh]':>9s}")
-    print(f"{'':32s} {'':>5s} {'':>7s} | {'pyscf':>8s} {'mojoscf':>8s} {'':>8s} | {'pyscf':>8s} {'mojoscf':>8s} {'':>8s} |")
+    bench_dir = os.path.dirname(os.path.abspath(__file__))
+    print(f"{'system':36s} {'nao':>4s} {'cyc':>6s} | {'pyscf [s]':>9s} {'(veff)':>7s} | {'mojoscf [s]':>11s} {'mode':>4s} | {'speedup':>7s} {'|dE| [Eh]':>9s}")
     for key in args.cases.split(","):
-        name, atoms, basis, charge, spin, kind = CASES[key]
-        mol = gto.M(atom=atoms_to_str(atoms()), basis=basis, charge=charge, spin=spin, verbose=0, max_memory=12000)
-        cls = scf.RHF if kind == "rhf" else scf.UHF
-        t_ref, g_ref, ref = run(cls, mol, False)
-        t_moj, g_moj, moj = run(cls, mol, True)
-        print(f"{name:32s} {mol.nao_nr():5d} {ref.cycles:3d}/{moj.cycles:<3d} | {t_ref:8.1f} {t_moj:8.1f} {t_ref / t_moj:7.2f}x | "
-              f"{g_ref:8.2f} {g_moj:8.2f} {g_ref / g_moj:7.2f}x | {abs(ref.e_tot - moj.e_tot):9.1e}"
-              f"{'' if ref.converged and moj.converged else '  NOT CONVERGED'}", flush=True)
+        name = CASES[key][0]
+        ref = run(key, "pyscf", bench_dir)
+        moj = run(key, "mojoscf", bench_dir)
+        flag = "" if ref["conv"] and moj["conv"] else "  NOT CONVERGED"
+        print(f"{name:36s} {ref['nao']:4d} {ref['cycles']:2d}/{moj['cycles']:<3d}| {ref['total']:9.1f} {ref['veff']:7.1f} | "
+              f"{moj['total']:11.1f} {moj['mode']:4d} | {ref['total'] / moj['total']:6.2f}x {abs(ref['e'] - moj['e']):9.1e}{flag}",
+              flush=True)
 
 
 if __name__ == "__main__":

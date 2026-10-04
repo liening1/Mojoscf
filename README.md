@@ -2,21 +2,26 @@
 
 **Mojo replacements for the Python glue in pyscf's SCF driver.**
 
-[pyscf](https://pyscf.org) does its heavy lifting (integrals, J/K builds) in C,
-but the self-consistent-field loop that stitches those pieces together is
-Python + NumPy: Fock assembly, damping, DIIS extrapolation, the generalised
-eigenproblem, occupations, density matrices, energies, convergence tests and
-logging.  For small and medium molecules that glue is a large fraction of the
-wall time.  `mojoscf` re-implements exactly that layer in
-[Mojo](https://www.modular.com/mojo) and leaves everything else to pyscf.
+[pyscf](https://pyscf.org) evaluates integrals in C (libcint), but the
+self-consistent-field loop that stitches everything together is Python + NumPy:
+Fock assembly, damping, DIIS extrapolation, the generalised eigenproblem,
+occupations, density matrices, energies, convergence tests and logging, plus
+the orchestration of the two-electron (J/K) build.  `mojoscf` re-implements the
+whole SCF iteration in [Mojo](https://www.modular.com/mojo): the glue, and the
+J/K build itself whenever the integrals are in core (density-fitting tensor or
+8-fold packed ERIs).  An iteration then runs without touching Python at all.
+pyscf still evaluates the integrals (once) and runs direct-SCF J/K builds when
+the integrals do not fit in memory.
 
 * **Drop-in**: `mojoscf.RHF(mol)` and `mojoscf.UHF(mol)` are subclasses of
   `pyscf.scf.hf.RHF` / `pyscf.scf.uhf.UHF`; results (energies, orbitals,
   iteration counts, `scf_summary`) agree with pyscf to round-off because the
   driver is a port of `pyscf.scf.hf.kernel`, not a reimplementation of SCF.
   UHF includes open-shell and broken-symmetry (BS) calculations.
-* **Whole loop in Mojo**: one native call runs all iterations; the only Python
-  call per cycle is `mf.get_veff`, which is pyscf's compiled two-electron code.
+* **Whole loop in Mojo**: one native call runs all iterations.  With density
+  fitting or in-core ERIs the Coulomb/exchange matrices are built by Mojo
+  kernels too (`mojoscf.kernels.df_jk`, `jk_s8`), so a cycle makes no Python
+  call; only direct SCF still calls back into pyscf's C integral code.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -56,33 +61,37 @@ library and can then be slower than NumPy.  Use `mojoscf.RHF` /
 
 ### Larger systems
 
-With density fitting the two-electron part is cheap enough to see the glue
-(`python benchmarks/bench_large.py`, 4 cores).  "Glue" is total time minus the
-time inside `mf.get_veff`, i.e. exactly the part mojoscf replaces; it is not
-affected by the run-to-run noise (about 10%) of the J/K code both drivers share.
+Every (system, driver) pair below ran in its own process on an otherwise idle
+4-core machine (`python benchmarks/bench_large.py`), so BLAS thread pools and
+memory of one run cannot affect another.  For pyscf the time inside
+`mf.get_veff` is listed separately; for mojoscf the J/K build is part of the
+native loop (mode 1 = density fitting, 2 = in-core ERIs).
 
-| system                           | nao | cycles | total pyscf [s] | total mojoscf [s] | speed-up | glue pyscf [s] | glue mojoscf [s] | glue speed-up | &#124;ΔE&#124; [Eh] |
-|----------------------------------|----:|-------:|----------:|----------:|--------:|--------:|--------:|--------:|--------:|
-| C10H22 / 6-31G*                  | 184 |    9/9 |       8.4 |       6.6 |   1.27x |    1.78 |    0.36 |   4.95x | 5e-13 |
-| C20H42 / 6-31G                   | 264 |    8/8 |      27.5 |      25.7 |   1.07x |    1.79 |    0.52 |   3.43x | 1e-11 |
-| (H2O)10 / cc-pVDZ                | 240 |  10/10 |      13.3 |      11.5 |   1.16x |    2.23 |    0.54 |   4.11x | 2e-12 |
-| C60 / STO-3G                     | 300 |    8/8 |      94.2 |      92.8 |   1.01x |    1.81 |    0.69 |   2.65x | 2e-10 |
-| (H2O)20 / cc-pVDZ                | 480 |  10/10 |      81.2 |      82.0 |   0.99x |    2.79 |    0.88 |   3.18x | 2e-11 |
-| C20H41 radical / 6-31G, UHF      | 262 |  13/13 |      60.2 |      55.3 |   1.09x |    4.74 |    0.76 |   6.26x | 2e-11 |
-| (H2O)10 cation / cc-pVDZ, UHF    | 240 |  19/19 |      33.2 |      28.3 |   1.18x |    6.84 |    0.91 |   7.48x | 7e-12 |
+| system | nao | cycles | pyscf [s] | of which get_veff [s] | mojoscf [s] | J/K mode | speed-up | &#124;ΔE&#124; [Eh] |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| C10H22 / 6-31G* (DF) | 184 | 9/9 | 5.9 | 4.4 | 2.7 | 1 | 2.20x | 0.0e+00 |
+| C20H42 / 6-31G (DF) | 264 | 8/8 | 19.3 | 17.7 | 12.4 | 1 | 1.55x | 8.2e-12 |
+| (H2O)10 / cc-pVDZ (DF) | 240 | 10/10 | 7.6 | 5.8 | 4.8 | 1 | 1.59x | 1.6e-12 |
 
-The glue is 2.7 to 7.5 times faster at every size, but it is only 2 to 15% of
-these runs, so the total improves by 1.0 to 1.3 times: once the integral code
-dominates (C60, 20 waters) the end-to-end gain disappears into the noise.
-Speed-ups of 2 to 3 times overall need the glue to be a large fraction of the
-run, as in the small and medium systems above or with cheaper two-electron
-methods.
+(Remaining systems of `bench_large.py` are being re-measured and will be added.)
 
-Two things in this table were found by running these systems, not the small
-ones, and are fixed: the density handed to `get_veff` must carry pyscf's
-`mo_coeff`/`mo_occ` tags (density fitting then uses a much cheaper exchange
-build; without them the first call was 2x and the SCF up to 6x slower), and the
-BLAS library has to be chosen by matrix size (below).
+What the numbers mean:
+
+* **In-core ERIs** (non-DF, up to about 250 orbitals with pyscf's default
+  memory limit): pyscf's C contraction is replaced by a Mojo kernel that is
+  1.6 to 1.8x faster, on top of the glue savings.  For UHF pyscf never uses
+  this path (it recomputes the integrals in every cycle), so the in-core
+  build is a large win there.
+* **Density fitting**: the exchange build is a GEMM-bound operation
+  (`sum_Q (Q|mu i)(Q|nu i)`, 2.1e11 flops for 20 waters) that pyscf already
+  runs at about 100 GFlop/s on this machine; the Mojo kernel reaches 123
+  GFlop/s on the whole J+K build by streaming J and using a `dsyrk` update, a
+  1.2x gain per iteration.  The one-time 3-index integral build (libcint,
+  about 20 s for 20 waters) is unchanged, so the end-to-end gain for the
+  largest DF systems is modest and bounded by the integral code.
+* The earlier version of this table (v0.2.0) was measured while a leftover
+  background benchmark was competing for the CPU, which roughly doubled the
+  pyscf reference times; these numbers replace it.
 
 ### Broken-symmetry UHF
 
@@ -178,6 +187,10 @@ GEMM and the symmetric eigensolvers (`dsygvd`/`dsyevd`) are called through
   prefix).  Measured on 4 cores, the glue (diagonalisation, DIIS error vector,
   density) is 1.6x faster than pyscf's at 300 orbitals and 2.7x at 1000 with the
   threaded library, but 1.4 to 2.3x *slower* with the sequential one.
+* the density-fitting exchange build uses both: Mojo worker threads each call
+  the *sequential* library for their per-auxiliary-function GEMM (as pyscf's C
+  transform does with OpenMP), and the threaded library closes every block
+  with one `dsyrk` rank-k update.
 
 `MOJOSCF_BLAS=/path/lib.so[:prefix]` forces one library for all sizes, and
 `mojoscf.set_blas(small, prefix, large, prefix)` selects them from Python.  A
@@ -194,16 +207,21 @@ but slow for more than a few dozen orbitals.
 | `eig` (`x^T F x`, `dsyevd`, back-transform) | NumPy + LAPACK            | Mojo + LAPACK via `dlopen`           |
 | `get_occ`, `make_rdm1`, `energy_elec`, `get_grad`, norms | NumPy          | Mojo (+ BLAS `dgemm`)                |
 | convergence test, bookkeeping, logging       | Python                    | Mojo (log lines via one callback)    |
-| `get_veff` (J/K)                            | pyscf C (`libcvhf`)       | unchanged, called once per cycle     |
+| J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q sequential GEMM, threaded `dsyrk` |
+| J/K, in-core 8-fold ERIs (`_vhf.incore`)    | C (`libcvhf`, OpenMP)     | Mojo (`_mojo/erijk.mojo`), 1.6-1.8x faster |
+| J/K, direct SCF (integrals every cycle)     | C (libcint + `libcvhf`)   | unchanged, called once per cycle     |
+| integral evaluation (1e, 3-index DF tensor, 4-index ERIs) | C (libcint), once | unchanged                      |
 
 Source layout:
 
 ```
 mojoscf/
   _mojo/linalg.mojo    vector kernels, GEMM/eigensolver dispatch, native fallbacks
-  _mojo/kernels.mojo   make_rdm1, get_occ, get_grad, damping, level_shift, DIIS errvec, J/K
+  _mojo/kernels.mojo   make_rdm1, get_occ, get_grad, damping, level_shift, DIIS errvec, dense J/K
+  _mojo/dfjk.mojo      density-fitted J/K from pyscf's (naux, npair) tensor; density factorisation
+  _mojo/erijk.mojo     J/K from 8-fold packed ERIs
   _mojo/diis.mojo      pyscf-compatible CDIIS bookkeeping and extrapolation
-  _mojo/driver.mojo    the RHF SCF loop (port of pyscf.scf.hf.kernel)
+  _mojo/driver.mojo    the RHF/UHF SCF loop (port of pyscf.scf.hf.kernel) with native J/K modes
   _mojo/__init__.mojo  Python bindings (module mojoscf._mojoscf)
   _backend.py          build/load the extension, discover BLAS/LAPACK
   kernels.py           NumPy-facing wrappers
@@ -220,6 +238,14 @@ benchmarks/            bench_scf.py, bench_kernels.py
   fitting, X2C or other decorations that only change `get_jk`/`get_hcore`.
   ROHF, GHF, Kohn-Sham DFT, symmetry-adapted and second-order (Newton) SCF
   objects are rejected by `accelerate` and are not provided as classes yet.
+* The native J/K build covers plain `pyscf.df.DF` objects with the tensor in
+  core and the in-core 8-fold ERI path (used when `mol.incore_anyway` or
+  pyscf's own memory check allows it; for UHF this replaces pyscf's direct SCF
+  with an in-core build of the same integrals, so energies agree to the
+  direct-SCF screening threshold of 1e-13 rather than to round-off).  Range
+  separation, `only_dfj`, DF tensors on disk and overridden `get_jk`/`get_veff`
+  fall back to calling `mf.get_veff`.  `mf.scf_summary["mojoscf_veff_mode"]`
+  reports which path ran (1 = DF, 2 = in-core ERIs, 0 = pyscf callback).
 * Only CDIIS is native.  EDIIS/ADIIS, DIIS objects assigned to `mf.diis`,
   `diis_space_rollback`, `diis_file`, a custom `check_convergence` and
   dispersion corrections make the driver fall back to pyscf's loop (with the

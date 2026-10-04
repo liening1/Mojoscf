@@ -9,7 +9,7 @@ individual NumPy-facing kernels.
 from ._backend import BackendError, backend_info, blas_args, blas_config, build_extension, set_blas, use_native
 from . import guess, kernels
 from .diis import CDIIS
-from .scf import RHF, UHF, accelerate, is_supported, kernel
+from .scf import RHF, UHF, accelerate, is_supported, kernel, native_veff
 
 __version__ = "0.2.0"
 
@@ -18,6 +18,7 @@ __all__ = [
     "UHF",
     "CDIIS",
     "kernel",
+    "native_veff",
     "accelerate",
     "is_supported",
     "kernels",
