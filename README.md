@@ -209,7 +209,20 @@ pyscf's OpenMP, the Mojo engine through its runtime; best of 2):
 | (H2O)5 / cc-pVDZ       | 120 |  580 |        0.84 s  | 0.54 s  |  1.6  |        0.203 s | 0.125 s |  1.6  |
 | C8H18 / cc-pVDZ        | 202 |  974 |        6.50 s  | 3.49 s  |  1.9  |        0.926 s | 0.497 s |  1.9  |
 
-The one-electron matrices take 1 to 26 ms (libcint: 0.3 to 11 ms).  Per
+End to end (`--scf`: integrals plus the Mojo RHF loop, in-core ERIs, one run
+each, the previous ERI tensor released first):
+
+| system                 | RHF with libcint integrals | RHF with Mojo integrals | energies agree to |
+|------------------------|---------------------------:|------------------------:|------------------:|
+| H2O / cc-pVDZ          |                     0.17 s |                  0.05 s |           3e-14 Eh |
+| H2O / aug-cc-pVTZ      |                     0.30 s |                  0.34 s |           1e-14 Eh |
+| H2O / cc-pVQZ          |                     0.46 s |                  0.70 s |           1e-13 Eh |
+| benzene / cc-pVDZ      |                     0.82 s |                  1.45 s |           8e-13 Eh |
+| benzene / def2-TZVP    |                     6.04 s |                 10.24 s |           2e-13 Eh |
+| (H2O)5 / cc-pVDZ       |                     0.95 s |                  1.37 s |           5e-13 Eh |
+| C8H18 / cc-pVDZ        |                     4.91 s |                  8.25 s |           9e-13 Eh |
+
+The one-electron matrices take 1 to 27 ms (libcint: 0.3 to 11 ms).  Per
 shell-quartet class the engine is within 1.1 to 1.4x of libcint for
 multi-primitive d and f quartets, where the dense contractions dominate, and
 2 to 4x slower for s and p quartets with one primitive, where per-quartet
