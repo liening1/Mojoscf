@@ -27,7 +27,7 @@ from _mojo.dfjk import df_jk_core, factorize_density, block_size
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 
-comptime VERSION = "0.2.0"
+comptime VERSION = "0.3.0"
 
 
 @export

@@ -31,23 +31,24 @@ the integrals do not fit in memory.
 
 ## Results
 
-Hartree-Fock on 4 cores, pyscf 2.14, Mojo 1.1.0, default backend (pyscf's
-bundled OpenBLAS).  Both drivers use pyscf's direct-SCF `get_veff`, the same
-initial guess and `conv_tol = 1e-10`; best of 3 runs.
+Hartree-Fock on 4 cores, pyscf 2.14, Mojo 1.1.0.  Both drivers keep the ERIs
+in core for these molecules (pyscf's C contraction versus mojoscf's Mojo
+kernel), start from the same initial guess with `conv_tol = 1e-10`; best of 3
+runs, including the one-time integral evaluation.
 
 | system             | nao | cycles | pyscf [s] | mojoscf [s] | speed-up | &#124;ΔE&#124; [Eh] |
 |--------------------|----:|-------:|----------:|------------:|---------:|--------:|
-| H2O / STO-3G       |   7 |    7/7 |     0.032 |       0.019 |    1.7x  | 1e-14 |
-| H2O / cc-pVDZ      |  24 |    9/9 |     0.169 |       0.050 |    3.4x  | 6e-14 |
-| H2O / cc-pVTZ      |  58 |    9/9 |     0.191 |       0.095 |    2.0x  | 3e-14 |
-| benzene / STO-3G   |  36 |    7/7 |     0.215 |       0.180 |    1.2x  | 2e-13 |
-| benzene / cc-pVDZ  | 114 |    8/8 |     2.760 |       0.874 |    3.2x  | 9e-13 |
-| (H2O)3 / cc-pVDZ   |  72 |  10/10 |     0.478 |       0.310 |    1.5x  | 7e-13 |
+| H2O / STO-3G       |   7 |    7/7 |     0.037 |       0.035 |    1.1x  | 3e-14 |
+| H2O / cc-pVDZ      |  24 |    9/9 |     0.141 |       0.068 |    2.1x  | 1e-13 |
+| H2O / cc-pVTZ      |  58 |    9/9 |     0.164 |       0.148 |    1.1x  | 1e-13 |
+| benzene / STO-3G   |  36 |    7/7 |     0.201 |       0.184 |    1.1x  | 0 |
+| benzene / cc-pVDZ  | 114 |    8/8 |     2.435 |       0.835 |    2.9x  | 5e-13 |
+| (H2O)3 / cc-pVDZ   |  72 |  10/10 |     0.607 |       0.285 |    2.1x  | 7e-13 |
 
-(`python benchmarks/bench_scf.py`.)  The remaining time is the integral code
-both drivers share, so the speed-up shrinks as `get_veff` grows relative to
-the glue.  Per-cycle logs are identical to pyscf's to all printed digits,
-including with damping, level shifting and DIIS damping switched on.
+(`python benchmarks/bench_scf.py`.)  Below about 0.2 s the totals are dominated
+by the integral evaluation (libcint, identical in both) and by timer noise.
+Per-cycle logs are identical to pyscf's to all printed digits, including with
+damping, level shifting and DIIS damping switched on.
 
 Stand-alone kernels (`python benchmarks/bench_kernels.py`, same machine) show
 where the time goes: the DIIS update and the Fock diagonalisation are the
@@ -72,8 +73,13 @@ native loop (mode 1 = density fitting, 2 = in-core ERIs).
 | C10H22 / 6-31G* (DF) | 184 | 9/9 | 5.9 | 4.4 | 2.7 | 1 | 2.20x | 0.0e+00 |
 | C20H42 / 6-31G (DF) | 264 | 8/8 | 19.3 | 17.7 | 12.4 | 1 | 1.55x | 8.2e-12 |
 | (H2O)10 / cc-pVDZ (DF) | 240 | 10/10 | 7.6 | 5.8 | 4.8 | 1 | 1.59x | 1.6e-12 |
-
-(Remaining systems of `bench_large.py` are being re-measured and will be added.)
+| C60 / STO-3G (DF) | 300 | 8/8 | 57.3 | 55.6 | 46.0 | 1 | 1.24x | 1.1e-10 |
+| (H2O)20 / cc-pVDZ (DF) | 480 | 10/10 | 47.7 | 45.6 | 41.1 | 1 | 1.16x | 2.1e-11 |
+| C20H41 radical / 6-31G (DF, UHF) | 262 | 13/13 | 32.9 | 28.5 | 23.6 | 1 | 1.40x | 1.2e-11 |
+| (H2O)10 cation / cc-pVDZ (DF, UHF) | 240 | 19/19 | 22.4 | 16.3 | 8.7 | 1 | 2.56x | 7.7e-12 |
+| benzene / cc-pVDZ (in-core) | 114 | 8/8 | 2.8 | 1.4 | 0.9 | 2 | 3.25x | 9.1e-13 |
+| benzene cation / cc-pVDZ (UHF) | 114 | 12/12 | 5.7 | 2.2 | 1.0 | 2 | 5.64x | 1.0e-12 |
+| (H2O)5 / cc-pVDZ (in-core) | 120 | 10/10 | 3.2 | 1.7 | 0.8 | 2 | 4.09x | 8.0e-13 |
 
 What the numbers mean:
 
@@ -86,9 +92,19 @@ What the numbers mean:
   (`sum_Q (Q|mu i)(Q|nu i)`, 2.1e11 flops for 20 waters) that pyscf already
   runs at about 100 GFlop/s on this machine; the Mojo kernel reaches 123
   GFlop/s on the whole J+K build by streaming J and using a `dsyrk` update, a
-  1.2x gain per iteration.  The one-time 3-index integral build (libcint,
-  about 20 s for 20 waters) is unchanged, so the end-to-end gain for the
-  largest DF systems is modest and bounded by the integral code.
+  1.2x gain per iteration (K alone takes the same 1.6 s in both).  The first
+  cycle, whose density has no orbitals, is handled by diagonalising the
+  density into weighted orbitals instead of pyscf's O(naux nao^3) path.  The
+  one-time 3-index integral build (libcint, about 20 s for 20 waters) is
+  unchanged, so the end-to-end gain for the largest DF systems is bounded by
+  the integral code: 1.16x for 20 waters, 1.24x for C60, 1.4 to 2.6x when
+  more cycles are needed (UHF).
+* **What is still C**: libcint evaluates all integrals (one-electron matrices,
+  the 3-index DF tensor, the 4-index ERIs) once per molecule, and direct SCF
+  (integrals recomputed every cycle because they do not fit in memory) runs
+  pyscf's `libcvhf`.  A Mojo integral engine competitive with libcint would be
+  a project of its own; on this hardware the remaining large-system cost is
+  compute-bound BLAS and integral work, not Python glue.
 * The earlier version of this table (v0.2.0) was measured while a leftover
   background benchmark was competing for the CPU, which roughly doubled the
   pyscf reference times; these numbers replace it.

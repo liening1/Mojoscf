@@ -40,7 +40,11 @@ def jk_s8_core(
     """
     var npair = nao * (nao + 1) // 2
     var n2 = nao * nao
+    # Small problems (a few hundred AO pairs) are faster on one thread than with
+    # the dispatch and reduction overhead of several work items.
     var nchunks = max(1, 4 * parallelism_level())
+    if npair * (npair + 1) // 2 < (1 << 18):
+        nchunks = 1
     if nchunks > npair:
         nchunks = npair
 

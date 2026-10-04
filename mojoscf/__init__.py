@@ -11,7 +11,7 @@ from . import guess, kernels
 from .diis import CDIIS
 from .scf import RHF, UHF, accelerate, is_supported, kernel, native_veff
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "RHF",
