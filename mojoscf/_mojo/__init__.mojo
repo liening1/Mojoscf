@@ -26,8 +26,9 @@ from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
+from _mojo.integrals import Basis, BoysTable, int1e_core, eri_s8_core, int3c2e_core, int2c2e_core
 
-comptime VERSION = "0.3.0"
+comptime VERSION = "0.4.0"
 
 
 @export
@@ -56,6 +57,10 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k): J/K from 8-fold packed ERIs.")
         m.def_function[py_factorize_density]("factorize_density", docstring="factorize_density(dm, orb_out, sign_out, rel_tol, path, prefix) -> m.")
         m.def_function[scf_kernel]("scf_kernel", docstring="Native RHF/UHF SCF driver; see mojoscf.scf.kernel.")
+        m.def_function[py_int1e]("int1e", docstring="int1e(basis, s_out, t_out, v_out): overlap, kinetic and nuclear attraction matrices.")
+        m.def_function[py_int2e_s8]("int2e_s8", docstring="int2e_s8(basis, eri_out, schwarz_tol): 8-fold packed electron repulsion integrals.")
+        m.def_function[py_int3c2e]("int3c2e", docstring="int3c2e(basis, auxbasis, out): (ab|P) as a (naux, npair) array.")
+        m.def_function[py_int2c2e]("int2c2e", docstring="int2c2e(auxbasis, out): (P|Q) as a dense (naux, naux) array.")
         return m.finalize()
     except e:
         abort(String("error creating the mojoscf._mojoscf module: ", e))
@@ -350,4 +355,64 @@ def py_jk_s8(
     var nj = nset if Bool(py=with_j) else 0
     var nk = nset if Bool(py=with_k) else 0
     jk_s8_core(f64ptr(eri), nao, nj, f64ptr(dms), f64ptr(vj), nk, f64ptr(dms), f64ptr(vk))
+    return PythonObject(None)
+
+
+# --------------------------------------------------------------------------
+# Integral engine
+# --------------------------------------------------------------------------
+
+
+def i64ptr(arr: PythonObject) raises -> Pointer[Int64, MutAnyOrigin]:
+    return Pointer[Int64, MutAnyOrigin](unsafe_from_address=Int(py=arr.__array_interface__["data"][0]))
+
+
+def _basis(b: PythonObject) raises -> Basis:
+    """``b`` is the tuple (atm, bas, env, nf, c2s) prepared by mojoscf.integrals."""
+    var atm = b[0]
+    var bas = b[1]
+    var env = b[2]
+    var nf = b[3]
+    var c2s = b[4]
+    return Basis(
+        Int(py=atm.shape[0]), i64ptr(atm), Int(py=bas.shape[0]), i64ptr(bas), Int(py=env.shape[0]), f64ptr(env),
+        Int(py=nf.shape[0]), i64ptr(nf), f64ptr(c2s),
+    )
+
+
+def py_int1e(basis: PythonObject, s: PythonObject, t: PythonObject, v: PythonObject) raises -> PythonObject:
+    var bs = _basis(basis)
+    var boys = BoysTable()
+    int1e_core(bs, boys, f64ptr(s), f64ptr(t), f64ptr(v))
+    _ = bs^
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_int2e_s8(basis: PythonObject, eri: PythonObject, schwarz_tol: PythonObject) raises -> PythonObject:
+    var bs = _basis(basis)
+    var boys = BoysTable()
+    eri_s8_core(bs, boys, f64ptr(eri), Float64(py=schwarz_tol))
+    _ = bs^
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_int3c2e(basis: PythonObject, auxbasis: PythonObject, dst: PythonObject) raises -> PythonObject:
+    var bs = _basis(basis)
+    var aux = _basis(auxbasis)
+    var boys = BoysTable()
+    int3c2e_core(bs, aux, boys, f64ptr(dst))
+    _ = bs^
+    _ = aux^
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_int2c2e(auxbasis: PythonObject, dst: PythonObject) raises -> PythonObject:
+    var aux = _basis(auxbasis)
+    var boys = BoysTable()
+    int2c2e_core(aux, boys, f64ptr(dst))
+    _ = aux^
+    _ = boys^
     return PythonObject(None)

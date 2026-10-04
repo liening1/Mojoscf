@@ -28,3 +28,4 @@ jobs:
         run: |
           python benchmarks/bench_scf.py --repeat 1 --cases 0,1
           python benchmarks/bench_bs.py
+          python benchmarks/bench_integrals.py --repeat 1 --cases 0 --scf

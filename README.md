@@ -10,8 +10,10 @@ the orchestration of the two-electron (J/K) build.  `mojoscf` re-implements the
 whole SCF iteration in [Mojo](https://www.modular.com/mojo): the glue, and the
 J/K build itself whenever the integrals are in core (density-fitting tensor or
 8-fold packed ERIs).  An iteration then runs without touching Python at all.
-pyscf still evaluates the integrals (once) and runs direct-SCF J/K builds when
-the integrals do not fit in memory.
+pyscf's libcint evaluates the integrals by default, but `mojoscf.integrals`
+provides a complete Mojo integral engine (overlap, kinetic, nuclear attraction,
+four-index and density-fitting integrals) that can replace it; only direct-SCF
+J/K builds for integrals that do not fit in memory still run pyscf's C code.
 
 * **Drop-in**: `mojoscf.RHF(mol)` and `mojoscf.UHF(mol)` are subclasses of
   `pyscf.scf.hf.RHF` / `pyscf.scf.uhf.UHF`; results (energies, orbitals,
@@ -22,6 +24,12 @@ the integrals do not fit in memory.
   fitting or in-core ERIs the Coulomb/exchange matrices are built by Mojo
   kernels too (`mojoscf.kernels.df_jk`, `jk_s8`), so a cycle makes no Python
   call; only direct SCF still calls back into pyscf's C integral code.
+* **Mojo integral engine** (`mojoscf.integrals`): a McMurchie-Davidson
+  implementation of the one-electron, electron-repulsion and density-fitting
+  integrals over contracted Gaussians, agreeing with libcint to about 1e-13
+  for s to g functions, spherical or Cartesian, and running at 1/2 to 1/3 of
+  libcint's speed.  `mojoscf.integrals.attach(mf)` makes an SCF object use it;
+  it is opt-in because libcint is still faster.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -99,12 +107,12 @@ What the numbers mean:
   unchanged, so the end-to-end gain for the largest DF systems is bounded by
   the integral code: 1.16x for 20 waters, 1.24x for C60, 1.4 to 2.6x when
   more cycles are needed (UHF).
-* **What is still C**: libcint evaluates all integrals (one-electron matrices,
-  the 3-index DF tensor, the 4-index ERIs) once per molecule, and direct SCF
-  (integrals recomputed every cycle because they do not fit in memory) runs
-  pyscf's `libcvhf`.  A Mojo integral engine competitive with libcint would be
-  a project of its own; on this hardware the remaining large-system cost is
-  compute-bound BLAS and integral work, not Python glue.
+* **What is still C**: by default libcint evaluates all integrals
+  (one-electron matrices, the 3-index DF tensor, the 4-index ERIs) once per
+  molecule, and direct SCF (integrals recomputed every cycle because they do
+  not fit in memory) runs pyscf's `libcvhf`.  The Mojo integral engine below
+  can take over the one-time integral evaluation, but it is 1.5 to 2.5x slower
+  than libcint, so it is not used unless asked for.
 * The earlier version of this table (v0.2.0) was measured while a leftover
   background benchmark was competing for the CPU, which roughly doubled the
   pyscf reference times; these numbers replace it.
@@ -140,6 +148,76 @@ above the triplet) and Fe(III)/Fe(III) with five unpaired electrons per iron
 needing 38 cycles with a 0.3 Eh level shift.  The N2 row is one of two
 broken-symmetry states the mix guess can reach, see the degenerate-shell caveat
 below.
+
+## Mojo integral engine
+
+`mojoscf.integrals` evaluates the integrals of a pyscf `Mole` in Mojo and
+returns exactly what `mol.intor` returns (same conventions: pyscf's
+`_atm`/`_bas`/`_env` tables, `gto_norm`-normalised primitives, libcint's
+Cartesian component order, `cart2sph` spherical functions or `mol.cart`
+Cartesian ones, `aosym="s8"` packing, pyscf's DF tensor layout).
+
+| function                          | pyscf equivalent                                   |
+|-----------------------------------|----------------------------------------------------|
+| `int1e(mol)` / `get_ovlp`, `get_kin`, `get_nuc`, `get_hcore` | `mol.intor("int1e_ovlp" / "int1e_kin" / "int1e_nuc")`, `scf.hf.get_hcore` |
+| `int2e_s8(mol)`, `int2e(mol)`     | `mol.intor("int2e", aosym="s8")`, `mol.intor("int2e")` |
+| `int3c2e(mol, auxmol)`, `int2c2e(auxmol)` | `df.incore.aux_e2(..., aosym="s2ij").T`, `auxmol.intor("int2c2e")` |
+| `cholesky_eri(mol, auxbasis)`     | `df.incore.cholesky_eri`                           |
+| `attach(mf)`                      | makes an RHF/UHF object (plain or density-fitted) use all of the above |
+
+**Method.** McMurchie-Davidson: Hermite expansion coefficients `E_t^{ij}` for
+every primitive pair, Hermite Coulomb integrals `R_{tuv}` from the Boys
+function (an 8-term Taylor table on a 0.05 grid up to T = 36 followed by the
+downward recursion; the asymptotic form with the upward recursion beyond), and
+
+    (ab|cd) = 2 pi^{5/2} / (p q sqrt(p+q)) sum_{tuv} E^{ab}_{tuv} sum_{TUV} (-1)^{T+U+V} E^{cd}_{TUV} R_{t+T,u+U,v+V}
+
+evaluated as two small dense matrix products per primitive quartet
+(`R x E^{ab}` over the bra Hermite indices, then `x E^{cd}`) through
+register-tiled SIMD kernels (two output rows x four vectors, eight independent
+accumulators).  Primitive blocks are contracted over the ket per bra primitive
+pair, so general contractions cost little extra; shells with `l <= 1` fold the
+libcint `common_fac_sp` factors into the coefficients and higher shells are
+transformed with the `cart2sph` matrices supplied by Python.  Primitive pairs
+with `mu |AB|^2 > 60` are dropped (libcint's `EXPCUTOFF`) and shell quartets
+are Schwarz-screened (`schwarz_tol`, default 1e-14; `0` computes everything).
+Worker threads pull chunks of bra shell pairs from a shared counter, set up
+every ket pair once per chunk and write the 8-fold packed elements directly;
+every packed element belongs to exactly one shell quartet, so no locking is
+needed.  Three- and two-centre integrals reuse the same code with a dummy
+s shell of exponent 0 as the partner of each auxiliary function; the Cholesky
+factorisation and triangular solve of `cholesky_eri` are LAPACK calls through
+SciPy, as in pyscf.
+
+**Accuracy.** Against libcint on H2O, Ne-H and Ne with STO-3G, cc-pVDZ,
+aug-cc-pVTZ, cc-pVQZ (s to g shells, general contractions, spherical and
+Cartesian): overlap to 1e-15, kinetic energy to 1e-14, nuclear attraction to
+2e-13, every four-index integral to 1e-13, three- and two-centre integrals to
+2e-13 and 1e-11 (values of order 1e3).  SCF energies with either set of
+integrals agree to 1e-12 Eh.
+
+**Speed** (`benchmarks/bench_integrals.py`, 4 cores for both: libcint through
+pyscf's OpenMP, the Mojo engine through its runtime; best of 2):
+
+| system                 | nao | naux | ERIs (s8) Mojo | libcint | ratio | DF tensor Mojo | libcint | ratio |
+|------------------------|----:|-----:|---------------:|--------:|------:|---------------:|--------:|------:|
+| H2O / cc-pVDZ          |  24 |  116 |        0.007 s | 0.002 s |  3.4  |        0.014 s | 0.011 s |  1.3  |
+| H2O / aug-cc-pVTZ      |  92 |  139 |        0.148 s | 0.081 s |  1.8  |        0.028 s | 0.017 s |  1.6  |
+| H2O / cc-pVQZ          | 115 |  208 |        0.403 s | 0.180 s |  2.2  |        0.054 s | 0.032 s |  1.7  |
+| benzene / cc-pVDZ      | 114 |  558 |        1.19 s  | 0.47 s  |  2.5  |        0.174 s | 0.119 s |  1.5  |
+| benzene / def2-TZVP    | 222 |  558 |        7.56 s  | 3.89 s  |  1.9  |        0.586 s | 0.327 s |  1.8  |
+| (H2O)5 / cc-pVDZ       | 120 |  580 |        0.84 s  | 0.54 s  |  1.6  |        0.203 s | 0.125 s |  1.6  |
+| C8H18 / cc-pVDZ        | 202 |  974 |        6.50 s  | 3.49 s  |  1.9  |        0.926 s | 0.497 s |  1.9  |
+
+The one-electron matrices take 1 to 26 ms (libcint: 0.3 to 11 ms).  Per
+shell-quartet class the engine is within 1.1 to 1.4x of libcint for
+multi-primitive d and f quartets, where the dense contractions dominate, and
+2 to 4x slower for s and p quartets with one primitive, where per-quartet
+set-up dominates; libcint's Rys quadrature needs fewer operations per
+primitive quartet than the Hermite contractions used here.  The engine is
+therefore opt-in: `attach(mf)` or the functions above.  On a virtual machine
+the first touch of a multi-GB ERI tensor can cost several seconds (page
+faults), which the benchmark excludes by touching the memory beforehand.
 
 ## Installation
 
@@ -177,6 +255,14 @@ mol = gto.M(atom="H 0 0 0; H 0 0 3.0", basis="cc-pvdz")
 mf = mojoscf.UHF(mol)
 mf.kernel(dm0=mix_homo_lumo_guess(mol))      # spin-polarised start -> BS solution
 print(mf.e_tot, mf.spin_square())
+
+# Integrals from the Mojo engine instead of libcint
+from mojoscf import integrals
+S = integrals.get_ovlp(mol)                     # == mol.intor("int1e_ovlp")
+eri = integrals.int2e_s8(mol)                   # == mol.intor("int2e", aosym="s8")
+cderi = integrals.cholesky_eri(mol, "cc-pvdz-jkfit")   # == pyscf.df.incore.cholesky_eri
+mf = integrals.attach(mojoscf.RHF(mol))         # hcore, overlap and ERIs from Mojo
+mf.kernel()
 
 # Use the individual kernels
 from mojoscf import kernels
@@ -226,7 +312,7 @@ but slow for more than a few dozen orbitals.
 | J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q sequential GEMM, threaded `dsyrk` |
 | J/K, in-core 8-fold ERIs (`_vhf.incore`)    | C (`libcvhf`, OpenMP)     | Mojo (`_mojo/erijk.mojo`), 1.6-1.8x faster |
 | J/K, direct SCF (integrals every cycle)     | C (libcint + `libcvhf`)   | unchanged, called once per cycle     |
-| integral evaluation (1e, 3-index DF tensor, 4-index ERIs) | C (libcint), once | unchanged                      |
+| integral evaluation (1e, 3-index DF tensor, 4-index ERIs) | C (libcint), once | libcint by default; Mojo engine (`_mojo/integrals.mojo`) with `mojoscf.integrals.attach(mf)` |
 
 Source layout:
 
@@ -238,14 +324,16 @@ mojoscf/
   _mojo/erijk.mojo     J/K from 8-fold packed ERIs
   _mojo/diis.mojo      pyscf-compatible CDIIS bookkeeping and extrapolation
   _mojo/driver.mojo    the RHF/UHF SCF loop (port of pyscf.scf.hf.kernel) with native J/K modes
+  _mojo/integrals.mojo Gaussian integral engine (Boys function, Hermite recursions, S/T/V, ERIs, 3c2e/2c2e)
   _mojo/__init__.mojo  Python bindings (module mojoscf._mojoscf)
   _backend.py          build/load the extension, discover BLAS/LAPACK
   kernels.py           NumPy-facing wrappers
+  integrals.py         pyscf-compatible integral functions and attach()
   diis.py              CDIIS drop-in class
   scf.py               RHF/UHF classes, kernel(), accelerate()
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
-tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf
-benchmarks/            bench_scf.py, bench_kernels.py
+tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint
+benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py
 ```
 
 ## Scope and limitations
@@ -274,6 +362,11 @@ benchmarks/            bench_scf.py, bench_kernels.py
 * The checkpoint file is written once at the end of the SCF instead of every
   cycle, and the per-cycle HOMO/LUMO lines of pyscf's log are printed once, for
   the final orbitals.
+* The integral engine handles contracted Gaussians up to l = 8 (spherical or
+  Cartesian), point nuclei and no effective core potentials; it provides the
+  overlap, kinetic, nuclear-attraction, four-index and 3-/2-centre Coulomb
+  integrals only (no derivatives, multipoles or range-separated operators).
+  `unsupported_reason(mol)` says why a molecule is rejected.
 * The first call in a process starts the Mojo runtime and loads BLAS
   (about 50 ms); time a second run when benchmarking tiny systems.
 * Only the LP64 (32-bit integer) BLAS/LAPACK interface is supported.

@@ -1,0 +1,141 @@
+"""The Mojo integral engine against libcint (``mol.intor``)."""
+import numpy as np
+import pytest
+from pyscf import ao2mo, df, gto, scf
+
+import mojoscf
+from mojoscf import integrals as mi
+
+H2O = "O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587"
+
+
+def _mol(basis, **kw):
+    return gto.M(atom=H2O, basis=basis, verbose=0, **kw)
+
+
+@pytest.fixture(scope="module", params=["sto-3g", "cc-pvdz", "aug-cc-pvdz", "def2-svp"])
+def mol(request):
+    return _mol(request.param)
+
+
+def test_one_electron(mol):
+    s, t, v = mi.int1e(mol)
+    assert np.allclose(s, mol.intor("int1e_ovlp"), atol=1e-13, rtol=0)
+    assert np.allclose(t, mol.intor("int1e_kin"), atol=1e-12, rtol=0)
+    assert np.allclose(v, mol.intor("int1e_nuc"), atol=1e-11, rtol=0)
+    assert np.allclose(mi.get_hcore(mol), scf.hf.get_hcore(mol), atol=1e-11, rtol=0)
+    assert np.allclose(mi.get_ovlp(mol), s)
+
+
+def test_two_electron_s8(mol):
+    eri = mi.int2e_s8(mol, schwarz_tol=0.0)
+    ref = mol.intor("int2e", aosym="s8")
+    assert eri.shape == ref.shape
+    assert abs(eri - ref).max() < 1e-12
+
+
+def test_two_electron_screened_and_full(mol):
+    eri = mi.int2e(mol)  # default Schwarz screening
+    ref = mol.intor("int2e")
+    assert eri.shape == ref.shape
+    assert abs(eri - ref).max() < 1e-12
+
+
+def test_higher_angular_momentum():
+    """f and g shells, general contractions."""
+    mol = gto.M(atom="Ne 0 0 0; H 0 0 1.9", basis={"Ne": "cc-pvqz", "H": "cc-pvdz"}, spin=1, verbose=0)
+    assert max(mol.bas_angular(i) for i in range(mol.nbas)) == 4
+    s, t, v = mi.int1e(mol)
+    assert abs(s - mol.intor("int1e_ovlp")).max() < 1e-13
+    assert abs(t - mol.intor("int1e_kin")).max() < 1e-12
+    assert abs(v - mol.intor("int1e_nuc")).max() < 1e-11
+    assert abs(mi.int2e_s8(mol, 0.0) - mol.intor("int2e", aosym="s8")).max() < 1e-12
+
+
+def test_cartesian_basis():
+    mol = _mol("cc-pvdz", cart=True)
+    s, t, v = mi.int1e(mol)
+    assert abs(s - mol.intor("int1e_ovlp")).max() < 1e-13
+    assert abs(t - mol.intor("int1e_kin")).max() < 1e-12
+    assert abs(v - mol.intor("int1e_nuc")).max() < 1e-11
+    assert abs(mi.int2e_s8(mol, 0.0) - mol.intor("int2e", aosym="s8")).max() < 1e-12
+
+
+def test_density_fitting_tensors():
+    mol = _mol("cc-pvdz")
+    auxmol = df.addons.make_auxmol(mol, "cc-pvdz-jkfit")
+    j3c = mi.int3c2e(mol, auxmol)
+    ref3 = df.incore.aux_e2(mol, auxmol, "int3c2e", aosym="s2ij").T
+    assert j3c.shape == (auxmol.nao_nr(), mol.nao_nr() * (mol.nao_nr() + 1) // 2)
+    assert abs(j3c - ref3).max() < 1e-12
+    j2c = mi.int2c2e(auxmol)
+    assert abs(j2c - auxmol.intor("int2c2e")).max() < 1e-11
+    cderi = mi.cholesky_eri(mol, auxmol=auxmol)
+    ref = df.incore.cholesky_eri(mol, auxmol=auxmol)
+    assert abs(cderi - ref).max() < 1e-10
+    # sanity: the fitted integrals approximate the exact ones (jkfit bases are
+    # tuned for J/K, individual integrals carry errors of order 1e-2)
+    eri_df = cderi.T @ cderi
+    eri = ao2mo.restore(4, mol.intor("int2e"), mol.nao_nr())
+    assert abs(eri_df - eri).max() < 0.05
+
+
+def test_cholesky_eri_default_auxbasis():
+    mol = _mol("sto-3g")
+    cderi = mi.cholesky_eri(mol)
+    ref = df.incore.cholesky_eri(mol)
+    assert cderi.shape == ref.shape
+    assert abs(cderi - ref).max() < 1e-10
+
+
+def test_attach_rhf_matches_pyscf():
+    mol = _mol("cc-pvdz")
+    e_ref = scf.RHF(mol).run(conv_tol=1e-11).e_tot
+    mf = mi.attach(mojoscf.RHF(mol))
+    assert mf._eri is not None
+    assert mf.get_ovlp() is mf.get_ovlp(mol)
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    assert mf.converged
+    assert abs(mf.e_tot - e_ref) < 1e-9
+    assert mf.scf_summary["mojoscf_veff_mode"] == 2
+
+
+def test_attach_uhf_matches_pyscf():
+    mol = gto.M(atom="O 0 0 0; H 0 0 0.97", basis="cc-pvdz", spin=1, verbose=0)
+    e_ref = scf.UHF(mol).run(conv_tol=1e-11).e_tot
+    mf = mi.attach(mojoscf.UHF(mol))
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    assert mf.converged
+    assert abs(mf.e_tot - e_ref) < 1e-9
+
+
+def test_attach_density_fitting():
+    mol = _mol("cc-pvdz")
+    e_ref = scf.RHF(mol).density_fit().run(conv_tol=1e-11).e_tot
+    mf = mi.attach(mojoscf.RHF(mol).density_fit())
+    assert mf.with_df._cderi is not None
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    assert mf.converged
+    assert abs(mf.e_tot - e_ref) < 1e-9
+    assert mf.scf_summary["mojoscf_veff_mode"] == 1
+
+
+def test_unsupported_molecules():
+    mol = gto.M(atom="Cu 0 0 0", basis="lanl2dz", ecp="lanl2dz", spin=1, verbose=0)
+    assert "core potential" in mi.unsupported_reason(mol)
+    with pytest.raises(NotImplementedError):
+        mi.get_ovlp(mol)
+    mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", nucmod="G", verbose=0)
+    assert "point nuclei" in mi.unsupported_reason(mol)
+    assert mi.unsupported_reason(_mol("sto-3g")) is None
+
+
+def test_basis_tables_layout():
+    mol = _mol("cc-pvdz")
+    atm, bas, env, nf, c2s = mi.basis_tables(mol)
+    assert atm.dtype == np.int64 and bas.dtype == np.int64 and env.dtype == np.float64
+    assert list(nf) == [1, 3, 5]
+    assert c2s.size == 1 * 1 + 3 * 3 + 6 * 5
