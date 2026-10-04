@@ -12,8 +12,9 @@ J/K build itself whenever the integrals are in core (density-fitting tensor or
 8-fold packed ERIs).  An iteration then runs without touching Python at all.
 pyscf's libcint evaluates the integrals by default, but `mojoscf.integrals`
 provides a complete Mojo integral engine (overlap, kinetic, nuclear attraction,
-four-index and density-fitting integrals) that can replace it; only direct-SCF
-J/K builds for integrals that do not fit in memory still run pyscf's C code.
+four-index and density-fitting integrals) that replaces it and is faster for
+the two-electron integrals; only direct-SCF J/K builds for integrals that do
+not fit in memory still run pyscf's C code.
 
 * **Drop-in**: `mojoscf.RHF(mol)` and `mojoscf.UHF(mol)` are subclasses of
   `pyscf.scf.hf.RHF` / `pyscf.scf.uhf.UHF`; results (energies, orbitals,
@@ -27,9 +28,9 @@ J/K builds for integrals that do not fit in memory still run pyscf's C code.
 * **Mojo integral engine** (`mojoscf.integrals`): a McMurchie-Davidson
   implementation of the one-electron, electron-repulsion and density-fitting
   integrals over contracted Gaussians, agreeing with libcint to about 1e-13
-  for s to g functions, spherical or Cartesian, and running at 1/2 to 1/3 of
-  libcint's speed.  `mojoscf.integrals.attach(mf)` makes an SCF object use it;
-  it is opt-in because libcint is still faster.
+  for s to g functions, spherical or Cartesian.  The 4-index ERI tensor is
+  built in 0.47 to 0.97x of libcint's time and the 3-index DF integrals in
+  about 0.75x; `mojoscf.integrals.attach(mf)` makes an SCF object use it.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -111,8 +112,8 @@ What the numbers mean:
   (one-electron matrices, the 3-index DF tensor, the 4-index ERIs) once per
   molecule, and direct SCF (integrals recomputed every cycle because they do
   not fit in memory) runs pyscf's `libcvhf`.  The Mojo integral engine below
-  can take over the one-time integral evaluation, but it is 1.5 to 2.5x slower
-  than libcint, so it is not used unless asked for.
+  takes over the one-time integral evaluation with `attach(mf)` and is faster
+  than libcint for it (0.47 to 0.97x of the time for the 4-index tensor).
 * The earlier version of this table (v0.2.0) was measured while a leftover
   background benchmark was competing for the CPU, which roughly doubled the
   pyscf reference times; these numbers replace it.
@@ -155,7 +156,8 @@ below.
 returns exactly what `mol.intor` returns (same conventions: pyscf's
 `_atm`/`_bas`/`_env` tables, `gto_norm`-normalised primitives, libcint's
 Cartesian component order, `cart2sph` spherical functions or `mol.cart`
-Cartesian ones, `aosym="s8"` packing, pyscf's DF tensor layout).
+Cartesian ones, `aosym="s8"` packing, pyscf's DF tensor layout).  For the
+four-index and three-centre integrals it is faster than libcint.
 
 | function                          | pyscf equivalent                                   |
 |-----------------------------------|----------------------------------------------------|
@@ -165,72 +167,103 @@ Cartesian ones, `aosym="s8"` packing, pyscf's DF tensor layout).
 | `cholesky_eri(mol, auxbasis)`     | `df.incore.cholesky_eri`                           |
 | `attach(mf)`                      | makes an RHF/UHF object (plain or density-fitted) use all of the above |
 
-**Method.** McMurchie-Davidson: Hermite expansion coefficients `E_t^{ij}` for
-every primitive pair, Hermite Coulomb integrals `R_{tuv}` from the Boys
-function (an 8-term Taylor table on a 0.05 grid up to T = 36 followed by the
-downward recursion; the asymptotic form with the upward recursion beyond), and
+**Method.** McMurchie-Davidson: Hermite expansion coefficients `E_t^{ij}`,
+Hermite Coulomb integrals `R_{tuv}` from the Boys function (an 8-term Taylor
+table on a 0.05 grid up to T = 36, the asymptotic form beyond), and
 
     (ab|cd) = 2 pi^{5/2} / (p q sqrt(p+q)) sum_{tuv} E^{ab}_{tuv} sum_{TUV} (-1)^{T+U+V} E^{cd}_{TUV} R_{t+T,u+U,v+V}
 
-evaluated as two small dense matrix products per primitive quartet
-(`R x E^{ab}` over the bra Hermite indices, then `x E^{cd}`) through
-register-tiled SIMD kernels (two output rows x four vectors, eight independent
-accumulators).  Primitive blocks are contracted over the ket per bra primitive
-pair, so general contractions cost little extra; shells with `l <= 1` fold the
-libcint `common_fac_sp` factors into the coefficients and higher shells are
-transformed with the `cart2sph` matrices supplied by Python.  Primitive pairs
-with `mu |AB|^2 > 60` are dropped (libcint's `EXPCUTOFF`) and shell quartets
-are Schwarz-screened (`schwarz_tol`, default 1e-14; `0` computes everything).
-Worker threads pull chunks of bra shell pairs from a shared counter, set up
-every ket pair once per chunk and write the 8-fold packed elements directly;
-every packed element belongs to exactly one shell quartet, so no locking is
-needed.  Three- and two-centre integrals reuse the same code with a dummy
-s shell of exponent 0 as the partner of each auxiliary function; the Cholesky
-factorisation and triangular solve of `cholesky_eri` are LAPACK calls through
-SciPy, as in pyscf.
+The implementation is built around a few decisions, each measured:
 
-**Accuracy.** Against libcint on H2O, Ne-H and Ne with STO-3G, cc-pVDZ,
-aug-cc-pVTZ, cc-pVQZ (s to g shells, general contractions, spherical and
-Cartesian): overlap to 1e-15, kinetic energy to 1e-14, nuclear attraction to
-2e-13, every four-index integral to 1e-13, three- and two-centre integrals to
-2e-13 and 1e-11 (values of order 1e3).  SCF energies with either set of
-integrals agree to 1e-12 Eh.
+* **Shell-pair table.**  Every shell pair is set up once, in parallel: for
+  each primitive pair it stores p, 1/p, P and a matrix `E[h][j]` over the
+  Hermite indices h and the pair's *final* basis functions j, with the
+  contraction coefficients and the Cartesian-to-spherical transformation
+  already applied.  The integrals are linear in these matrices, so a quartet
+  comes out directly in spherical functions with no transformation step
+  (which had cost 38% of the time for d shells), and a d-d pair carries 25
+  columns instead of 36.
+* **Two dense products per quartet.**  For an outer pair O and an inner pair
+  I, `T[h_o][i] += sum_{h_i} R[h_o + h_i] E_I[h_i][i]` accumulates over the
+  inner primitives and `(o|i) += sum_{h_o} (-1)^{|h_o|} E_O[h_o][o] T[h_o][i]`
+  runs once per outer primitive.  `eri_quartet` makes the pair with more
+  primitives (by operation count) the inner one, so for contracted shells the
+  outer transform is amortised.
+* **Compile-time kernels.**  For Hermite degrees up to 4 per pair (and up to
+  6 against a pair of degree <= 2) the Boys function, the Hermite recursion
+  and both transforms are unrolled with `comptime` indices
+  (`tools/gen_eri_kernel.py` writes the register-blocked code).  The unrolled
+  L=4 recursion takes 11 ns instead of over 100 ns with run-time loops.
+* **SIMD over primitive quartets.**  Eight inner primitive pairs are processed
+  together: prefactors, the Boys function (table rows gathered per lane,
+  branch-free blend with the asymptotic form) and the Hermite recursion run as
+  8-wide vectors, the transforms keep eight independent FMA chains in
+  registers and take R as an embedded broadcast operand, and all lanes of a
+  batch accumulate before one store.  Single primitive quartets use a scalar
+  version of the same code.  Vector operands are 64-byte aligned (cache-line
+  splits had cost 1.45x).
+* Higher degrees use a generic kernel with run-time loops and
+  register-tiled SIMD products.  Primitive pairs with `mu |AB|^2 > 60` are
+  dropped (libcint's `EXPCUTOFF`), shell quartets are Schwarz-screened
+  (`schwarz_tol`, default 1e-14), and worker threads pull bra pairs from a
+  shared counter and write the 8-fold packed elements directly.  Three- and
+  two-centre integrals reuse the kernels with a dummy s shell of exponent 0;
+  a three-centre task owns one bra shell, whose AO pairs form a contiguous
+  column block of the `(naux, npair)` output, so it writes whole row segments.
+  The Cholesky factorisation and triangular solve of `cholesky_eri` are LAPACK
+  calls through SciPy, as in pyscf.
 
-**Speed** (`benchmarks/bench_integrals.py`, 4 cores for both: libcint through
-pyscf's OpenMP, the Mojo engine through its runtime; best of 2):
+**Accuracy.** Against libcint on H2O, Ne-H, Ne, benzene, octane and a
+30-water cluster with STO-3G up to cc-pVQZ (s to g shells, general
+contractions, spherical and Cartesian): overlap to 1e-15, kinetic energy to
+1e-14, nuclear attraction to 2e-13, every four-index integral to 1e-13, three-
+and two-centre integrals to 2e-13 and 1e-11 (values of order 1e3).  SCF
+energies with either set of integrals agree to 1e-12 Eh.
+
+**Speed** (`benchmarks/bench_integrals.py --scf --repeat 3`, 4 cores for both:
+libcint through pyscf's OpenMP, the Mojo engine through its runtime; best of 3,
+output memory touched beforehand):
 
 | system                 | nao | naux | ERIs (s8) Mojo | libcint | ratio | DF tensor Mojo | libcint | ratio |
 |------------------------|----:|-----:|---------------:|--------:|------:|---------------:|--------:|------:|
-| H2O / cc-pVDZ          |  24 |  116 |        0.007 s | 0.002 s |  3.4  |        0.014 s | 0.011 s |  1.3  |
-| H2O / aug-cc-pVTZ      |  92 |  139 |        0.148 s | 0.081 s |  1.8  |        0.028 s | 0.017 s |  1.6  |
-| H2O / cc-pVQZ          | 115 |  208 |        0.403 s | 0.180 s |  2.2  |        0.054 s | 0.032 s |  1.7  |
-| benzene / cc-pVDZ      | 114 |  558 |        1.19 s  | 0.47 s  |  2.5  |        0.174 s | 0.119 s |  1.5  |
-| benzene / def2-TZVP    | 222 |  558 |        7.56 s  | 3.89 s  |  1.9  |        0.586 s | 0.327 s |  1.8  |
-| (H2O)5 / cc-pVDZ       | 120 |  580 |        0.84 s  | 0.54 s  |  1.6  |        0.203 s | 0.125 s |  1.6  |
-| C8H18 / cc-pVDZ        | 202 |  974 |        6.50 s  | 3.49 s  |  1.9  |        0.926 s | 0.497 s |  1.9  |
+| H2O / cc-pVDZ          |  24 |  116 |        0.001 s | 0.002 s | 0.75  |        0.004 s | 0.006 s | 0.71  |
+| H2O / aug-cc-pVTZ      |  92 |  139 |        0.060 s | 0.061 s | 0.97  |        0.014 s | 0.031 s | 0.46  |
+| H2O / cc-pVQZ          | 115 |  208 |        0.122 s | 0.188 s | 0.65  |        0.040 s | 0.049 s | 0.82  |
+| benzene / cc-pVDZ      | 114 |  558 |        0.224 s | 0.453 s | 0.49  |        0.101 s | 0.133 s | 0.76  |
+| benzene / def2-TZVP    | 222 |  558 |        2.21 s  | 3.66 s  | 0.60  |        0.306 s | 0.307 s | 1.00  |
+| (H2O)5 / cc-pVDZ       | 120 |  580 |        0.213 s | 0.395 s | 0.54  |        0.087 s | 0.124 s | 0.70  |
+| C8H18 / cc-pVDZ        | 202 |  974 |        1.51 s  | 3.23 s  | 0.47  |        0.471 s | 0.484 s | 0.97  |
 
-End to end (`--scf`: integrals plus the Mojo RHF loop, in-core ERIs, one run
-each, the previous ERI tensor released first):
+The DF tensor column includes the Cholesky solve, which is the same SciPy
+call in both and dominates for the larger systems; the three-centre integrals
+alone take 0.155 s against libcint's 0.207 s for octane.  The one-electron
+matrices take 0.6 to 14 ms (libcint 0.3 to 11 ms).  libcint's times for the
+4-index tensor vary by up to 2x between runs (memory traffic for a tensor of
+up to 2.5 GB); the table keeps the best run of each.
+
+End to end (integrals plus the Mojo RHF loop with in-core ERIs, one run each,
+the previous ERI tensor released first):
 
 | system                 | RHF with libcint integrals | RHF with Mojo integrals | energies agree to |
 |------------------------|---------------------------:|------------------------:|------------------:|
-| H2O / cc-pVDZ          |                     0.17 s |                  0.05 s |           3e-14 Eh |
-| H2O / aug-cc-pVTZ      |                     0.30 s |                  0.34 s |           1e-14 Eh |
-| H2O / cc-pVQZ          |                     0.46 s |                  0.70 s |           1e-13 Eh |
-| benzene / cc-pVDZ      |                     0.82 s |                  1.45 s |           8e-13 Eh |
-| benzene / def2-TZVP    |                     6.04 s |                 10.24 s |           2e-13 Eh |
-| (H2O)5 / cc-pVDZ       |                     0.95 s |                  1.37 s |           5e-13 Eh |
-| C8H18 / cc-pVDZ        |                     4.91 s |                  8.25 s |           9e-13 Eh |
+| H2O / cc-pVDZ          |                     0.22 s |                  0.09 s |           9e-14 Eh |
+| H2O / aug-cc-pVTZ      |                     0.37 s |                  0.25 s |           6e-14 Eh |
+| H2O / cc-pVQZ          |                     0.54 s |                  0.42 s |           2e-13 Eh |
+| benzene / cc-pVDZ      |                     0.96 s |                  0.60 s |           3e-13 Eh |
+| benzene / def2-TZVP    |                     6.22 s |                  5.16 s |           1e-13 Eh |
+| (H2O)5 / cc-pVDZ       |                     0.90 s |                  0.71 s |           2e-13 Eh |
+| C8H18 / cc-pVDZ        |                     5.07 s |                  3.81 s |           7e-13 Eh |
 
-The one-electron matrices take 1 to 27 ms (libcint: 0.3 to 11 ms).  Per
-shell-quartet class the engine is within 1.1 to 1.4x of libcint for
-multi-primitive d and f quartets, where the dense contractions dominate, and
-2 to 4x slower for s and p quartets with one primitive, where per-quartet
-set-up dominates; libcint's Rys quadrature needs fewer operations per
-primitive quartet than the Hermite contractions used here.  The engine is
-therefore opt-in: `attach(mf)` or the functions above.  On a virtual machine
-the first touch of a multi-GB ERI tensor can cost several seconds (page
-faults), which the benchmark excludes by touching the memory beforehand.
+Per shell class (benzene / cc-pVDZ, 4-index tensor restricted to the listed
+shells): s-only 0.50x of libcint's time, p-only 0.75x, s+p 0.44x, s+d 0.53x,
+p+d 0.60x, all 0.47x.  The weak spot is uncontracted high angular momentum:
+the d-only tensor (single-primitive d shells) takes 1.5x libcint's time, as
+McMurchie-Davidson needs more operations than libcint's Rys quadrature when
+there are no primitives to amortise the transforms over.  Calls are
+lightweight (0.13 ms for H2; the Boys table is built once per process and
+tiny jobs stay on the calling thread).  The engine stays opt-in
+(`attach(mf)` or the functions above) because it does not cover ECPs, finite
+nuclei or derivative integrals.
 
 ## Installation
 
@@ -347,6 +380,7 @@ mojoscf/
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint
 benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py
+tools/gen_eri_kernel.py  generates the register-blocked ERI kernel in _mojo/integrals.mojo
 ```
 
 ## Scope and limitations
@@ -406,7 +440,9 @@ make bench      # SCF benchmark
 ```
 
 Mojo sources follow Mojo 1.1 (`def`-only, `std.` namespaced imports,
-closures with explicit capture lists).  The GitHub Actions workflow in
+closures with explicit capture lists).  The register-blocked ERI kernel in
+`_mojo/integrals.mojo` is generated: edit `tools/gen_eri_kernel.py` and run
+`python tools/gen_eri_kernel.py` to rewrite it.  The GitHub Actions workflow in
 `.github/workflows/ci.yml` builds the kernels and runs the test suite.
 
 ## License

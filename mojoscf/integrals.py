@@ -68,6 +68,19 @@ def _check(mol):
         raise NotImplementedError(f"mojoscf.integrals: {reason}")
 
 
+_BOYS_TABLE = None
+
+
+def _boys_table():
+    """Boys-function interpolation table, built once per process by the extension."""
+    global _BOYS_TABLE
+    if _BOYS_TABLE is None:
+        table = np.empty(721 * 40)
+        get_extension().boys_table(table)
+        _BOYS_TABLE = table
+    return _BOYS_TABLE
+
+
 def basis_tables(mol):
     """``(atm, bas, env, nf, c2s)``: the basis in the form the Mojo engine reads.
 
@@ -100,7 +113,7 @@ def int1e(mol):
     s = np.empty((nao, nao))
     t = np.empty((nao, nao))
     v = np.empty((nao, nao))
-    get_extension().int1e(tables, s, t, v)
+    get_extension().int1e(tables, s, t, v, _boys_table())
     return s, t, v
 
 
@@ -132,7 +145,7 @@ def int2e_s8(mol, schwarz_tol: float = 1e-14):
     nao = mol.nao_nr()
     npair = nao * (nao + 1) // 2
     eri = np.empty(npair * (npair + 1) // 2)
-    get_extension().int2e_s8(tables, eri, float(schwarz_tol))
+    get_extension().int2e_s8(tables, eri, float(schwarz_tol), _boys_table())
     return eri
 
 
@@ -150,7 +163,7 @@ def int3c2e(mol, auxmol):
     nao = mol.nao_nr()
     npair = nao * (nao + 1) // 2
     out = np.empty((auxmol.nao_nr(), npair))
-    get_extension().int3c2e(tables, aux_tables, out)
+    get_extension().int3c2e(tables, aux_tables, out, _boys_table())
     return out
 
 
@@ -159,7 +172,7 @@ def int2c2e(auxmol):
     aux_tables = basis_tables(auxmol)
     naux = auxmol.nao_nr()
     out = np.empty((naux, naux))
-    get_extension().int2c2e(aux_tables, out)
+    get_extension().int2c2e(aux_tables, out, _boys_table())
     return out
 
 

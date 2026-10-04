@@ -139,3 +139,27 @@ def test_basis_tables_layout():
     assert atm.dtype == np.int64 and bas.dtype == np.int64 and env.dtype == np.float64
     assert list(nf) == [1, 3, 5]
     assert c2s.size == 1 * 1 + 3 * 3 + 6 * 5
+
+
+def test_generated_kernel_is_current():
+    """The register-blocked kernel in integrals.mojo matches tools/gen_eri_kernel.py."""
+    import importlib.util
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("gen_eri_kernel", root / "tools" / "gen_eri_kernel.py")
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+    text = gen.TARGET.read_text()
+    region = text[text.index(gen.BEGIN) + len(gen.BEGIN):text.index(gen.END)]
+    assert region == gen.kernel() + "\n\n", "run `python tools/gen_eri_kernel.py` after editing the generator"
+
+
+def test_large_l_against_small_l_pairs():
+    """f and g shells paired with s and p shells (the extended specialised kernels) and with each other."""
+    mol = gto.M(
+        atom="Cl 0 0 0; F 0 0 1.7; H 1.0 0.3 -0.6", basis={"Cl": "cc-pvtz", "F": "cc-pvdz", "H": "cc-pvdz"},
+        spin=0, charge=1, verbose=0,
+    )
+    eri = mi.int2e_s8(mol, schwarz_tol=0.0)
+    assert abs(eri - mol.intor("int2e", aosym="s8")).max() < 1e-12

@@ -12,7 +12,7 @@ from . import guess, integrals, kernels
 from .diis import CDIIS
 from .scf import RHF, UHF, accelerate, is_supported, kernel, native_veff
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "RHF",
