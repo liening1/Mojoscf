@@ -37,7 +37,7 @@ iteration then runs without touching Python or pyscf's C code at all.
 * **Nuclear gradients** (`mojoscf.grad`): `nuc_grad_method()` of `mojoscf.RHF`
   and `UHF` returns pyscf's gradient classes with the derivative integrals
   from the Mojo engine; the two-electron term is evaluated directly from the
-  unique shell quartets, 3.8 to 9.9x faster than `pyscf.grad` with the same
+  unique shell quartets, 3.5 to 9.9x faster than `pyscf.grad` with the same
   gradients to about 1e-13.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
@@ -357,6 +357,8 @@ two-electron term alone, `get_veff` for pyscf and `grad_2e` for mojoscf):
 | benzene cation / cc-pVDZ (UHF) | 114 |      3.89 | 4.00 |        0.76 | 0.73 |   5.09x |   1.6e-11 |
 | C8H18 / cc-pVDZ                | 202 |     17.55 | 17.31 |       3.82 | 3.27 |   4.59x |   8.9e-12 |
 | (H2O)5 / aug-cc-pVDZ           | 205 |     14.00 | 14.20 |       3.67 | 3.73 |   3.81x |   5.4e-12 |
+| (H2O)10 / cc-pVDZ              | 240 |     17.12 | 16.31 |       3.30 | 2.90 |   5.19x |   9.7e-12 |
+| benzene / def2-TZVP            | 222 |     24.74 | 25.36 |       7.13 | 7.90 |   3.47x |   2.9e-12 |
 
 Each process converges its own SCF, so `max |dg|` (Eh/Bohr) includes the
 SCF convergence (1e-11 Eh); on the same SCF object the gradients agree to

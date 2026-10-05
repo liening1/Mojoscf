@@ -29,7 +29,7 @@ from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, eri_s8_core, int3c2e_core, int2c2e_core
 from _mojo.directjk import DirectJK, basis_from_py, grad2e_core, jk_ip1_core
 
-comptime VERSION = "0.6.0"
+comptime VERSION = "0.7.0"
 
 
 @export
