@@ -150,3 +150,32 @@ def solvated_ion_atoms(metal="Fe", n_second=12, bond=2.12, r2=4.3, seed=1):
         atoms += [("O", tuple(o)), ("H", tuple(o + q @ np.array([0.0, 0.757, 0.587]))),
                   ("H", tuple(o + q @ np.array([0.0, -0.757, 0.587])))]
     return atoms
+
+
+def mm_water_charges(qm_atoms, radius=15.0, spacing=3.1, exclude=2.6, seed=2):
+    """TIP3P point charges (O -0.834, H +0.417) of waters around a QM solute, coordinates in Angstrom.
+
+    Water oxygens sit on a jittered cubic lattice of the given ``spacing``
+    (about liquid density for 3.1 A) within ``radius`` of the solute's centre,
+    leaving out any water with an atom closer than ``exclude`` to a QM atom;
+    each water is randomly oriented.  Returns ``(coords (N, 3), charges (N,))``.
+    """
+    rng = np.random.default_rng(seed)
+    qm = np.array([xyz for _, xyz in qm_atoms], dtype=float)
+    centre = qm.mean(axis=0)
+    n = int(np.ceil(radius / spacing))
+    grid = np.arange(-n, n + 1) * spacing
+    coords, charges = [], []
+    for x in grid:
+        for y in grid:
+            for z in grid:
+                o = centre + np.array([x, y, z]) + rng.normal(scale=0.15, size=3)
+                if np.linalg.norm(o - centre) > radius:
+                    continue
+                q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+                mol = [o, o + q @ np.array([0.0, 0.757, 0.587]), o + q @ np.array([0.0, -0.757, 0.587])]
+                if min(np.linalg.norm(qm - p, axis=1).min() for p in mol) < exclude:
+                    continue
+                coords += mol
+                charges += [-0.834, 0.417, 0.417]
+    return np.array(coords), np.array(charges)

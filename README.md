@@ -227,6 +227,43 @@ level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
   0.57 s.  The f shells of def2-TZVP give pairs beyond the lane kernels'
   Hermite degree, which keep the single-quartet path.
 
+### QM/MM
+
+`benchmarks/bench_qmmm.py` embeds a QM solute in a sphere of TIP3P
+point-charge waters (`pyscf.qmmm.mm_charge`; liquid density, waters within
+2.6 Å of a QM atom left out) and times the SCF, the gradient on the QM atoms
+(`nuc_grad_method().kernel()`) and the forces on the MM charges
+(`grad_hcore_mm(dm) + grad_nuc_mm()`): pyscf versus the same object
+accelerated with `mojoscf.accelerate`, each in its own process, 4 cores of a
+2.1 GHz Xeon, conv_tol 1e-9.
+
+| system                                          | nao | MM charges | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | MM forces pyscf [s] | mojoscf [s] | x |
+|-------------------------------------------------|----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|------:|-----:|------:|
+| benzene / cc-pVDZ, 15 Å (DF)                    | 114 | 1353 |  4.3 |  0.7 | 5.9x |  1.5 |  0.4 | 3.5x |  0.72 | 0.10 |  7.2x |
+| benzene / cc-pVDZ, 25 Å (DF)                    | 114 | 6486 |  3.8 |  0.8 | 4.8x |  2.7 |  0.7 | 3.9x |  3.73 | 0.42 |  8.9x |
+| benzene / cc-pVDZ, 25 Å, Gaussian charges (DF)  | 114 | 6486 |  4.7 |  0.8 | 5.6x |  3.9 |  0.7 | 5.3x |  3.37 | 0.43 |  7.8x |
+| (H2O)5 / aug-cc-pVDZ, 20 Å (in-core)            | 205 | 3366 | 14.1 |  4.0 | 3.5x | 18.2 |  5.4 | 3.4x |  6.29 | 0.70 |  9.0x |
+| C8H18 / 6-31G*, 20 Å (direct)                   | 148 | 3330 | 16.7 |  4.5 | 3.7x | 11.4 |  2.5 | 4.6x |  5.15 | 0.30 | 17.2x |
+| ferrocene / def2-SVP, 25 Å (DF)                 | 221 | 6456 | 23.4 |  8.2 | 2.9x | 13.9 |  3.2 | 4.4x | 10.91 | 1.44 |  7.6x |
+| (H2O)10+ / cc-pVDZ, 20 Å (DF, UHF)              | 240 | 3330 | 31.9 | 11.8 | 2.7x | 19.0 |  3.2 | 6.0x |  7.44 | 0.58 | 12.9x |
+
+Energies agree to 4e-11 Eh or better, QM gradients to 9e-12 and MM forces
+to 5e-14 Eh/Bohr.  pyscf builds one integral matrix per block of 200
+charges (`int1e_grids` for the Hamiltonian, `int1e_grids_ip` and
+`int3c2e_ip2` with charges of exponent 1e16 for the gradients) and
+contracts it with NumPy.  `_mojo/qmmm.mojo` treats each charge as the
+s-type ket of the batched ERI kernel instead (a point charge as exponent
+1e30, exact to double precision; Gaussian charges with their own
+exponent), with up to 64 charges as the SIMD lanes against one AO shell
+pair, and contracts on the fly: the potential in one pass, and the
+derivative matrix and the forces on all charges from the six-component pair
+table (nabla a, nabla b) in another, the charge's derivative following from
+translational invariance.  The MM terms stay a sizeable part for a small
+QM region (benzene with 6486 charges: 0.12 s for the potential, 0.42 s for
+the derivative matrix inside the 0.7 s gradient, 0.42 s for the forces);
+the rest of the speed-up is the SCF loop, J/K and the QM gradient described
+above.
+
 ## Mojo integral engine
 
 `mojoscf.integrals` evaluates the integrals of a pyscf `Mole` in Mojo and
@@ -247,6 +284,9 @@ four-index and three-centre integrals it is faster than libcint.
 | `get_jk_ip1(mol, dm)`             | `pyscf.grad.rhf.get_jk` (derivative J/K matrices)  |
 | `grad2e(mol, dm_j, dm_k, j_factor, k_factor)` | the two-electron term of `pyscf.grad.rhf/uhf.grad_elec` |
 | `grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor, k_factor)` | the two-electron term of `pyscf.df.grad.rhf/uhf` (with the auxiliary-basis response) |
+| `int1e_grids_sum(mol, coords, w, zetas=None)` | `einsum('kij,k->ij', mol.intor("int1e_grids", grids=coords), w)`; with `zetas`, Gaussian charges (`int3c2e` with `fakemol_for_charges`) |
+| `int1e_grids_ip_sum(mol, coords, w, zetas=None)` | `einsum('xkij,k->xij', mol.intor("int1e_grids_ip", grids=coords), w)` |
+| `mm_charge_forces(mol, dm, coords, w, zetas=None)` | `pyscf.qmmm` `QMMMGrad.grad_hcore_mm(dm)` (`int3c2e_ip2` contracted with dm) |
 
 **Method.** McMurchie-Davidson: Hermite expansion coefficients `E_t^{ij}`,
 Hermite Coulomb integrals `R_{tuv}` from the Boys function (an 8-term Taylor
@@ -535,6 +575,14 @@ g = mf.nuc_grad_method().kernel()               # mojoscf.grad.Gradients, == pys
 g = mojoscf.RHF(mol).density_fit().run().nuc_grad_method().kernel()   # DFGradients
 g = mojoscf.grad.Gradients(scf.RHF(mol).run()).kernel()   # also for pyscf objects
 
+# QM/MM electrostatic embedding (pyscf.qmmm): the MM-charge terms come from the Mojo engine
+from pyscf import qmmm
+mf = mojoscf.accelerate(qmmm.mm_charge(scf.RHF(mol).density_fit(), mm_coords, mm_charges))
+mf.kernel()                                     # (also: qmmm.mm_charge(mojoscf.RHF(mol), ...))
+g = mf.nuc_grad_method()
+de_qm = g.kernel()                              # forces on the QM atoms
+de_mm = g.grad_hcore_mm(mf.make_rdm1()) + g.grad_nuc_mm()   # forces on the MM charges
+
 # Use the individual kernels
 from mojoscf import kernels
 dm = kernels.make_rdm1(mf.mo_coeff, mf.mo_occ)
@@ -587,6 +635,7 @@ but slow for more than a few dozen orbitals.
 | two-electron integrals (3-index DF tensor, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
 | one-electron integrals (`get_hcore`, `get_ovlp`) | C (libcint)          | unchanged (`attach(mf)` uses the Mojo engine) |
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |
+| QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly; nucleus-charge terms NumPy as in pyscf |
 
 Source layout:
 
@@ -601,6 +650,7 @@ mojoscf/
   _mojo/integrals.mojo Gaussian integral engine (Boys function, Hermite recursions, S/T/V, ERIs, 3c2e/2c2e)
   _mojo/directjk.mojo  integral-direct J/K (screening, 8-fold digestion) for direct SCF; derivative J/K matrices
   _mojo/gradients.mojo two-electron gradient terms, exact and density-fitted
+  _mojo/qmmm.mojo      potential of MM point/Gaussian charges, its derivative, forces on the charges
   _mojo/__init__.mojo  Python bindings (module mojoscf._mojoscf)
   _backend.py          build/load the extension, discover BLAS/LAPACK
   kernels.py           NumPy-facing wrappers
@@ -608,9 +658,10 @@ mojoscf/
   diis.py              CDIIS drop-in class
   scf.py               RHF/UHF classes, kernel(), accelerate()
   grad.py              RHF/UHF nuclear gradient classes, exact and DF (nuc_grad_method)
+  qmmm.py              QM/MM (pyscf.qmmm) hooks: MM-charge Hamiltonian and gradient terms from the engine
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
-benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py
+benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py
 tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quartet, batched kets) in _mojo/integrals.mojo
 ```
 
@@ -654,6 +705,11 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
 * Nuclear gradients are native for RHF and UHF, with exact or
   density-fitted (in-core `pyscf.df.DF`, auxiliary-basis response included)
   two-electron integrals.
+* QM/MM (`pyscf.qmmm.mm_charge`, point or Gaussian MM charges) runs on the
+  native loop with the MM-charge terms of the Hamiltonian and of the
+  gradients (QM atoms and MM charges) from the engine, for QM shells up to
+  g; the periodic interface (`qmmm.pbc`) is not covered.  The charge sums are not screened (all charges interact with all
+  shell pairs), as in pyscf.
 * The first call in a process starts the Mojo runtime and loads BLAS
   (about 50 ms); time a second run when benchmarking tiny systems.
 * Only the LP64 (32-bit integer) BLAS/LAPACK interface is supported.

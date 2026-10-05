@@ -26,6 +26,8 @@ versions.
 """
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 from pyscf import lib
 from pyscf.data import nist
@@ -352,8 +354,10 @@ def _mojo_grad_method(mf, after):
 
     The implementation ``mf`` would inherit past ``after`` decides: pyscf's
     plain RHF/UHF one gives ``mojoscf.grad.Gradients``/``UGradients``, the
-    density-fitting one (``_DFHF``) ``DFGradients``/``DFUGradients``; any
-    other decoration (solvent, ...) keeps its own gradients.
+    density-fitting one (``_DFHF``) ``DFGradients``/``DFUGradients``, a QM/MM
+    one (``pyscf.qmmm``) the gradients of the method underneath with the Mojo
+    QM/MM terms (:mod:`mojoscf.qmmm`); any other decoration (solvent, ...)
+    keeps its own gradients.
     """
     from pyscf.df import df_jk
 
@@ -370,6 +374,11 @@ def _mojo_grad_method(mf, after):
         return (grad.UGradients if uhf else grad.Gradients)(mf)
     if nxt is df_jk._DFHF.nuc_grad_method and not mf.istype("_Solvation"):
         return (grad.DFUGradients if uhf else grad.DFGradients)(mf)
+    qmmm_itrf = sys.modules.get("pyscf.qmmm.itrf")
+    if qmmm_itrf is not None and nxt is qmmm_itrf.QMMMSCF.nuc_grad_method:
+        from . import qmmm
+
+        return qmmm.qmmm_grad_for_scf(_mojo_grad_method(mf, qmmm_itrf.QMMMSCF))
     return nxt(mf)
 
 
@@ -387,6 +396,22 @@ class _MojoDFHook:
         return _mojo_grad_method(self, _MojoDFHook)
 
 
+def _add_qmmm_hook(mf):
+    """Put ``mojoscf.qmmm._MojoQMMMHook`` in front of a QM/MM object (pyscf.qmmm) that lacks it.
+
+    ``accelerate`` adds it to QM/MM objects; this covers a Mojo object
+    decorated afterwards (``qmmm.mm_charge(mojoscf.RHF(mol), ...)``), where
+    pyscf's ``QMMMSCF`` comes first in the MRO.
+    """
+    qmmm_itrf = sys.modules.get("pyscf.qmmm.itrf")     # a QM/MM object implies it is loaded
+    if qmmm_itrf is None or not isinstance(mf, qmmm_itrf.QMMMSCF):
+        return
+    from .qmmm import _MojoQMMMHook
+
+    if not isinstance(mf, _MojoQMMMHook):
+        lib.set_class(mf, (_MojoQMMMHook, type(mf)))
+
+
 class _MojoGlueMixin:
     """Pieces shared by the RHF and UHF mixins: driver entry point and eigensolver."""
 
@@ -394,6 +419,7 @@ class _MojoGlueMixin:
 
     def kernel(self, dm0=None, **kwargs):
         cput0 = (logger.process_clock(), logger.perf_counter())
+        _add_qmmm_hook(self)
         self.dump_flags()
         self.build(self.mol)
         if dm0 is None and self.mo_coeff is not None and self.mo_occ is not None:
@@ -627,7 +653,8 @@ def accelerate(mf):
     The object is modified in place (its class becomes a subclass of the
     original one with the Mojo mixin in front) and returned.  Density fitting,
     X2C and other decorations that only change ``get_jk``/``get_hcore`` are
-    preserved.  ROHF, Kohn-Sham, symmetry-adapted, second-order SCF objects and
+    preserved; QM/MM objects (``pyscf.qmmm``) get their MM-charge terms from
+    the Mojo engine (:mod:`mojoscf.qmmm`).  ROHF, Kohn-Sham, symmetry-adapted, second-order SCF objects and
     objects that override the glue methods (smearing, constrained UHF, ...) are
     rejected with ``TypeError``.
     """
@@ -643,4 +670,5 @@ def accelerate(mf):
         new_cls = type("Mojo" + cls.__name__, (mixin, cls), {"__module__": __name__})
         _accelerated_classes[cls] = new_cls
     mf.__class__ = new_cls
+    _add_qmmm_hook(mf)
     return mf

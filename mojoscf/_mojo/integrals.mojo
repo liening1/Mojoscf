@@ -1927,18 +1927,32 @@ def batch_supported(lo: Int, li: Int) -> Bool:
     return lo <= KMAX and li <= KMAX
 
 
+comptime LMAX_POT = 9     # outer degrees of eri_kernel_lanes against s-type lanes (charge distributions)
+
+
+def lanes_dispatch(
+    lo: Int, li: Int, nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
+    pin: F64Ptr, nvec: Int, btab: F64Ptr, ubuf: F64Ptr, rb: F64Ptr,
+):
+    """``eri_kernel_lanes[lo, li]`` for lo, li <= KMAX, or li = 0 and lo <= LMAX_POT.
+
+    ``rb`` is the recursion scratch (64-byte aligned, at least
+    (2 nherm(lo + li) + 2 (lo + li) + 9) W values).
+    """
+    comptime for LO_ in range(LMAX_POT + 1):
+        comptime for LI_ in range(KMAX + 1):
+            comptime if LO_ <= KMAX or LI_ == 0:
+                if lo == LO_ and li == LI_:
+                    eri_kernel_lanes[LO_, LI_](nop, po, eo, so, no, pin, nvec, btab, ubuf, rb)
+                    return
+
+
 def run_kernel_lanes(
     lo: Int, li: Int, nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
     pin: F64Ptr, nvec: Int, boys: BoysTable, ws: EriWork, ubuf: F64Ptr,
 ):
     """``eri_kernel_lanes[lo, li]``; the caller checks ``batch_supported`` first."""
-    var btab = list_ptr(boys.table)
-    var rb = F64Ptr(unsafe_from_address=ws.raddr)
-    comptime for LO_ in range(KMAX + 1):
-        comptime for LI_ in range(KMAX + 1):
-            if lo == LO_ and li == LI_:
-                eri_kernel_lanes[LO_, LI_](nop, po, eo, so, no, pin, nvec, btab, ubuf, rb)
-                return
+    lanes_dispatch(lo, li, nop, po, eo, so, no, pin, nvec, list_ptr(boys.table), ubuf, F64Ptr(unsafe_from_address=ws.raddr))
 
 
 def lanes_ket_transform[LI: Int](

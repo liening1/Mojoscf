@@ -382,6 +382,75 @@ def int1e_iprinv_dm(mol, dm, centers=None):
     return out
 
 
+MM_LMAX = 4     # the charge kernels handle shell pairs up to Hermite degree 9 (g-g pairs and their derivative)
+
+
+def mm_supported(mol) -> bool:
+    """True if the MM-charge kernels below support ``mol`` (engine-supported, shells up to g)."""
+    return available(mol, allow_ecp=True) and (mol.nbas == 0 or int(mol._bas[:, gto.ANG_OF].max()) <= MM_LMAX)
+
+
+def _mm_args(mol, coords, weights, zetas):
+    if not mm_supported(mol):
+        raise NotImplementedError(
+            unsupported_reason(mol, allow_ecp=True) or f"MM charges need shells up to l = {MM_LMAX}"
+        )
+    coords = np.ascontiguousarray(coords, dtype=np.float64).reshape(-1, 3)
+    weights = np.ascontiguousarray(weights, dtype=np.float64).reshape(-1)
+    if weights.shape[0] != coords.shape[0]:
+        raise ValueError("one weight per MM charge expected")
+    point = zetas is None
+    zetas = np.zeros(1) if point else np.ascontiguousarray(np.broadcast_to(zetas, weights.shape), dtype=np.float64)
+    return coords, weights, zetas, point
+
+
+def int1e_grids_sum(mol, coords, weights, zetas=None):
+    """``sum_k w_k <i| 1/|r - R_k| |j>`` for charges at ``coords`` (Bohr), shape (nao, nao).
+
+    pyscf: ``einsum('kij,k->ij', mol.intor('int1e_grids', grids=coords), weights)``.
+    With ``zetas`` the charges are unit Gaussians ``(zeta/pi)^{3/2} exp(-zeta r^2)``
+    and the result is ``sum_k w_k (ij|k)`` (pyscf's ``int3c2e`` with
+    ``gto.fakemol_for_charges(coords, zetas)``).  One pass over the shell
+    pairs with the charges as SIMD lanes.
+    """
+    coords, weights, zetas, point = _mm_args(mol, coords, weights, zetas)
+    nao = mol.nao_nr()
+    out = np.empty((nao, nao))
+    get_extension().mm_potential(basis_tables(mol), _boys_table(), coords, weights, zetas, point, out)
+    return out
+
+
+def int1e_grids_ip_sum(mol, coords, weights, zetas=None):
+    """``sum_k w_k <nabla i| 1/|r - R_k| |j>``, shape (3, nao, nao) (Gaussian charges with ``zetas``).
+
+    pyscf: ``einsum('kxij,k->xij', mol.intor('int1e_grids_ip', grids=coords), weights)``.
+    """
+    coords, weights, zetas, point = _mm_args(mol, coords, weights, zetas)
+    nao = mol.nao_nr()
+    mat = np.empty((3, nao, nao))
+    get_extension().mm_grad(
+        basis_tables(mol), _boys_table(), coords, weights, zetas, point, np.zeros(1), mat, np.zeros(0)
+    )
+    return mat
+
+
+def mm_charge_forces(mol, dm, coords, weights, zetas=None):
+    """``sum_ij D_ij w_k (ij|nabla_k)`` for every charge k, shape (ncharge, 3).
+
+    This is pyscf's ``QMMMGrad.grad_hcore_mm(dm)`` (``int3c2e_ip2`` with the
+    charges as unit Gaussians, or point charges without ``zetas``) for a
+    symmetric density ``dm``.
+    """
+    coords, weights, zetas, point = _mm_args(mol, coords, weights, zetas)
+    dm = np.ascontiguousarray(dm, dtype=np.float64)
+    nao = mol.nao_nr()
+    if dm.shape != (nao, nao):
+        raise ValueError(f"dm must be ({nao}, {nao})")
+    forces = np.empty((coords.shape[0], 3))
+    get_extension().mm_grad(basis_tables(mol), _boys_table(), coords, weights, zetas, point, dm, np.zeros(0), forces)
+    return forces
+
+
 def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14):
     """Gradient J/K exactly as ``pyscf.grad.rhf.get_jk``: ``(-sum (nabla i j|kl) D_lk, -sum (nabla i j|kl) D_jk)``.
 
