@@ -31,8 +31,10 @@ iteration then runs without touching Python or pyscf's C code at all.
   for s to g functions, spherical or Cartesian.  The 4-index ERI tensor is
   built in 0.47 to 0.97x of libcint's time and the 3-index DF integrals in
   about 0.75x.  The SCF driver uses it by default for the two-electron
-  integrals and falls back to libcint for molecules it does not support (ECPs,
-  finite nuclei, `mol.omega`); `MOJOSCF_INTEGRALS=libcint` or
+  integrals, also for molecules with effective core potentials or finite
+  nuclei (those only change the one-electron Hamiltonian, which stays
+  pyscf's), and falls back to libcint only for range-separated `mol.omega`
+  and l > 8; `MOJOSCF_INTEGRALS=libcint` or
   `mojoscf.integrals.set_engine("libcint")` switches it off.
 * **Nuclear gradients** (`mojoscf.grad`): `nuc_grad_method()` of `mojoscf.RHF`
   and `UHF`, with exact or density-fitted integrals, returns pyscf's gradient
@@ -299,10 +301,13 @@ density change (pyscf's incremental `direct_scf` update and its
 `direct_scf_tol` test, Schwarz bound times the largest density element of the
 six shell blocks involved) and folds them into per-thread J/K accumulators
 with the 8-fold symmetry weights; the exchange digestion costs about 1% of
-the integral evaluation.  Molecules the engine does not support (ECPs, finite
-nuclei, range-separated `mol.omega`) use libcint as before, and
+the integral evaluation.  Molecules with effective core potentials or finite
+nuclei use the engine too (only their one-electron Hamiltonian differs, and
+it comes from pyscf); range-separated `mol.omega` uses libcint, and
 `MOJOSCF_INTEGRALS=libcint` switches the engine off.  One-electron matrices
-still come from pyscf unless `attach(mf)` is used.
+still come from pyscf unless `attach(mf)` is used.  The DF tensor
+`L^-1 (P|mu nu)` is solved in place (`dtrsm` on the transposed view of the
+C-ordered integrals), so no copy of it is made at any point.
 
 ### Nuclear gradients
 
@@ -345,8 +350,10 @@ engine.  The classes also take plain pyscf objects,
   (`hcore_generator`, `make_rdm1e`) are put together exactly as in
   `pyscf.grad.rhf.grad_elec`; scanners, `atmlst`, TDHF gradients on top of
   a Mojo SCF and pyscf code calling `get_jk` (also with the non-symmetric
-  densities of TDHF, which go to pyscf) keep working.  X2C and ECP objects
-  and range-separated operators use pyscf's gradient code.
+  densities of TDHF, which go to pyscf) keep working.  With effective core
+  potentials only the ECP derivative integrals (`ECPscalar_ipnuc`,
+  `ECPscalar_iprinv`) come from pyscf; X2C objects take all one-electron
+  pieces from pyscf, and range-separated operators use pyscf's gradient code.
 * **Density fitting.**  For DF objects (`mojoscf.RHF(mol).density_fit()`,
   or `accelerate`d DF objects) `nuc_grad_method()` returns
   `DFGradients`/`DFUGradients`, pyscf's `df.grad` classes with the same
@@ -556,11 +563,13 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernel in _mojo/inte
   cycle, and the per-cycle HOMO/LUMO lines of pyscf's log are printed once, for
   the final orbitals.
 * The integral engine handles contracted Gaussians up to l = 8 (spherical or
-  Cartesian), point nuclei and no effective core potentials; it provides the
-  overlap, kinetic, nuclear-attraction, four-index and 3-/2-centre Coulomb
-  integrals and the first derivatives needed for HF gradients (no second
-  derivatives, multipoles or range-separated operators).
-  `unsupported_reason(mol)` says why a molecule is rejected.
+  Cartesian); it provides the overlap, kinetic, point-charge
+  nuclear-attraction, four-index and 3-/2-centre Coulomb integrals and the
+  first derivatives needed for HF gradients (no ECP integrals, second
+  derivatives, multipoles or range-separated operators).  Molecules with
+  ECPs or finite nuclei use it for everything but the ECP / finite-nucleus
+  terms.  `unsupported_reason(mol, two_electron=..., allow_ecp=...)` says why
+  a molecule is rejected for a given use.
 * Nuclear gradients are native for RHF and UHF, with exact or
   density-fitted (in-core `pyscf.df.DF`, auxiliary-basis response included)
   two-electron integrals.
