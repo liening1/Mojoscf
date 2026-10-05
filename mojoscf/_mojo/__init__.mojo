@@ -30,7 +30,7 @@ from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_i
 from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
 from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core
 
-comptime VERSION = "0.7.0"
+comptime VERSION = "0.8.0"
 
 
 @export

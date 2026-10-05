@@ -38,8 +38,8 @@ iteration then runs without touching Python or pyscf's C code at all.
   and `UHF`, with exact or density-fitted integrals, returns pyscf's gradient
   classes with the derivative integrals from the Mojo engine; the
   two-electron term is evaluated directly from the derivative integrals,
-  3.5 to 9.9x faster than `pyscf.grad` (exact) and several times faster than
-  `pyscf.df.grad` with the same gradients to about 1e-13.
+  3.3 to 7.1x faster than `pyscf.grad` (exact) and 2.9 to 6.0x faster than
+  `pyscf.df.grad` (DF) with the same gradients to about 1e-13.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -372,17 +372,25 @@ engine.  The classes also take plain pyscf objects,
 
 Timings (`benchmarks/bench_grad.py`, 4 cores of a 2.1 GHz Xeon; the same
 converged pyscf SCF in both processes, only the gradient timed; "2e" is the
-two-electron term alone, `get_veff` for pyscf and `grad_2e` for mojoscf):
+two-electron term alone, `get_veff` for pyscf (for DF including the
+auxiliary-basis response) and `grad_2e` for mojoscf; "(DF)" rows compare
+pyscf's `df.grad` with `DFGradients`):
 
-| system                         | nao | pyscf [s] | (2e) | mojoscf [s] | (2e) | speedup | max \|dg\| |
-|--------------------------------|----:|----------:|-----:|------------:|-----:|--------:|----------:|
-| H2O / cc-pVTZ                  |  58 |      0.47 | 0.37 |        0.05 | 0.04 |   9.88x |   5.2e-14 |
-| benzene / cc-pVDZ              | 114 |      4.37 | 3.58 |        0.74 | 0.65 |   5.90x |   6.7e-13 |
-| benzene cation / cc-pVDZ (UHF) | 114 |      3.89 | 4.00 |        0.76 | 0.73 |   5.09x |   1.6e-11 |
-| C8H18 / cc-pVDZ                | 202 |     17.55 | 17.31 |       3.82 | 3.27 |   4.59x |   8.9e-12 |
-| (H2O)5 / aug-cc-pVDZ           | 205 |     14.00 | 14.20 |       3.67 | 3.73 |   3.81x |   5.4e-12 |
-| (H2O)10 / cc-pVDZ              | 240 |     17.12 | 16.31 |       3.30 | 2.90 |   5.19x |   9.7e-12 |
-| benzene / def2-TZVP            | 222 |     24.74 | 25.36 |       7.13 | 7.90 |   3.47x |   2.9e-12 |
+| system                             | nao | pyscf [s] | (2e)  | mojoscf [s] | (2e)  | speedup | max \|dg\| |
+|------------------------------------|----:|----------:|------:|------------:|------:|--------:|----------:|
+| H2O / cc-pVTZ                      |  58 |      0.42 |  0.34 |        0.06 |  0.05 |   7.07x |   1.9e-14 |
+| benzene / cc-pVDZ                  | 114 |      3.70 |  3.80 |        0.69 |  0.65 |   5.37x |   6.0e-13 |
+| benzene cation / cc-pVDZ (UHF)     | 114 |      3.90 |  3.76 |        0.72 |  0.67 |   5.38x |   6.7e-12 |
+| C8H18 / cc-pVDZ                    | 202 |     16.97 | 17.15 |        3.39 |  3.12 |   5.01x |   8.9e-12 |
+| (H2O)5 / aug-cc-pVDZ               | 205 |     13.54 | 13.52 |        3.49 |  3.35 |   3.88x |   5.4e-12 |
+| (H2O)10 / cc-pVDZ                  | 240 |     16.30 | 16.30 |        3.13 |  2.87 |   5.22x |   9.6e-12 |
+| benzene / def2-TZVP                | 222 |     24.46 | 24.73 |        7.40 |  7.04 |   3.31x |   2.9e-12 |
+| benzene / cc-pVDZ (DF)             | 114 |      1.26 |  1.01 |        0.35 |  0.26 |   3.63x |   4.7e-13 |
+| C8H18 / cc-pVDZ (DF)               | 202 |      3.97 |  3.66 |        1.03 |  0.73 |   3.84x |   2.1e-12 |
+| (H2O)10 / cc-pVDZ (DF)             | 240 |      7.59 |  6.34 |        1.71 |  1.30 |   4.43x |   5.7e-12 |
+| (H2O)10 cation / cc-pVDZ (DF, UHF) | 240 |     12.08 | 10.66 |        2.01 |  1.51 |   6.01x |   5.7e-12 |
+| benzene / def2-TZVP (DF)           | 222 |      2.54 |  1.94 |        0.89 |  0.64 |   2.86x |   4.9e-13 |
+| C20H42 / 6-31G (DF)                | 264 |     23.86 | 23.74 |        5.29 |  4.64 |   4.51x |   5.4e-12 |
 
 Each process converges its own SCF, so `max |dg|` (Eh/Bohr) includes the
 SCF convergence (1e-11 Eh); on the same SCF object the gradients agree to
