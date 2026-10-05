@@ -2443,6 +2443,35 @@ def aux_table(aux: Basis, ht: HermTable) -> PairTable:
 comptime PAIR_BLOCK = 8192
 
 
+def store_aux_batch(
+    basis: Basis, atab: PairTable, pshell: Int, tab: PairTable, kets: IntPtr, nket: Int, boys: BoysTable,
+    ws: EriWork, mut wb: EriBatch, i0: Int, c0: Int, wdt: Int, pbuf: F64Ptr,
+):
+    """(P|ab) of auxiliary shell ``pshell`` and the queued pairs (a, b) of one bra shell a into ``pbuf``.
+
+    ``pbuf`` holds the rows of P's functions over the pair columns of shell a
+    (``c0`` the first, ``wdt`` per row), as in ``int3c2e_core``.
+    """
+    eri_batch(atab, pshell, tab, kets, nket, boys, ws, wb)
+    var npf = atab.get(pshell, I_NCOMP)
+    for k in range(nket):
+        var sp = kets[unsafe_offset=k]
+        var b = tab.get(sp, I_B)
+        var na = basis.ao_loc[tab.get(sp, I_A) + 1] - i0
+        var j0 = basis.ao_loc[b]
+        var nb = basis.ao_loc[b + 1] - j0
+        var blk = wb.block(k)       # [fp][fa nb + fb]
+        for fp in range(npf):
+            var src = blk.unsafe_offset(fp * na * nb)
+            var drow = pbuf.unsafe_offset(fp * wdt - c0)
+            for fa in range(na):
+                var ii = i0 + fa
+                var col0 = ii * (ii + 1) // 2 + j0
+                var njj = min(nb, ii - j0 + 1)
+                for fb in range(njj):
+                    drow[unsafe_offset=col0 + fb] = src[unsafe_offset=fa * nb + fb]
+
+
 def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0: Int = 0, pshell1: Int = -1):
     """(ab|P) into ``dst[P * npair + pair(a, b)]`` (naux x npair, pyscf's cderi layout before the Cholesky step).
 
@@ -2490,13 +2519,18 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0
                 sa.append(a)
                 sb.append(b)
         var tab = PairTable(basis, basis, sa, sb, ht)
+        var kcls = List[Int](length=max(tab.npairs, 1), fill=-1)
+        var nclass = batch_classes(tab, kcls)
+        var pkcls = int_ptr(kcls)
         var ntask = s1 - s0
         var nworkers = min(parallelism_level(), ntask)
         counter.store(0)
 
-        def work(w: Int) {imm basis, imm aux, imm boys, imm tab, imm atab, imm ht, imm dst, imm npair_ao, imm pcount, imm ntask, imm s0, imm s1, imm npfmax, imm wmax, imm ps0, imm ps1, imm plo}:
+        def work(w: Int) {imm basis, imm aux, imm boys, imm tab, imm atab, imm ht, imm dst, imm npair_ao, imm pcount, imm ntask, imm s0, imm s1, imm npfmax, imm wmax, imm ps0, imm ps1, imm plo, imm pkcls, imm nclass}:
             var ws = EriWork(tab.maxcomp, tab.maxlab, atab.maxcomp, atab.maxlab)
-            var buf = List[Float64](length=npfmax * wmax, fill=0.0)
+            var wb = EriBatch(atab.maxcomp, tab.maxcomp)
+            var queue = KetQueue(nclass)
+            var buf = List[Float64](length=npfmax * wmax + W, fill=0.0)
             var pbuf = list_ptr(buf)
             while True:
                 var task = Int(pcount[].fetch_add(1))
@@ -2514,8 +2548,19 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0
                     var p0 = aux.ao_loc[pshell] - plo
                     var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
                     vfill(pbuf, npf * wdt, 0.0)
+                    # (P|ab) with the pairs (a, b) as the lanes of eri_batch where that pays off
+                    var batch_bra = atab.get(pshell, I_NP) > 0 and batch_supported(atab.get(pshell, I_LAB), 0)
                     for b in range(a + 1):
-                        if not eri_quartet(tab, pbase + b, atab, pshell, ht, boys, ws):
+                        var sp = pbase + b
+                        var kc = pkcls[unsafe_offset=sp] if batch_bra else -1
+                        if kc >= 0 and lanes_preferred(atab, pshell, tab, sp):
+                            var npk = tab.get(sp, I_NP)
+                            if queue.full(kc, npk):
+                                store_aux_batch(basis, atab, pshell, tab, queue.kets(kc), queue.cnt[kc], boys, ws, wb, i0, c0, wdt, pbuf)
+                                queue.clear(kc)
+                            queue.push(kc, sp, npk)
+                            continue
+                        if not eri_quartet(tab, sp, atab, pshell, ht, boys, ws):
                             continue
                         var j0 = basis.ao_loc[b]
                         var nb = basis.ao_loc[b + 1] - j0
@@ -2527,12 +2572,18 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0
                                 var src = (fa * nb + fb) * npf
                                 for fp in range(npf):
                                     pbuf[unsafe_offset=fp * wdt + col0 + fb] = ws.out[src + fp]
+                    for kc in range(nclass):
+                        if queue.cnt[kc] > 0:
+                            store_aux_batch(basis, atab, pshell, tab, queue.kets(kc), queue.cnt[kc], boys, ws, wb, i0, c0, wdt, pbuf)
+                            queue.clear(kc)
                     for fp in range(npf):
                         var drow = dst.unsafe_offset((p0 + fp) * npair_ao + c0)
                         var srow = pbuf.unsafe_offset(fp * wdt)
                         for c in range(wdt):
                             drow[unsafe_offset=c] = srow[unsafe_offset=c]
             _ = ws^
+            _ = wb^
+            _ = queue^
             _ = buf^
 
         if nworkers == 1:
@@ -2540,6 +2591,7 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0
         else:
             parallelize(work, nworkers)
         _ = tab^
+        _ = kcls^
         _ = sa^
         _ = sb^
         s1 = s0
