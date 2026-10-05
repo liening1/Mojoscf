@@ -24,8 +24,9 @@ from max.algorithm import parallelize
 from _mojo.linalg import F64Ptr, Blas, list_ptr, vfill, vdot_serial
 from _mojo.dfjk import unpack_row
 from _mojo.integrals import (
-    Basis, BoysTable, HermTable, PairTable, EriWork, aux_table, eri_quartet, int3c2e_core, schwarz_bounds,
-    shell_nfunc, I_A, I_B,
+    Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, KetQueue, IntPtr, aux_table, eri_quartet, eri_batch,
+    int3c2e_core, schwarz_bounds, shell_nfunc, batch_classes, batch_supported, lanes_preferred, int_ptr,
+    I_A, I_B, I_LAB, I_NP,
 )
 
 
@@ -259,7 +260,8 @@ def df_grad_rhs(
             s1 += 1
         var p0 = aux.ao_loc[s0]
         var p1 = aux.ao_loc[s1]
-        var b = List[Float64](length=(p1 - p0) * npair, fill=0.0)
+        # every element is written by int3c2e_core: no serial zero fill (first touch by the workers)
+        var b = List[Float64](unsafe_uninit_length=max((p1 - p0) * npair, 1))
         var pb = list_ptr(b)
         int3c2e_core(basis, aux, boys, pb, s0, s1)
 
@@ -298,6 +300,72 @@ def df_grad_rhs(
     _ = boys^
 
 
+def df3c_contract(
+    basis: Basis, tab2: PairTable, sp: Int, npf: Int, grows: F64Ptr, npair: Int, blk3: F64Ptr, sxij: Int, sfp: Int,
+    acc: F64Ptr, pp: F64Ptr,
+):
+    """Fold d(ab|P) of pair ``sp`` (element (x, ij, fp) at blk3[(x nab + ij) sxij + fp sfp]) with Gamma_P.
+
+    ``grows`` holds the packed rows Gamma_P of P's functions; the forces go
+    to the atoms of a and b in ``acc`` and minus their sum to P's (``pp``).
+    """
+    var a = tab2.get(sp, I_A)
+    var b = tab2.get(sp, I_B)
+    var i0 = basis.ao_loc[a]
+    var na = basis.ao_loc[a + 1] - i0
+    var j0 = basis.ao_loc[b]
+    var nb = basis.ao_loc[b + 1] - j0
+    var nab = na * nb
+    var g0 = 0.0
+    var g1 = 0.0
+    var g2 = 0.0
+    var g3 = 0.0
+    var g4 = 0.0
+    var g5 = 0.0
+    for fp in range(npf):
+        var grow = grows.unsafe_offset(fp * npair)
+        var bp = blk3.unsafe_offset(fp * sfp)
+        for i in range(na):
+            for j in range(nb):
+                var ii = max(i0 + i, j0 + j)
+                var jj = min(i0 + i, j0 + j)
+                var gv = grow[unsafe_offset=ii * (ii + 1) // 2 + jj]
+                var e = bp.unsafe_offset((i * nb + j) * sxij)
+                var sx = nab * sxij
+                g0 += e[unsafe_offset=0] * gv
+                g1 += e[unsafe_offset=sx] * gv
+                g2 += e[unsafe_offset=2 * sx] * gv
+                g3 += e[unsafe_offset=3 * sx] * gv
+                g4 += e[unsafe_offset=4 * sx] * gv
+                g5 += e[unsafe_offset=5 * sx] * gv
+    var wgt = 2.0 if a != b else 1.0
+    var pa = acc.unsafe_offset(3 * basis.atom[a])
+    var pb = acc.unsafe_offset(3 * basis.atom[b])
+    pa[unsafe_offset=0] -= wgt * g0
+    pa[unsafe_offset=1] -= wgt * g1
+    pa[unsafe_offset=2] -= wgt * g2
+    pb[unsafe_offset=0] -= wgt * g3
+    pb[unsafe_offset=1] -= wgt * g4
+    pb[unsafe_offset=2] -= wgt * g5
+    pp[unsafe_offset=0] += wgt * (g0 + g3)
+    pp[unsafe_offset=1] += wgt * (g1 + g4)
+    pp[unsafe_offset=2] += wgt * (g2 + g5)
+
+
+def df3c_batch(
+    basis: Basis, atab: PairTable, pshell: Int, tab2: PairTable, kets: IntPtr, nket: Int, boys: BoysTable,
+    ws: EriWork, mut wb: EriBatch, npf: Int, grows: F64Ptr, npair: Int, acc: F64Ptr, pp: F64Ptr,
+):
+    """d(ab|P) of auxiliary shell ``pshell`` and the queued derivative pairs (``eri_batch``), folded with Gamma_P."""
+    eri_batch(atab, pshell, tab2, kets, nket, boys, ws, wb)
+    for k in range(nket):
+        var sp = kets[unsafe_offset=k]
+        var nab = (basis.ao_loc[tab2.get(sp, I_A) + 1] - basis.ao_loc[tab2.get(sp, I_A)]) * (
+            basis.ao_loc[tab2.get(sp, I_B) + 1] - basis.ao_loc[tab2.get(sp, I_B)]
+        )
+        df3c_contract(basis, tab2, sp, npf, grows, npair, wb.block(k), 1, 6 * nab, acc, pp)
+
+
 def grad_df3c_core(
     blas_seq: Blas, var basis: Basis, var aux: Basis, var boys: BoysTable, coef: F64Ptr, dpack: F64Ptr,
     jfac: Float64, kfac: Float64, nset: Int, m: Int, xs: F64Ptr, cns: F64Ptr, blk: Int, tol: Float64, de: F64Ptr,
@@ -333,6 +401,9 @@ def grad_df3c_core(
     var q2 = schwarz_bounds(boys, tab2, ht)
     var atab = aux_table(aux, ht)
     var qa = schwarz_bounds(boys, atab, ht)
+    var kcls = List[Int](length=max(npairs, 1), fill=-1)
+    var nclass = batch_classes(tab2, kcls)
+    var pkcls = int_ptr(kcls)
     var nthreads = max(1, parallelism_level())
     var nwork = 2 * nthreads
     var per = 3 * natm
@@ -353,7 +424,8 @@ def grad_df3c_core(
             s1 += 1
         var p0 = aux.ao_loc[s0]
         var p1 = aux.ao_loc[s1]
-        var gbuf = List[Float64](length=(p1 - p0) * npair + 1, fill=0.0)
+        # every row is written by ``build``: no serial zero fill (first touch by the workers)
+        var gbuf = List[Float64](unsafe_uninit_length=(p1 - p0) * npair + 1)
         var gam = list_ptr(gbuf)
 
         def build(c: Int) {imm blas_seq, imm pf, imm gam, imm coef, imm dpack, imm jfac, imm kfac, imm xs, imm cns, imm nao, imm n2, imm npair, imm nset, imm m, imm mp, imm wsz, imm p0, imm p1, imm nwork, imm aux}:
@@ -397,10 +469,10 @@ def grad_df3c_core(
         counter.store(0)
         var ntask = s1 - s0
 
-        def work(w: Int) {imm basis, imm aux, imm boys, imm ht, imm tab2, imm atab, imm pq2, imm pqa, imm pacc, imm pcount, imm npairs, imm per, imm s0, imm ntask, imm p0, imm npair, imm gam, imm tol}:
+        def work(w: Int) {imm basis, imm aux, imm boys, imm ht, imm tab2, imm atab, imm pq2, imm pqa, imm pacc, imm pcount, imm npairs, imm per, imm s0, imm ntask, imm p0, imm npair, imm gam, imm tol, imm pkcls, imm nclass}:
             var ws = EriWork(tab2.maxcomp, tab2.maxlab, atab.maxcomp, atab.maxlab)
-            var gabuf = List[Float64](length=8, fill=0.0)
-            var ga = list_ptr(gabuf)
+            var wb = EriBatch(atab.maxcomp, tab2.maxcomp)
+            var queue = KetQueue(nclass)
             var acc = pacc.unsafe_offset(w * per)
             while True:
                 var task = Int(pcount[].fetch_add(1))
@@ -414,6 +486,8 @@ def grad_df3c_core(
                 var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
                 var grows = gam.unsafe_offset(f0 * npair)
                 var pp = acc.unsafe_offset(3 * aux.atom[pshell])
+                # the derivative pairs are the lanes of eri_batch (bra P) where that pays off
+                var batch_bra = batch_supported(atab.get(pshell, I_LAB), 0)
                 for sp in range(npairs):
                     var qab = pq2[unsafe_offset=sp] * qp
                     if qab < tol:
@@ -424,7 +498,6 @@ def grad_df3c_core(
                     var na = basis.ao_loc[a + 1] - i0
                     var j0 = basis.ao_loc[b]
                     var nb = basis.ao_loc[b + 1] - j0
-                    var nab = na * nb
                     var gmax = 0.0
                     for fp in range(npf):
                         var grow = grows.unsafe_offset(fp * npair)
@@ -435,31 +508,24 @@ def grad_df3c_core(
                                 gmax = max(gmax, abs(grow[unsafe_offset=ii * (ii + 1) // 2 + jj]))
                     if qab * gmax < tol:
                         continue
+                    var kc = pkcls[unsafe_offset=sp] if batch_bra else -1
+                    if kc >= 0 and lanes_preferred(atab, pshell, tab2, sp):
+                        var npk = tab2.get(sp, I_NP)
+                        if queue.full(kc, npk):
+                            df3c_batch(basis, atab, pshell, tab2, queue.kets(kc), queue.cnt[kc], boys, ws, wb, npf, grows, npair, acc, pp)
+                            queue.clear(kc)
+                        queue.push(kc, sp, npk)
+                        continue
                     if not eri_quartet(tab2, sp, atab, pshell, ht, boys, ws):
                         continue
-                    var blk3 = list_ptr(ws.out)
-                    vfill(ga, 6, 0.0)
-                    for fp in range(npf):
-                        var grow = grows.unsafe_offset(fp * npair)
-                        for i in range(na):
-                            for j in range(nb):
-                                var ii = max(i0 + i, j0 + j)
-                                var jj = min(i0 + i, j0 + j)
-                                var gv = grow[unsafe_offset=ii * (ii + 1) // 2 + jj]
-                                var ij = i * nb + j
-                                for x in range(6):
-                                    ga[unsafe_offset=x] += blk3[unsafe_offset=(x * nab + ij) * npf + fp] * gv
-                    var wgt = 2.0 if a != b else 1.0
-                    var pa = acc.unsafe_offset(3 * basis.atom[a])
-                    var pb = acc.unsafe_offset(3 * basis.atom[b])
-                    for x in range(3):
-                        var gx = wgt * ga[unsafe_offset=x]
-                        var gy = wgt * ga[unsafe_offset=3 + x]
-                        pa[unsafe_offset=x] -= gx
-                        pb[unsafe_offset=x] -= gy
-                        pp[unsafe_offset=x] += gx + gy
+                    df3c_contract(basis, tab2, sp, npf, grows, npair, list_ptr(ws.out), npf, 1, acc, pp)
+                for kc in range(nclass):
+                    if queue.cnt[kc] > 0:
+                        df3c_batch(basis, atab, pshell, tab2, queue.kets(kc), queue.cnt[kc], boys, ws, wb, npf, grows, npair, acc, pp)
+                        queue.clear(kc)
             _ = ws^
-            _ = gabuf^
+            _ = wb^
+            _ = queue^
 
         var nw = min(nthreads, ntask)
         if nw <= 1:
@@ -478,6 +544,7 @@ def grad_df3c_core(
     _ = counter^
     _ = tab2^
     _ = atab^
+    _ = kcls^
     _ = q2^
     _ = qa^
     _ = sa^
