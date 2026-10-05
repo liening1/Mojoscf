@@ -175,7 +175,7 @@ def test_basis_tables_layout():
 
 
 def test_generated_kernel_is_current():
-    """The register-blocked kernel in integrals.mojo matches tools/gen_eri_kernel.py."""
+    """The generated kernels in integrals.mojo match tools/gen_eri_kernel.py."""
     import importlib.util
     import pathlib
 
@@ -185,7 +185,7 @@ def test_generated_kernel_is_current():
     spec.loader.exec_module(gen)
     text = gen.TARGET.read_text()
     region = text[text.index(gen.BEGIN) + len(gen.BEGIN):text.index(gen.END)]
-    assert region == gen.kernel() + "\n\n", "run `python tools/gen_eri_kernel.py` after editing the generator"
+    assert region == gen.generated(), "run `python tools/gen_eri_kernel.py` after editing the generator"
 
 
 def test_large_l_against_small_l_pairs():

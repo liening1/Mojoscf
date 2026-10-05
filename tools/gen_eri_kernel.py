@@ -1,7 +1,9 @@
-"""Generate the specialised ERI kernel of mojoscf/_mojo/integrals.mojo.
+"""Generate the specialised ERI kernels of mojoscf/_mojo/integrals.mojo.
 
-The kernel ``eri_kernel_spec[LO, LI]`` is fully unrolled over Hermite indices
-with Mojo ``comptime`` loops, but its register blocking (eight named SIMD
+The kernels ``eri_kernel_spec[LO, LI]`` (one shell quartet) and
+``eri_kernel_lanes[LO, LI]`` (one bra against the primitive pairs of several
+kets, one per SIMD lane) are fully unrolled over Hermite indices with Mojo
+``comptime`` loops, but their register blocking (eight named SIMD
 accumulators split between Hermite indices and partial sums) is written out
 explicitly.  This script produces that repetitive code and replaces the text
 between the BEGIN/END markers in integrals.mojo:
@@ -371,12 +373,103 @@ def kernel() -> str:
     return "\n".join(out) + "\n"
 
 
+def lanes_kernel() -> str:
+    """``eri_kernel_lanes[LO, LI]``: one outer pair against up to W single-primitive inner pairs.
+
+    The inner pairs (kets) are the SIMD lanes throughout: the prefactor,
+    Boys function and Hermite recursion are the vector-path code of
+    ``eri_kernel_spec`` (lanes = kets instead of primitives).  Because every
+    ket has a single primitive pair, its Hermite matrix does not depend on
+    the outer primitive, so only the outer transform runs per outer
+    primitive pair (into U[o][hi], accumulated over them) and the inner one
+    runs once per ket afterwards (``lanes_ket_transform``).
+    """
+    spec = kernel().split("\n")
+    i0 = next(i for i, ln in enumerate(spec) if ln.strip() == "var q = pin.unsafe_load[width=W](ki0)")
+    i1 = next(i for i, ln in enumerate(spec) if ln.strip() == "# inner transforms of the W lanes")
+    vec = [ln[4:] if ln.startswith(" " * 4) else ln for ln in spec[i0:i1]]
+    out = []
+    A = out.append
+    A('''def eri_kernel_lanes[LO: Int, LI: Int](
+    nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int, pin: F64Ptr, nvec: Int, btab: F64Ptr, ubuf: F64Ptr,
+    rbuf: F64Ptr,
+):
+    """U[o][hi][lane] = sum_ko sum_ho (-1)^{|ho|} E_O[ko][ho][o] R_{ko,lane}[ho + hi] over nvec W lanes.
+
+    Each lane is one primitive pair of an inner pair (ket).  ``pin`` holds
+    their primitive data as five SoA arrays of nvec W values (p, 1/p, Px,
+    Py, Pz; unused lanes zero) and ``ubuf[(o NHI + hi) nvec W + lane]``
+    receives U (overwritten): the outer pair's contracted functions against
+    the lanes' Hermite functions.  Per outer primitive pair and W lanes the
+    prefactors, the Boys function and the Hermite recursion run as in
+    ``eri_kernel_spec``'s vector path, then the outer transform adds vector
+    FMAs over the lanes (E_O broadcast).  ``rbuf`` must be 64-byte aligned.
+    """
+    comptime NHO = nherm(LO)
+    comptime NHI = nherm(LI)
+    comptime L = LO + LI
+    comptime NHL = nherm(L)
+    comptime NR = BoysTable.NROWS
+    comptime NCH = 4 if NHI <= 2 else 1             # FMA chains per accumulator (split over ho)
+    var opad = padded(nop)
+    var ipad = nvec * W
+    var rv = rbuf                                   # two recursion levels, [h][lane]
+    var fbv = rbuf.unsafe_offset(2 * NHL * W)       # gathered table rows, then scaled F_n
+    var tv = rbuf.unsafe_offset((2 * NHL + L + 8) * W)   # F_n
+    for x in range(no * NHI * nvec):
+        ubuf.unsafe_store(x * W, SIMD[DType.float64, W](0.0))
+    for ko in range(nop):
+        var p = po[unsafe_offset=ko]
+        var ip = po[unsafe_offset=opad + ko]
+        var px = po[unsafe_offset=2 * opad + ko]
+        var py = po[unsafe_offset=3 * opad + ko]
+        var pz = po[unsafe_offset=4 * opad + ko]
+        var eob = eo.unsafe_offset(ko * NHO * so)
+        for v in range(nvec):
+            var ki0 = v * W''')
+    out += vec
+    A("            # outer transform: U[o][hi] += sum_ho (-1)^{|ho|} E_O[ko][ho][o] R[ho + hi], vectors over")
+    A(f"            # the lanes, blocks of {NACC} inner Hermite indices")
+    A("            for o in range(no):")
+    A("                var er = eob.unsafe_offset(o)")
+    A(f"                comptime for blk in range((NHI + {NACC - 1}) // {NACC}):")
+    A(f"                    comptime h0 = blk * {NACC}")
+    A(f"                    comptime nbh = min({NACC}, NHI - h0)")
+    A("                    var u = ubuf.unsafe_offset((o * NHI + h0) * ipad + ki0)")
+    for k in range(NACC):
+        for c in range(4):
+            A(f"                    var a{k}_{c} = SIMD[DType.float64, W](0.0)")
+    A("                    comptime for ho in range(NHO):")
+    A("                        var c = SIMD[DType.float64, W](er[unsafe_offset=ho * so])")
+    A("                        comptime if herm_odd(ho):")
+    A("                            c = -c")
+    for k in range(NACC):
+        A(f"                        comptime if {k} < nbh:")
+        A(f"                            comptime r{k} = herm_sum(ho, h0 + {k}) * W")
+        for ch in range(4):
+            kw = "comptime if" if ch == 0 else "elif"
+            A(f"                            {kw} ho % NCH == {ch}:")
+            A(f"                                a{k}_{ch} += rv.unsafe_load[width=W](r{k}) * c")
+    for k in range(NACC):
+        A(f"                    comptime if {k} < nbh:")
+        A("                        comptime if NCH == 1:")
+        A(f"                            u.unsafe_store({k} * ipad, u.unsafe_load[width=W]({k} * ipad) + a{k}_0)")
+        A("                        else:")
+        A(f"                            u.unsafe_store({k} * ipad, u.unsafe_load[width=W]({k} * ipad) + ((a{k}_0 + a{k}_1) + (a{k}_2 + a{k}_3)))")
+    return "\n".join(out) + "\n"
+
+
+def generated() -> str:
+    """The text between the BEGIN and END markers of ``TARGET``."""
+    return kernel() + "\n\n" + lanes_kernel() + "\n\n"
+
+
 def main():
     text = TARGET.read_text()
     i = text.index(BEGIN) + len(BEGIN)
     j = text.index(END)
-    TARGET.write_text(text[:i] + kernel() + "\n\n" + text[j:])
-    print(f"wrote eri_kernel_spec into {TARGET}")
+    TARGET.write_text(text[:i] + generated() + text[j:])
+    print(f"wrote eri_kernel_spec and eri_kernel_lanes into {TARGET}")
 
 
 if __name__ == "__main__":

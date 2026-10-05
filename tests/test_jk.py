@@ -241,6 +241,24 @@ def test_direct_get_jk_matches_pyscf(h2o_dz, rng):
     assert vk1 is None and abs(vj1 - rj[0]).max() < 1e-10
 
 
+@pytest.mark.parametrize("atom, basis", [
+    ("Cu 0 0 0; H 0 0 1.5", "def2-svp"),                       # segmented, f shell on Cu
+    ("O 0 0 0; H 0 0.76 0.59; H 0 -0.76 0.59", "def2-tzvp"),    # (fd), (ff) pairs: unbatched kets
+    ("N 0 0 0; N 0 0 1.1", "6-31g*"),
+    ("C 0 0 0; O 0 0 1.13", "cc-pvtz"),                          # general contraction
+])
+def test_direct_get_jk_segmented_and_general(atom, basis, rng):
+    """Batched kets (one SIMD lane per primitive pair) and the single-quartet fallback against pyscf."""
+    mol = gto.M(atom=atom, basis=basis, spin=None, verbose=0)
+    n = mol.nao_nr()
+    a = rng.standard_normal((2, n, n))
+    dms = a + a.transpose(0, 2, 1)
+    vj, vk = mojoscf.integrals.get_jk(mol, dms, direct_scf_tol=0.0)
+    rj, rk = scf.hf.get_jk(mol, dms)
+    assert abs(vj - rj).max() < 1e-10 * max(1.0, abs(rj).max())
+    assert abs(vk - rk).max() < 1e-10 * max(1.0, abs(rk).max())
+
+
 def test_incore_eris_and_df_tensor_from_mojo_engine(h2o_dz):
     mf = mojoscf.RHF(h2o_dz)
     mode, eri, _ = mojoscf.native_veff(mf)

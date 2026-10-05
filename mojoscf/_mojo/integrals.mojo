@@ -1545,6 +1545,290 @@ def eri_kernel_spec[LO: Int, LI: Int](
             o += 1
 
 
+def eri_kernel_lanes[LO: Int, LI: Int](
+    nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int, pin: F64Ptr, nvec: Int, btab: F64Ptr, ubuf: F64Ptr,
+    rbuf: F64Ptr,
+):
+    """U[o][hi][lane] = sum_ko sum_ho (-1)^{|ho|} E_O[ko][ho][o] R_{ko,lane}[ho + hi] over nvec W lanes.
+
+    Each lane is one primitive pair of an inner pair (ket).  ``pin`` holds
+    their primitive data as five SoA arrays of nvec W values (p, 1/p, Px,
+    Py, Pz; unused lanes zero) and ``ubuf[(o NHI + hi) nvec W + lane]``
+    receives U (overwritten): the outer pair's contracted functions against
+    the lanes' Hermite functions.  Per outer primitive pair and W lanes the
+    prefactors, the Boys function and the Hermite recursion run as in
+    ``eri_kernel_spec``'s vector path, then the outer transform adds vector
+    FMAs over the lanes (E_O broadcast).  ``rbuf`` must be 64-byte aligned.
+    """
+    comptime NHO = nherm(LO)
+    comptime NHI = nherm(LI)
+    comptime L = LO + LI
+    comptime NHL = nherm(L)
+    comptime NR = BoysTable.NROWS
+    comptime NCH = 4 if NHI <= 2 else 1             # FMA chains per accumulator (split over ho)
+    var opad = padded(nop)
+    var ipad = nvec * W
+    var rv = rbuf                                   # two recursion levels, [h][lane]
+    var fbv = rbuf.unsafe_offset(2 * NHL * W)       # gathered table rows, then scaled F_n
+    var tv = rbuf.unsafe_offset((2 * NHL + L + 8) * W)   # F_n
+    for x in range(no * NHI * nvec):
+        ubuf.unsafe_store(x * W, SIMD[DType.float64, W](0.0))
+    for ko in range(nop):
+        var p = po[unsafe_offset=ko]
+        var ip = po[unsafe_offset=opad + ko]
+        var px = po[unsafe_offset=2 * opad + ko]
+        var py = po[unsafe_offset=3 * opad + ko]
+        var pz = po[unsafe_offset=4 * opad + ko]
+        var eob = eo.unsafe_offset(ko * NHO * so)
+        for v in range(nvec):
+            var ki0 = v * W
+            var q = pin.unsafe_load[width=W](ki0)
+            var x = pin.unsafe_load[width=W](2 * ipad + ki0) - px
+            var y = pin.unsafe_load[width=W](3 * ipad + ki0) - py
+            var z = pin.unsafe_load[width=W](4 * ipad + ki0) - pz
+            var inv_s = 1.0 / (q + p)
+            var alpha = q * p * inv_s
+            var pref = pin.unsafe_load[width=W](ipad + ki0) * (TWO_PI_52 * ip) * sqrt(inv_s)
+            var tt = alpha * (x * x + y * y + z * z)
+            # Boys function of all lanes: Taylor expansion about the nearest grid point
+            # (table rows gathered per lane), blended with the asymptotic form for T >= TMAX
+            var near = tt.lt(BoysTable.TMAX)
+            var ttc = min(tt, SIMD[DType.float64, W](BoysTable.TMAX))
+            var kk = (ttc * BoysTable.INV_DT + 0.5).cast[DType.int64]()
+            var dt = kk.cast[DType.float64]() * BoysTable.DT - ttc
+            var off = kk * NR
+            var c1 = dt
+            var c2 = c1 * dt * 0.5
+            var c3 = c2 * dt * 0.3333333333333333
+            var c4 = c3 * dt * 0.25
+            var c5 = c4 * dt * 0.2
+            var c6 = c5 * dt * 0.16666666666666666
+            var c7 = c6 * dt * 0.14285714285714285
+            comptime for mm in range(L + 8):
+                fbv.unsafe_store(mm * W, btab.unsafe_gather(off + SIMD[DType.int64, W](mm)))
+            comptime for n in range(L + 1):
+                var fv = (
+                    fbv.unsafe_load[width=W](n * W) + c1 * fbv.unsafe_load[width=W]((n + 1) * W)
+                    + c2 * fbv.unsafe_load[width=W]((n + 2) * W) + c3 * fbv.unsafe_load[width=W]((n + 3) * W)
+                    + c4 * fbv.unsafe_load[width=W]((n + 4) * W) + c5 * fbv.unsafe_load[width=W]((n + 5) * W)
+                    + c6 * fbv.unsafe_load[width=W]((n + 6) * W) + c7 * fbv.unsafe_load[width=W]((n + 7) * W)
+                )
+                tv.unsafe_store(n * W, fv)
+            if not near.reduce_and():
+                # vector exp is accurate to ~1e-11 relative, but exp(-T) < 2.4e-16 here and only
+                # enters as a correction, so the result keeps full precision
+                var tts = max(tt, SIMD[DType.float64, W](BoysTable.TMAX))
+                var fa = sqrt(PI / tts) * 0.5
+                var et = SIMD[DType.float64, W](0.0)
+                comptime if L > 0:
+                    et = std_exp(-tts)
+                var inv2t = 0.5 / tts
+                comptime for n in range(L + 1):
+                    tv.unsafe_store(n * W, near.select(tv.unsafe_load[width=W](n * W), fa))
+                    fa = (fa * Float64(2 * n + 1) - et) * inv2t
+            # level n of the recursion starts from pref (-2 alpha)^n F_n(T)
+            var m2a = alpha * -2.0
+            var g = pref
+            comptime for n in range(L + 1):
+                fbv.unsafe_store(n * W, tv.unsafe_load[width=W](n * W) * g)
+                g = g * m2a
+            rv.unsafe_store(((L % 2) * NHL) * W, fbv.unsafe_load[width=W](L * W))
+            comptime for nn in range(L):
+                comptime n = L - 1 - nn
+                comptime cur = (n % 2) * NHL
+                comptime prv = ((n + 1) % 2) * NHL
+                rv.unsafe_store((cur) * W, fbv.unsafe_load[width=W](n * W))
+                comptime for h in range(1, nherm(L - n)):
+                    comptime t = herm_t(h)
+                    comptime u = herm_u(h)
+                    comptime v = herm_v(h)
+                    comptime if t > 0:
+                        comptime i1 = herm_index(t - 1, u, v)
+                        var val = x * rv.unsafe_load[width=W]((prv + i1) * W)
+                        comptime if t > 1:
+                            comptime i2 = herm_index(t - 2, u, v)
+                            val += rv.unsafe_load[width=W]((prv + i2) * W) * Float64(t - 1)
+                        rv.unsafe_store((cur + h) * W, val)
+                    elif u > 0:
+                        comptime i1 = herm_index(t, u - 1, v)
+                        var val = y * rv.unsafe_load[width=W]((prv + i1) * W)
+                        comptime if u > 1:
+                            comptime i2 = herm_index(t, u - 2, v)
+                            val += rv.unsafe_load[width=W]((prv + i2) * W) * Float64(u - 1)
+                        rv.unsafe_store((cur + h) * W, val)
+                    else:
+                        comptime i1 = herm_index(t, u, v - 1)
+                        var val = z * rv.unsafe_load[width=W]((prv + i1) * W)
+                        comptime if v > 1:
+                            comptime i2 = herm_index(t, u, v - 2)
+                            val += rv.unsafe_load[width=W]((prv + i2) * W) * Float64(v - 1)
+                        rv.unsafe_store((cur + h) * W, val)
+            # outer transform: U[o][hi] += sum_ho (-1)^{|ho|} E_O[ko][ho][o] R[ho + hi], vectors over
+            # the lanes, blocks of 8 inner Hermite indices
+            for o in range(no):
+                var er = eob.unsafe_offset(o)
+                comptime for blk in range((NHI + 7) // 8):
+                    comptime h0 = blk * 8
+                    comptime nbh = min(8, NHI - h0)
+                    var u = ubuf.unsafe_offset((o * NHI + h0) * ipad + ki0)
+                    var a0_0 = SIMD[DType.float64, W](0.0)
+                    var a0_1 = SIMD[DType.float64, W](0.0)
+                    var a0_2 = SIMD[DType.float64, W](0.0)
+                    var a0_3 = SIMD[DType.float64, W](0.0)
+                    var a1_0 = SIMD[DType.float64, W](0.0)
+                    var a1_1 = SIMD[DType.float64, W](0.0)
+                    var a1_2 = SIMD[DType.float64, W](0.0)
+                    var a1_3 = SIMD[DType.float64, W](0.0)
+                    var a2_0 = SIMD[DType.float64, W](0.0)
+                    var a2_1 = SIMD[DType.float64, W](0.0)
+                    var a2_2 = SIMD[DType.float64, W](0.0)
+                    var a2_3 = SIMD[DType.float64, W](0.0)
+                    var a3_0 = SIMD[DType.float64, W](0.0)
+                    var a3_1 = SIMD[DType.float64, W](0.0)
+                    var a3_2 = SIMD[DType.float64, W](0.0)
+                    var a3_3 = SIMD[DType.float64, W](0.0)
+                    var a4_0 = SIMD[DType.float64, W](0.0)
+                    var a4_1 = SIMD[DType.float64, W](0.0)
+                    var a4_2 = SIMD[DType.float64, W](0.0)
+                    var a4_3 = SIMD[DType.float64, W](0.0)
+                    var a5_0 = SIMD[DType.float64, W](0.0)
+                    var a5_1 = SIMD[DType.float64, W](0.0)
+                    var a5_2 = SIMD[DType.float64, W](0.0)
+                    var a5_3 = SIMD[DType.float64, W](0.0)
+                    var a6_0 = SIMD[DType.float64, W](0.0)
+                    var a6_1 = SIMD[DType.float64, W](0.0)
+                    var a6_2 = SIMD[DType.float64, W](0.0)
+                    var a6_3 = SIMD[DType.float64, W](0.0)
+                    var a7_0 = SIMD[DType.float64, W](0.0)
+                    var a7_1 = SIMD[DType.float64, W](0.0)
+                    var a7_2 = SIMD[DType.float64, W](0.0)
+                    var a7_3 = SIMD[DType.float64, W](0.0)
+                    comptime for ho in range(NHO):
+                        var c = SIMD[DType.float64, W](er[unsafe_offset=ho * so])
+                        comptime if herm_odd(ho):
+                            c = -c
+                        comptime if 0 < nbh:
+                            comptime r0 = herm_sum(ho, h0 + 0) * W
+                            comptime if ho % NCH == 0:
+                                a0_0 += rv.unsafe_load[width=W](r0) * c
+                            elif ho % NCH == 1:
+                                a0_1 += rv.unsafe_load[width=W](r0) * c
+                            elif ho % NCH == 2:
+                                a0_2 += rv.unsafe_load[width=W](r0) * c
+                            elif ho % NCH == 3:
+                                a0_3 += rv.unsafe_load[width=W](r0) * c
+                        comptime if 1 < nbh:
+                            comptime r1 = herm_sum(ho, h0 + 1) * W
+                            comptime if ho % NCH == 0:
+                                a1_0 += rv.unsafe_load[width=W](r1) * c
+                            elif ho % NCH == 1:
+                                a1_1 += rv.unsafe_load[width=W](r1) * c
+                            elif ho % NCH == 2:
+                                a1_2 += rv.unsafe_load[width=W](r1) * c
+                            elif ho % NCH == 3:
+                                a1_3 += rv.unsafe_load[width=W](r1) * c
+                        comptime if 2 < nbh:
+                            comptime r2 = herm_sum(ho, h0 + 2) * W
+                            comptime if ho % NCH == 0:
+                                a2_0 += rv.unsafe_load[width=W](r2) * c
+                            elif ho % NCH == 1:
+                                a2_1 += rv.unsafe_load[width=W](r2) * c
+                            elif ho % NCH == 2:
+                                a2_2 += rv.unsafe_load[width=W](r2) * c
+                            elif ho % NCH == 3:
+                                a2_3 += rv.unsafe_load[width=W](r2) * c
+                        comptime if 3 < nbh:
+                            comptime r3 = herm_sum(ho, h0 + 3) * W
+                            comptime if ho % NCH == 0:
+                                a3_0 += rv.unsafe_load[width=W](r3) * c
+                            elif ho % NCH == 1:
+                                a3_1 += rv.unsafe_load[width=W](r3) * c
+                            elif ho % NCH == 2:
+                                a3_2 += rv.unsafe_load[width=W](r3) * c
+                            elif ho % NCH == 3:
+                                a3_3 += rv.unsafe_load[width=W](r3) * c
+                        comptime if 4 < nbh:
+                            comptime r4 = herm_sum(ho, h0 + 4) * W
+                            comptime if ho % NCH == 0:
+                                a4_0 += rv.unsafe_load[width=W](r4) * c
+                            elif ho % NCH == 1:
+                                a4_1 += rv.unsafe_load[width=W](r4) * c
+                            elif ho % NCH == 2:
+                                a4_2 += rv.unsafe_load[width=W](r4) * c
+                            elif ho % NCH == 3:
+                                a4_3 += rv.unsafe_load[width=W](r4) * c
+                        comptime if 5 < nbh:
+                            comptime r5 = herm_sum(ho, h0 + 5) * W
+                            comptime if ho % NCH == 0:
+                                a5_0 += rv.unsafe_load[width=W](r5) * c
+                            elif ho % NCH == 1:
+                                a5_1 += rv.unsafe_load[width=W](r5) * c
+                            elif ho % NCH == 2:
+                                a5_2 += rv.unsafe_load[width=W](r5) * c
+                            elif ho % NCH == 3:
+                                a5_3 += rv.unsafe_load[width=W](r5) * c
+                        comptime if 6 < nbh:
+                            comptime r6 = herm_sum(ho, h0 + 6) * W
+                            comptime if ho % NCH == 0:
+                                a6_0 += rv.unsafe_load[width=W](r6) * c
+                            elif ho % NCH == 1:
+                                a6_1 += rv.unsafe_load[width=W](r6) * c
+                            elif ho % NCH == 2:
+                                a6_2 += rv.unsafe_load[width=W](r6) * c
+                            elif ho % NCH == 3:
+                                a6_3 += rv.unsafe_load[width=W](r6) * c
+                        comptime if 7 < nbh:
+                            comptime r7 = herm_sum(ho, h0 + 7) * W
+                            comptime if ho % NCH == 0:
+                                a7_0 += rv.unsafe_load[width=W](r7) * c
+                            elif ho % NCH == 1:
+                                a7_1 += rv.unsafe_load[width=W](r7) * c
+                            elif ho % NCH == 2:
+                                a7_2 += rv.unsafe_load[width=W](r7) * c
+                            elif ho % NCH == 3:
+                                a7_3 += rv.unsafe_load[width=W](r7) * c
+                    comptime if 0 < nbh:
+                        comptime if NCH == 1:
+                            u.unsafe_store(0 * ipad, u.unsafe_load[width=W](0 * ipad) + a0_0)
+                        else:
+                            u.unsafe_store(0 * ipad, u.unsafe_load[width=W](0 * ipad) + ((a0_0 + a0_1) + (a0_2 + a0_3)))
+                    comptime if 1 < nbh:
+                        comptime if NCH == 1:
+                            u.unsafe_store(1 * ipad, u.unsafe_load[width=W](1 * ipad) + a1_0)
+                        else:
+                            u.unsafe_store(1 * ipad, u.unsafe_load[width=W](1 * ipad) + ((a1_0 + a1_1) + (a1_2 + a1_3)))
+                    comptime if 2 < nbh:
+                        comptime if NCH == 1:
+                            u.unsafe_store(2 * ipad, u.unsafe_load[width=W](2 * ipad) + a2_0)
+                        else:
+                            u.unsafe_store(2 * ipad, u.unsafe_load[width=W](2 * ipad) + ((a2_0 + a2_1) + (a2_2 + a2_3)))
+                    comptime if 3 < nbh:
+                        comptime if NCH == 1:
+                            u.unsafe_store(3 * ipad, u.unsafe_load[width=W](3 * ipad) + a3_0)
+                        else:
+                            u.unsafe_store(3 * ipad, u.unsafe_load[width=W](3 * ipad) + ((a3_0 + a3_1) + (a3_2 + a3_3)))
+                    comptime if 4 < nbh:
+                        comptime if NCH == 1:
+                            u.unsafe_store(4 * ipad, u.unsafe_load[width=W](4 * ipad) + a4_0)
+                        else:
+                            u.unsafe_store(4 * ipad, u.unsafe_load[width=W](4 * ipad) + ((a4_0 + a4_1) + (a4_2 + a4_3)))
+                    comptime if 5 < nbh:
+                        comptime if NCH == 1:
+                            u.unsafe_store(5 * ipad, u.unsafe_load[width=W](5 * ipad) + a5_0)
+                        else:
+                            u.unsafe_store(5 * ipad, u.unsafe_load[width=W](5 * ipad) + ((a5_0 + a5_1) + (a5_2 + a5_3)))
+                    comptime if 6 < nbh:
+                        comptime if NCH == 1:
+                            u.unsafe_store(6 * ipad, u.unsafe_load[width=W](6 * ipad) + a6_0)
+                        else:
+                            u.unsafe_store(6 * ipad, u.unsafe_load[width=W](6 * ipad) + ((a6_0 + a6_1) + (a6_2 + a6_3)))
+                    comptime if 7 < nbh:
+                        comptime if NCH == 1:
+                            u.unsafe_store(7 * ipad, u.unsafe_load[width=W](7 * ipad) + a7_0)
+                        else:
+                            u.unsafe_store(7 * ipad, u.unsafe_load[width=W](7 * ipad) + ((a7_0 + a7_1) + (a7_2 + a7_3)))
+
+
 # END GENERATED eri_kernel_spec
 
 
@@ -1633,6 +1917,171 @@ def run_kernel(
                         eri_kernel_spec[LO_, LI_](nop, po, eo, so, no, nip, pin, ei, si, btab, m, F64Ptr(unsafe_from_address=ws.raddr))
                         return
     eri_kernel_generic(lo, li, ht, nop, po, eo, so, no, nip, pin, ei, si, boys, ws, m)
+
+
+comptime BATCH_LANES = 4 * W     # primitive pairs of the kets of one eri_batch call, at most
+
+
+def batch_supported(lo: Int, li: Int) -> Bool:
+    """True if ``eri_kernel_lanes`` is instantiated for these degrees (see ``run_kernel_lanes``)."""
+    return lo <= KMAX and li <= KMAX
+
+
+def run_kernel_lanes(
+    lo: Int, li: Int, nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
+    pin: F64Ptr, nvec: Int, boys: BoysTable, ws: EriWork, ubuf: F64Ptr,
+):
+    """``eri_kernel_lanes[lo, li]``; the caller checks ``batch_supported`` first."""
+    var btab = list_ptr(boys.table)
+    var rb = F64Ptr(unsafe_from_address=ws.raddr)
+    comptime for LO_ in range(KMAX + 1):
+        comptime for LI_ in range(KMAX + 1):
+            if lo == LO_ and li == LI_:
+                eri_kernel_lanes[LO_, LI_](nop, po, eo, so, no, pin, nvec, btab, ubuf, rb)
+                return
+
+
+def lanes_ket_transform[LI: Int](
+    no: Int, nk: Int, ubuf: F64Ptr, nl: Int, lane0: Int, np: Int, ek: F64Ptr, sk: Int, blk: F64Ptr
+):
+    """blk[o nk + i] = sum_kp sum_hi U[o][hi][lane0 + kp] E_kp[hi][i]: one ket of ``eri_kernel_lanes``.
+
+    The ket's ``np`` primitive pairs are the lanes from ``lane0``; ``ek`` is
+    its Hermite matrices (``np`` blocks of nherm(LI) rows of stride ``sk``,
+    zero past ``nk``) and ``nl`` the lane count of U.  Rows are written
+    whole vectors at a time in increasing order, so up to W - 1 values past
+    each row are overwritten.
+    """
+    comptime NHI = nherm(LI)
+    var nv = (nk + W - 1) // W
+    var se = NHI * sk
+    for o in range(no):
+        var ur = ubuf.unsafe_offset(o * NHI * nl + lane0)
+        var d = blk.unsafe_offset(o * nk)
+        var v = 0
+        while v + 4 <= nv:
+            var a0 = SIMD[DType.float64, W](0.0)
+            var a1 = SIMD[DType.float64, W](0.0)
+            var a2 = SIMD[DType.float64, W](0.0)
+            var a3 = SIMD[DType.float64, W](0.0)
+            for kp in range(np):
+                var u = ur.unsafe_offset(kp)
+                var e = ek.unsafe_offset(kp * se + v * W)
+                comptime for hi in range(NHI):
+                    var c = SIMD[DType.float64, W](u[unsafe_offset=hi * nl])
+                    a0 += e.unsafe_load[width=W](hi * sk) * c
+                    a1 += e.unsafe_load[width=W](hi * sk + W) * c
+                    a2 += e.unsafe_load[width=W](hi * sk + 2 * W) * c
+                    a3 += e.unsafe_load[width=W](hi * sk + 3 * W) * c
+            d.unsafe_store(v * W, a0)
+            d.unsafe_store(v * W + W, a1)
+            d.unsafe_store(v * W + 2 * W, a2)
+            d.unsafe_store(v * W + 3 * W, a3)
+            v += 4
+        if v + 2 <= nv:
+            var a0 = SIMD[DType.float64, W](0.0)
+            var a1 = SIMD[DType.float64, W](0.0)
+            for kp in range(np):
+                var u = ur.unsafe_offset(kp)
+                var e = ek.unsafe_offset(kp * se + v * W)
+                comptime for hi in range(NHI):
+                    var c = SIMD[DType.float64, W](u[unsafe_offset=hi * nl])
+                    a0 += e.unsafe_load[width=W](hi * sk) * c
+                    a1 += e.unsafe_load[width=W](hi * sk + W) * c
+            d.unsafe_store(v * W, a0)
+            d.unsafe_store(v * W + W, a1)
+            v += 2
+        if v < nv:
+            var a0 = SIMD[DType.float64, W](0.0)
+            var a1 = SIMD[DType.float64, W](0.0)
+            for kp in range(np):
+                var u = ur.unsafe_offset(kp)
+                var e = ek.unsafe_offset(kp * se + v * W)
+                comptime for hi in range(NHI):
+                    var c = SIMD[DType.float64, W](u[unsafe_offset=hi * nl])
+                    comptime if hi % 2 == 0:
+                        a0 += e.unsafe_load[width=W](hi * sk) * c
+                    else:
+                        a1 += e.unsafe_load[width=W](hi * sk) * c
+            d.unsafe_store(v * W, a0 + a1)
+
+
+struct EriBatch(Movable):
+    """Per-thread scratch of ``eri_batch``: lane data, the lane-major intermediate U, outputs."""
+
+    var buf: List[Float64]
+    var out: List[Float64]      # up to BATCH_LANES compact blocks [bra][ket]
+    var paddr: Int              # pin: five arrays of BATCH_LANES values
+    var uaddr: Int              # U: maxcomp_b x nherm(KMAX) x BATCH_LANES
+    var ostride: Int            # floats per compact block
+
+    def __init__(out self, maxcomp_b: Int, maxcomp_k: Int):
+        var nu = maxcomp_b * nherm(KMAX) * BATCH_LANES
+        self.buf = List[Float64](length=PFIELDS * BATCH_LANES + nu + 2 * W, fill=0.0)
+        var base = aligned_addr(self.buf)
+        self.paddr = base
+        self.uaddr = base + PFIELDS * BATCH_LANES * 8
+        self.ostride = maxcomp_b * maxcomp_k
+        self.out = List[Float64](length=BATCH_LANES * self.ostride + W, fill=0.0)
+
+    def block(self, k: Int) -> F64Ptr:
+        """The compact [bra][ket] block of ket ``k`` of the last batch."""
+        return list_ptr(self.out).unsafe_offset(k * self.ostride)
+
+
+def eri_batch(
+    tb: PairTable, ib: Int, tk: PairTable, kets: IntPtr, nket: Int, boys: BoysTable, ws: EriWork, mut wb: EriBatch
+):
+    """(bra|ket_k) for pair ``ib`` of ``tb`` and the ``nket`` pairs ``kets`` of ``tk``.
+
+    The kets must share their Hermite degree and component count, have
+    primitive pairs (at most BATCH_LANES together) and ``batch_supported``
+    must hold for the bra's and the kets' degrees; the bra must have
+    primitive pairs.  Block k (``wb.block(k)``) receives the final integrals
+    in the layout of ``eri_quartet``.  Every primitive pair of the kets is
+    one SIMD lane of ``eri_kernel_lanes``, which contracts the bra; each
+    lane's ket transform follows.
+    """
+    var npo = tb.get(ib, I_NP)
+    var lo = tb.get(ib, I_LAB)
+    var no = tb.get(ib, I_NCOMP)
+    var so = tb.get(ib, I_STRIDE)
+    var k0 = kets[unsafe_offset=0]
+    var li = tk.get(k0, I_LAB)
+    var nk = tk.get(k0, I_NCOMP)
+    var sk = tk.get(k0, I_STRIDE)
+    var nl = 0
+    for k in range(nket):
+        nl += tk.get(kets[unsafe_offset=k], I_NP)
+    var nvec = (nl + W - 1) // W
+    var ipad = nvec * W
+    var pin = F64Ptr(unsafe_from_address=wb.paddr)
+    var lane = 0
+    for k in range(nket):
+        var ik = kets[unsafe_offset=k]
+        var np = tk.get(ik, I_NP)
+        var pp = tk.prim_ptr(ik)
+        var pst = padded(np)
+        for f in range(PFIELDS):
+            for kp in range(np):
+                pin[unsafe_offset=f * ipad + lane + kp] = pp[unsafe_offset=f * pst + kp]
+        lane += np
+    # unused lanes: zero prefactor data, so R and U vanish there
+    for f in range(PFIELDS):
+        for x in range(nl, ipad):
+            pin[unsafe_offset=f * ipad + x] = 0.0
+    var ubuf = F64Ptr(unsafe_from_address=wb.uaddr)
+    run_kernel_lanes(lo, li, npo, tb.prim_ptr(ib), tb.e_ptr(ib), so, no, pin, nvec, boys, ws, ubuf)
+    var out = list_ptr(wb.out)
+    comptime for LI_ in range(KMAX + 1):
+        if li == LI_:
+            lane = 0
+            for k in range(nket):
+                var ik = kets[unsafe_offset=k]
+                var np = tk.get(ik, I_NP)
+                lanes_ket_transform[LI_](no, nk, ubuf, ipad, lane, np, tk.e_ptr(ik), sk, out.unsafe_offset(k * wb.ostride))
+                lane += np
+            return
 
 
 def eri_quartet(
