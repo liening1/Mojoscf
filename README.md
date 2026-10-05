@@ -174,6 +174,56 @@ codes reached the other one, 190.6 mEh, <S^2> = 1.018), and the RHF reference
 of twisted ethylene has degenerate pi orbitals; see the degenerate-shell caveat
 below.  Measured on the 2.1 GHz machine with the default Mojo integrals.
 
+### Transition-metal complexes
+
+`benchmarks/bench_metals.py` runs the SCF and the nuclear gradient for
+idealised complexes with def2 basis sets (which carry an f shell on the metal
+already in def2-SVP; Pt with its def2 effective core potential): pyscf
+versus the same object accelerated with `mojoscf.accelerate`, each in its own
+process, 4 cores of a 2.8 GHz Xeon, conv_tol 1e-9.  "DF" uses pyscf's
+default def2 JK-fitting basis, "direct" `max_memory=1`.
+
+| system                                         | nao | cycles | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | \|dE\| [Eh] |
+|------------------------------------------------|----:|------:|------:|------:|-----:|------:|------:|-----:|--------:|
+| ferrocene / def2-SVP (DF)                      | 221 | 14/14 |   11.2 |    4.2 | 2.7x |    8.7 |   2.8 | 3.1x | 1.0e-11 |
+| ferrocene / def2-TZVP (DF)                     | 415 | 16/16 |   24.7 |   13.4 | 1.8x |   22.2 |  14.1 | 1.6x | 1.8e-12 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP (DF, UHF)     | 303 | 45/45 |   49.3 |   21.6 | 2.3x |   14.3 |   4.8 | 3.0x | 6.8e-12 |
+| [Fe(H2O)6]2+ 12H2O quintet / def2-SVP (DF, UHF) | 463 | 56/56 |  301.7 |  228.6 | 1.3x |  122.8 |  32.7 | 3.8x | 6.9e-11 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP (DF, UHF)     | 241 | 15/15 |   15.1 |    4.6 | 3.3x |    6.8 |   2.4 | 2.9x | 5.5e-11 |
+| Ni(CO)4 / def2-TZVP (DF)                       | 293 | 15/15 |   13.0 |    5.6 | 2.3x |    7.9 |   4.6 | 1.7x | 3.7e-11 |
+| cisplatin / def2-TZVP (DF, Pt ECP)             | 212 | 12/12 |    5.7 |    2.8 | 2.0x |    5.5 |   2.7 | 2.0x | 3.6e-12 |
+| ferrocene / def2-SVP (direct)                  | 221 | 14/14 |   73.6 |   43.6 | 1.7x |   41.8 |  14.1 | 3.0x | 1.2e-11 |
+| [Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)  | 175 | 28/28 |   57.9 |   32.4 | 1.8x |   15.6 |   4.2 | 3.7x | 1.8e-11 |
+| cisplatin / def2-SVP (direct, Pt ECP)          | 126 | 12/12 |   13.8 |    4.1 | 3.3x |    6.7 |   2.0 | 3.4x | 6.8e-13 |
+| Ni(CO)4 / def2-SVP (in-core)                   | 143 | 14/14 |    5.5 |    1.3 | 4.2x |    6.9 |   1.9 | 3.7x | 5.0e-12 |
+
+Gradients agree to 1e-11 or better except for the direct UHF Fe(II) case
+(1e-7), where the two independently converged SCF solutions differ at that
+level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
+
+* **Effective core potentials** only change the one-electron Hamiltonian,
+  so molecules with ECPs (4d/5d metals with def2 or similar basis sets) use
+  the Mojo engine for all two-electron work: in-core ERIs, the DF tensor,
+  direct J/K and the gradient's two-electron term; in the gradients only the
+  ECP derivative integrals come from pyscf.  Before this, cisplatin ran on
+  libcint and pyscf's code throughout.
+* **Large density-fitted SCF** (the 463-AO Fe(II) cluster, 56 UHF cycles) is
+  dominated by the DF exchange build, `K = sum_Q (C^T E_Q)^T (C^T E_Q)`.
+  mojoscf and pyscf do the same GEMMs; with ~100 occupied orbitals as the
+  M dimension these reach ~35-40 GFLOPS per thread here (about 65% of this
+  machine's single-thread DGEMM peak), so per cycle the two codes are on par
+  and the SCF gains come from the DF tensor build (Mojo integrals, in-place
+  triangular solve), J and the native loop.  The gradients of the same
+  systems are 3-4x faster.
+* **Segmented basis sets** (def2) consist largely of single-primitive shells.
+  The integral kernels vectorise over primitive quartets, so quartets of
+  single-primitive shells run the scalar path: alone, such quartets take
+  about 2x libcint's time, while contracted shells take about 0.5x.  For
+  ferrocene / def2-SVP the direct J/K is 1.7x faster than pyscf's overall
+  (8x on the contracted shells alone, 1.3x on the single-primitive ones), and
+  the many quartets mixing the two kinds set the total.  The metal's f shell
+  itself is not the issue.
+
 ## Mojo integral engine
 
 `mojoscf.integrals` evaluates the integrals of a pyscf `Mole` in Mojo and
@@ -529,7 +579,7 @@ mojoscf/
   grad.py              RHF/UHF nuclear gradient classes, exact and DF (nuc_grad_method)
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
-benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py
+benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py
 tools/gen_eri_kernel.py  generates the register-blocked ERI kernel in _mojo/integrals.mojo
 ```
 
