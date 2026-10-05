@@ -97,29 +97,30 @@ recompute the 4-index integrals in every cycle.
 
 | system | nao | cycles | pyscf [s] | of which get_veff [s] | mojoscf [s] | J/K mode | speed-up | &#124;ΔE&#124; [Eh] |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| C10H22 / 6-31G* (DF) | 184 | 9/9 | 9.1 | 7.4 | 5.6 | 1 | 1.62x | 1.0e-12 |
-| C20H42 / 6-31G (DF) | 264 | 8/8 | 27.7 | 25.8 | 19.3 | 1 | 1.44x | 6.4e-12 |
-| (H2O)10 / cc-pVDZ (DF) | 240 | 10/10 | 11.5 | 9.4 | 6.6 | 1 | 1.74x | 4.3e-12 |
-| C60 / STO-3G (DF) | 300 | 8/8 | 97.6 | 95.9 | 71.7 | 1 | 1.36x | 8.4e-11 |
-| (H2O)20 / cc-pVDZ (DF) | 480 | 10/10 | 83.4 | 80.6 | 66.8 | 1 | 1.25x | 2.0e-11 |
-| C20H41 radical / 6-31G (DF, UHF) | 262 | 13/13 | 60.7 | 55.3 | 35.6 | 1 | 1.71x | 1.0e-11 |
-| (H2O)10 cation / cc-pVDZ (DF, UHF) | 240 | 19/19 | 33.1 | 25.6 | 14.0 | 1 | 2.36x | 1.1e-11 |
-| benzene / cc-pVDZ (in-core) | 114 | 8/8 | 2.9 | 1.5 | 0.6 | 2 | 5.03x | 8.5e-13 |
-| benzene cation / cc-pVDZ (UHF) | 114 | 12/12 | 6.2 | 2.3 | 0.8 | 2 | 7.71x | 2.3e-13 |
-| (H2O)5 / cc-pVDZ (in-core) | 120 | 10/10 | 3.9 | 1.9 | 0.8 | 2 | 5.05x | 2.3e-13 |
-| benzene / cc-pVDZ (direct) | 114 | 8/8 | 10.9 | 9.3 | 1.9 | 3 | 5.65x | 5.1e-13 |
-| C8H18 / cc-pVDZ (direct) | 202 | 9/9 | 25.6 | 23.8 | 11.0 | 3 | 2.33x | 1.8e-12 |
-| (H2O)10 / cc-pVDZ (direct) | 240 | 10/10 | 25.2 | 23.0 | 10.5 | 3 | 2.39x | 3.6e-12 |
-| (H2O)5 cation / cc-pVDZ (direct, UHF) | 120 | 19/19 | 20.9 | 14.0 | 3.6 | 3 | 5.72x | 9.1e-13 |
-| benzene / def2-TZVP (direct) | 222 | 8/8 | 32.5 | 30.6 | 16.7 | 3 | 1.95x | 2.8e-13 |
+| C10H22 / 6-31G* (DF) | 184 | 9/9 | 12.4 | 10.7 | 4.5 | 1 | 2.79x | 5.7e-13 |
+| C20H42 / 6-31G (DF) | 264 | 8/8 | 32.2 | 30.0 | 17.9 | 1 | 1.80x | 8.2e-12 |
+| (H2O)10 / cc-pVDZ (DF) | 240 | 10/10 | 16.9 | 14.9 | 4.4 | 1 | 3.85x | 1.8e-12 |
+| C60 / STO-3G (DF) | 300 | 8/8 | 104.8 | 102.8 | 56.7 | 1 | 1.85x | 5.8e-11 |
+| (H2O)20 / cc-pVDZ (DF) | 480 | 10/10 | 91.2 | 88.2 | 46.5 | 1 | 1.96x | 1.5e-11 |
+| C20H41 radical / 6-31G (DF, UHF) | 262 | 13/13 | 56.5 | 51.3 | 31.6 | 1 | 1.79x | 1.7e-11 |
+| (H2O)10 cation / cc-pVDZ (DF, UHF) | 240 | 19/19 | 31.1 | 24.5 | 11.7 | 1 | 2.66x | 6.8e-12 |
+| benzene / cc-pVDZ (in-core) | 114 | 8/8 | 2.8 | 1.2 | 0.6 | 2 | 5.03x | 6.3e-13 |
+| benzene cation / cc-pVDZ (UHF) | 114 | 12/12 | 6.1 | 2.4 | 0.8 | 2 | 7.50x | 2.8e-13 |
+| (H2O)5 / cc-pVDZ (in-core) | 120 | 10/10 | 3.6 | 2.0 | 0.6 | 2 | 6.48x | 3.4e-13 |
+| benzene / cc-pVDZ (direct) | 114 | 8/8 | 9.7 | 8.4 | 1.7 | 3 | 5.67x | 1.7e-13 |
+| C8H18 / cc-pVDZ (direct) | 202 | 9/9 | 23.2 | 21.5 | 9.3 | 3 | 2.51x | 1.7e-12 |
+| (H2O)10 / cc-pVDZ (direct) | 240 | 10/10 | 22.2 | 20.0 | 10.2 | 3 | 2.17x | 2.3e-12 |
+| (H2O)5 cation / cc-pVDZ (direct, UHF) | 120 | 19/19 | 19.1 | 12.8 | 3.1 | 3 | 6.20x | 1.5e-12 |
+| benzene / def2-TZVP (direct) | 222 | 8/8 | 28.8 | 27.2 | 16.0 | 3 | 1.80x | 1.6e-12 |
 
 What the numbers mean:
 
 * **Direct SCF** (integrals recomputed every cycle): mojoscf evaluates the
   quartets with its own integral engine and folds them into J and K in Mojo,
-  with pyscf's screening and incremental update, so every cycle is 2 to 6x
-  faster than libcint + libcvhf.  The largest gains are for the smaller and
-  the open-shell systems (more cycles, cheaper quartets).
+  with pyscf's screening and incremental update, so the SCF is 1.8 to 6x
+  faster than with libcint + libcvhf.  The largest gains are for the smaller
+  and the open-shell systems (more cycles, cheaper quartets); the smallest
+  for def2-TZVP, whose f shells take the single-quartet path.
 * **In-core ERIs** (non-DF, up to about 250 orbitals with pyscf's default
   memory limit): the tensor comes from the Mojo engine (about 2x faster than
   libcint) and is contracted by a Mojo kernel that is 1.6 to 1.8x faster than
@@ -127,18 +128,20 @@ What the numbers mean:
   recomputes the integrals in every cycle, so the in-core build is a large win
   there.
 * **Density fitting**: the 3-index integrals come from the Mojo engine
-  (0.75x of libcint's time) but the Cholesky solve is the same SciPy call;
-  the exchange build is a GEMM-bound operation (`sum_Q (Q|mu i)(Q|nu i)`) that
-  pyscf already runs near the machine's GEMM speed, and the Mojo kernel gains
-  about 1.2x per iteration on it with a streaming J and a `dsyrk` update.  The
-  end-to-end gain is therefore 1.25 to 1.7x for closed shells and up to 2.4x
-  when more cycles are needed (UHF).
+  (0.55-0.65x of libcint's time) and the triangular solve runs in place; the
+  exchange build is a GEMM-bound operation (`sum_Q (Q|mu i)(Q|nu i)`) that
+  pyscf already runs near the machine's GEMM speed, so the Mojo kernel's
+  gain per iteration on it is modest (a streaming J and a `dsyrk` update).
+  End to end: 1.8 to 3.9x here.
 * **What is still C**: the one-electron matrices (`get_hcore`, `get_ovlp`,
   milliseconds) come from libcint unless `attach(mf)` is used, and the BLAS
   and LAPACK calls (GEMM, eigensolvers, Cholesky) are OpenBLAS.  Molecules the
   integral engine does not support use libcint for everything.
 * Earlier versions of this table were measured on a 2.8 GHz machine and with
-  libcint integrals throughout; these numbers replace them.
+  libcint integrals throughout; these numbers replace them.  On this virtual
+  machine the same run can vary by 20-40% between sessions (pyscf's C10H22
+  DF run took 9.1 s in an earlier session, 12.4 s here), so compare within a
+  row rather than across tables.
 
 ### Broken-symmetry UHF
 
@@ -180,25 +183,25 @@ below.  Measured on the 2.1 GHz machine with the default Mojo integrals.
 idealised complexes with def2 basis sets (which carry an f shell on the metal
 already in def2-SVP; Pt with its def2 effective core potential): pyscf
 versus the same object accelerated with `mojoscf.accelerate`, each in its own
-process, 4 cores of a 2.8 GHz Xeon, conv_tol 1e-9.  "DF" uses pyscf's
+process, 4 cores of a 2.1 GHz Xeon, conv_tol 1e-9.  "DF" uses pyscf's
 default def2 JK-fitting basis, "direct" `max_memory=1`.
 
 | system                                         | nao | cycles | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | \|dE\| [Eh] |
 |------------------------------------------------|----:|------:|------:|------:|-----:|------:|------:|-----:|--------:|
-| ferrocene / def2-SVP (DF)                      | 221 | 14/14 |   11.2 |    4.2 | 2.7x |    8.7 |   2.8 | 3.1x | 1.0e-11 |
-| ferrocene / def2-TZVP (DF)                     | 415 | 16/16 |   24.7 |   13.4 | 1.8x |   22.2 |  14.1 | 1.6x | 1.8e-12 |
-| [Fe(H2O)6]2+ quintet / def2-TZVP (DF, UHF)     | 303 | 45/45 |   49.3 |   21.6 | 2.3x |   14.3 |   4.8 | 3.0x | 6.8e-12 |
-| [Fe(H2O)6]2+ 12H2O quintet / def2-SVP (DF, UHF) | 463 | 56/56 |  301.7 |  228.6 | 1.3x |  122.8 |  32.7 | 3.8x | 6.9e-11 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP (DF, UHF)     | 241 | 15/15 |   15.1 |    4.6 | 3.3x |    6.8 |   2.4 | 2.9x | 5.5e-11 |
-| Ni(CO)4 / def2-TZVP (DF)                       | 293 | 15/15 |   13.0 |    5.6 | 2.3x |    7.9 |   4.6 | 1.7x | 3.7e-11 |
-| cisplatin / def2-TZVP (DF, Pt ECP)             | 212 | 12/12 |    5.7 |    2.8 | 2.0x |    5.5 |   2.7 | 2.0x | 3.6e-12 |
-| ferrocene / def2-SVP (direct)                  | 221 | 14/14 |   73.6 |   43.6 | 1.7x |   41.8 |  14.1 | 3.0x | 1.2e-11 |
-| [Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)  | 175 | 28/28 |   57.9 |   32.4 | 1.8x |   15.6 |   4.2 | 3.7x | 1.8e-11 |
-| cisplatin / def2-SVP (direct, Pt ECP)          | 126 | 12/12 |   13.8 |    4.1 | 3.3x |    6.7 |   2.0 | 3.4x | 6.8e-13 |
-| Ni(CO)4 / def2-SVP (in-core)                   | 143 | 14/14 |    5.5 |    1.3 | 4.2x |    6.9 |   1.9 | 3.7x | 5.0e-12 |
+| ferrocene / def2-SVP (DF)                      | 221 | 14/14 |   17.7 |    5.4 | 3.3x |    8.9 |   1.9 | 4.6x | 7.3e-12 |
+| ferrocene / def2-TZVP (DF)                     | 415 | 16/16 |   34.6 |   16.8 | 2.1x |   27.2 |   7.8 | 3.5x | 1.1e-11 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP (DF, UHF)     | 303 | 45/45 |   68.6 |   29.9 | 2.3x |   16.3 |   3.3 | 5.0x | 4.5e-13 |
+| [Fe(H2O)6]2+ 12H2O quintet / def2-SVP (DF, UHF) | 463 | 56/56 |  547.6 |  348.2 | 1.6x |  178.7 |  23.3 | 7.7x | 5.0e-11 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP (DF, UHF)     | 241 | 15/15 |   19.8 |    5.9 | 3.3x |    7.3 |   1.9 | 3.7x | 5.7e-11 |
+| Ni(CO)4 / def2-TZVP (DF)                       | 293 | 15/15 |   16.1 |    6.0 | 2.7x |    8.9 |   2.3 | 3.9x | 3.2e-11 |
+| cisplatin / def2-TZVP (DF, Pt ECP)             | 212 | 12/12 |    7.6 |    2.9 | 2.6x |    5.4 |   2.2 | 2.5x | 1.8e-12 |
+| ferrocene / def2-SVP (direct)                  | 221 | 14/14 |   59.6 |   27.4 | 2.2x |   35.2 |   9.7 | 3.6x | 5.0e-12 |
+| [Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)  | 175 | 28/28 |   50.5 |   20.7 | 2.4x |   12.9 |   3.1 | 4.2x | 8.6e-12 |
+| cisplatin / def2-SVP (direct, Pt ECP)          | 126 | 12/12 |   11.9 |    2.7 | 4.3x |    5.1 |   1.8 | 2.9x | 1.4e-12 |
+| Ni(CO)4 / def2-SVP (in-core)                   | 143 | 14/14 |    6.2 |    1.3 | 5.0x |    6.2 |   1.6 | 3.8x | 1.2e-11 |
 
 Gradients agree to 1e-11 or better except for the direct UHF Fe(II) case
-(1e-7), where the two independently converged SCF solutions differ at that
+(3e-8), where the two independently converged SCF solutions differ at that
 level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
 
 * **Effective core potentials** only change the one-electron Hamiltonian,
@@ -211,18 +214,18 @@ level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
   dominated by the DF exchange build, `K = sum_Q (C^T E_Q)^T (C^T E_Q)`.
   mojoscf and pyscf do the same GEMMs; with ~100 occupied orbitals as the
   M dimension these reach ~35-40 GFLOPS per thread here (about 65% of this
-  machine's single-thread DGEMM peak), so per cycle the two codes are on par
+  machine's single-thread DGEMM peak), so per cycle the two codes are close
   and the SCF gains come from the DF tensor build (Mojo integrals, in-place
   triangular solve), J and the native loop.  The gradients of the same
-  systems are 3-4x faster.
-* **Segmented basis sets** (def2) consist largely of single-primitive shells.
-  The integral kernels vectorise over primitive quartets, so quartets of
-  single-primitive shells run the scalar path: alone, such quartets take
-  about 2x libcint's time, while contracted shells take about 0.5x.  For
-  ferrocene / def2-SVP the direct J/K is 1.7x faster than pyscf's overall
-  (8x on the contracted shells alone, 1.3x on the single-primitive ones), and
-  the many quartets mixing the two kinds set the total.  The metal's f shell
-  itself is not the issue.
+  systems are 3.5-8x faster.
+* **Segmented basis sets** (def2) consist largely of single-primitive shells,
+  where vectorising over the primitive quartets of one shell quartet leaves
+  most SIMD lanes empty.  The drivers therefore batch kets as SIMD lanes
+  (see *SIMD over kets* below): one direct J/K build for ferrocene / def2-SVP
+  went from 2.11 s to 1.60 s (pyscf 4.2-4.7 s), for def2-TZVP from 18.5 s to
+  16.4 s (pyscf 36.6 s), and for [Fe(H2O)6]2+ / def2-SVP from 0.78 s to
+  0.57 s.  The f shells of def2-TZVP give pairs beyond the lane kernels'
+  Hermite degree, which keep the single-quartet path.
 
 ## Mojo integral engine
 
@@ -318,22 +321,22 @@ and two-centre integrals to 2e-13 and 1e-11 (values of order 1e3).  SCF
 energies with either set of integrals agree to 1e-12 Eh.
 
 **Speed** (`benchmarks/bench_integrals.py --scf --repeat 3`, 4 cores of a
-2.8 GHz Xeon for both: libcint through pyscf's OpenMP, the Mojo engine through
+2.1 GHz Xeon for both: libcint through pyscf's OpenMP, the Mojo engine through
 its runtime; best of 3, output memory touched beforehand):
 
 | system                 | nao | naux | ERIs (s8) Mojo | libcint | ratio | DF tensor Mojo | libcint | ratio |
 |------------------------|----:|-----:|---------------:|--------:|------:|---------------:|--------:|------:|
-| H2O / cc-pVDZ          |  24 |  116 |        0.001 s | 0.002 s | 0.75  |        0.004 s | 0.006 s | 0.71  |
-| H2O / aug-cc-pVTZ      |  92 |  139 |        0.060 s | 0.061 s | 0.97  |        0.014 s | 0.031 s | 0.46  |
-| H2O / cc-pVQZ          | 115 |  208 |        0.122 s | 0.188 s | 0.65  |        0.040 s | 0.049 s | 0.82  |
-| benzene / cc-pVDZ      | 114 |  558 |        0.224 s | 0.453 s | 0.49  |        0.101 s | 0.133 s | 0.76  |
-| benzene / def2-TZVP    | 222 |  558 |        2.21 s  | 3.66 s  | 0.60  |        0.306 s | 0.307 s | 1.00  |
-| (H2O)5 / cc-pVDZ       | 120 |  580 |        0.213 s | 0.395 s | 0.54  |        0.087 s | 0.124 s | 0.70  |
-| C8H18 / cc-pVDZ        | 202 |  974 |        1.51 s  | 3.23 s  | 0.47  |        0.471 s | 0.484 s | 0.97  |
+| H2O / cc-pVDZ          |  24 |  116 |        0.003 s | 0.002 s | 1.20  |        0.004 s | 0.006 s | 0.69  |
+| H2O / aug-cc-pVTZ      |  92 |  139 |        0.051 s | 0.055 s | 0.93  |        0.009 s | 0.026 s | 0.34  |
+| H2O / cc-pVQZ          | 115 |  208 |        0.126 s | 0.151 s | 0.84  |        0.019 s | 0.027 s | 0.68  |
+| benzene / cc-pVDZ      | 114 |  558 |        0.147 s | 0.370 s | 0.40  |        0.073 s | 0.124 s | 0.59  |
+| benzene / def2-TZVP    | 222 |  558 |        2.03 s  | 3.38 s  | 0.60  |        0.193 s | 0.317 s | 0.61  |
+| (H2O)5 / cc-pVDZ       | 120 |  580 |        0.163 s | 0.314 s | 0.52  |        0.066 s | 0.107 s | 0.62  |
+| C8H18 / cc-pVDZ        | 202 |  974 |        1.05 s  | 2.73 s  | 0.38  |        0.301 s | 0.481 s | 0.63  |
 
 The DF tensor column includes the Cholesky solve, which is the same SciPy
-call in both and dominates for the larger systems; the three-centre integrals
-alone take 0.155 s against libcint's 0.207 s for octane.  The one-electron
+call in both; the three-centre integrals alone take 0.09 s against libcint's
+0.17 s for octane (0.61 s against 0.80 s for ferrocene / def2-TZVP).  The one-electron
 matrices take 0.6 to 14 ms (libcint 0.3 to 11 ms).  libcint's times for the
 4-index tensor vary by up to 2x between runs (memory traffic for a tensor of
 up to 2.5 GB); the table keeps the best run of each.
@@ -343,20 +346,23 @@ the previous ERI tensor released first):
 
 | system                 | RHF with libcint integrals | RHF with Mojo integrals | energies agree to |
 |------------------------|---------------------------:|------------------------:|------------------:|
-| H2O / cc-pVDZ          |                     0.22 s |                  0.09 s |           9e-14 Eh |
-| H2O / aug-cc-pVTZ      |                     0.37 s |                  0.25 s |           6e-14 Eh |
-| H2O / cc-pVQZ          |                     0.54 s |                  0.42 s |           2e-13 Eh |
-| benzene / cc-pVDZ      |                     0.96 s |                  0.60 s |           3e-13 Eh |
-| benzene / def2-TZVP    |                     6.22 s |                  5.16 s |           1e-13 Eh |
-| (H2O)5 / cc-pVDZ       |                     0.90 s |                  0.71 s |           2e-13 Eh |
-| C8H18 / cc-pVDZ        |                     5.07 s |                  3.81 s |           7e-13 Eh |
+| H2O / cc-pVDZ          |                     0.19 s |                  0.05 s |           1e-14 Eh |
+| H2O / aug-cc-pVTZ      |                     0.25 s |                  0.21 s |           1e-13 Eh |
+| H2O / cc-pVQZ          |                     0.44 s |                  0.49 s |           2e-13 Eh |
+| benzene / cc-pVDZ      |                     0.82 s |                  0.60 s |           2e-12 Eh |
+| benzene / def2-TZVP    |                     6.21 s |                  4.93 s |           8e-13 Eh |
+| (H2O)5 / cc-pVDZ       |                     0.88 s |                  0.73 s |                0 Eh |
+| C8H18 / cc-pVDZ        |                     4.61 s |                  3.94 s |           1e-12 Eh |
 
 Per shell class (benzene / cc-pVDZ, 4-index tensor restricted to the listed
 shells): s-only 0.50x of libcint's time, p-only 0.75x, s+p 0.44x, s+d 0.53x,
-p+d 0.60x, all 0.47x.  The weak spot is uncontracted high angular momentum:
-the d-only tensor (single-primitive d shells) takes 1.5x libcint's time, as
-McMurchie-Davidson needs more operations than libcint's Rys quadrature when
-there are no primitives to amortise the transforms over.  Calls are
+p+d 0.60x, all 0.47x.  For uncontracted high angular momentum
+McMurchie-Davidson needs more operations than libcint's Rys quadrature, as
+there are no primitives to amortise the transforms over; batching kets as
+SIMD lanes keeps single-primitive d shells ahead (30 centres with one
+uncontracted d shell each: 0.70x libcint's time, 0.78x without batching) and
+single-primitive f shells, which keep the single-quartet path, near parity
+(0.8-1.1x between runs).  Calls are
 lightweight (0.13 ms for H2; the Boys table is built once per process and
 tiny jobs stay on the calling thread).
 
@@ -456,23 +462,27 @@ pyscf's `df.grad` with `DFGradients`):
 
 | system                             | nao | pyscf [s] | (2e)  | mojoscf [s] | (2e)  | speedup | max \|dg\| |
 |------------------------------------|----:|----------:|------:|------------:|------:|--------:|----------:|
-| H2O / cc-pVTZ                      |  58 |      0.42 |  0.34 |        0.06 |  0.05 |   7.07x |   1.9e-14 |
-| benzene / cc-pVDZ                  | 114 |      3.70 |  3.80 |        0.69 |  0.65 |   5.37x |   6.0e-13 |
-| benzene cation / cc-pVDZ (UHF)     | 114 |      3.90 |  3.76 |        0.72 |  0.67 |   5.38x |   6.7e-12 |
-| C8H18 / cc-pVDZ                    | 202 |     16.97 | 17.15 |        3.39 |  3.12 |   5.01x |   8.9e-12 |
-| (H2O)5 / aug-cc-pVDZ               | 205 |     13.54 | 13.52 |        3.49 |  3.35 |   3.88x |   5.4e-12 |
-| (H2O)10 / cc-pVDZ                  | 240 |     16.30 | 16.30 |        3.13 |  2.87 |   5.22x |   9.6e-12 |
-| benzene / def2-TZVP                | 222 |     24.46 | 24.73 |        7.40 |  7.04 |   3.31x |   2.9e-12 |
-| benzene / cc-pVDZ (DF)             | 114 |      1.26 |  1.01 |        0.35 |  0.26 |   3.63x |   4.7e-13 |
-| C8H18 / cc-pVDZ (DF)               | 202 |      3.97 |  3.66 |        1.03 |  0.73 |   3.84x |   2.1e-12 |
-| (H2O)10 / cc-pVDZ (DF)             | 240 |      7.59 |  6.34 |        1.71 |  1.30 |   4.43x |   5.7e-12 |
-| (H2O)10 cation / cc-pVDZ (DF, UHF) | 240 |     12.08 | 10.66 |        2.01 |  1.51 |   6.01x |   5.7e-12 |
-| benzene / def2-TZVP (DF)           | 222 |      2.54 |  1.94 |        0.89 |  0.64 |   2.86x |   4.9e-13 |
-| C20H42 / 6-31G (DF)                | 264 |     23.86 | 23.74 |        5.29 |  4.64 |   4.51x |   5.4e-12 |
+| H2O / cc-pVTZ                      |  58 |      0.49 |  0.39 |        0.07 |  0.05 |   7.50x |   2.6e-14 |
+| benzene / cc-pVDZ                  | 114 |      4.03 |  3.88 |        0.96 |  0.96 |   4.19x |   6.6e-13 |
+| benzene cation / cc-pVDZ (UHF)     | 114 |      4.23 |  4.30 |        0.91 |  0.81 |   4.64x |   1.4e-11 |
+| C8H18 / cc-pVDZ                    | 202 |     18.25 | 18.22 |        4.67 |  4.40 |   3.91x |   9.0e-12 |
+| (H2O)5 / aug-cc-pVDZ               | 205 |     14.99 | 14.53 |        4.81 |  4.52 |   3.12x |   4.4e-08 |
+| (H2O)10 / cc-pVDZ                  | 240 |     17.45 | 17.70 |        3.96 |  3.60 |   4.40x |   9.7e-12 |
+| benzene / def2-TZVP                | 222 |     28.29 | 26.65 |        9.93 |  9.29 |   2.85x |   2.9e-12 |
+| benzene / cc-pVDZ (DF)             | 114 |      1.36 |  0.95 |        0.37 |  0.26 |   3.64x |   4.8e-13 |
+| C8H18 / cc-pVDZ (DF)               | 202 |      4.82 |  4.29 |        1.06 |  0.79 |   4.57x |   2.2e-12 |
+| (H2O)10 / cc-pVDZ (DF)             | 240 |     10.10 |  7.40 |        1.68 |  1.38 |   6.00x |   5.7e-12 |
+| (H2O)10 cation / cc-pVDZ (DF, UHF) | 240 |     13.42 | 13.66 |        2.25 |  1.75 |   5.95x |   5.8e-12 |
+| benzene / def2-TZVP (DF)           | 222 |      2.74 |  2.13 |        0.87 |  0.68 |   3.17x |   5.1e-13 |
+| C20H42 / 6-31G (DF)                | 264 |     29.18 | 29.13 |        5.39 |  5.18 |   5.41x |   5.6e-12 |
 
 Each process converges its own SCF, so `max |dg|` (Eh/Bohr) includes the
-SCF convergence (1e-11 Eh); on the same SCF object the gradients agree to
-about 1e-13 (`tests/test_grad.py`).
+SCF convergence (1e-11 Eh; for the aug-cc-pVDZ water cluster the two
+processes' SCF solutions moved the gradient by 4e-8 in this run, while on one
+shared SCF object the two gradients agree to 5e-12); on the same SCF object
+the gradients agree to about 1e-13 (`tests/test_grad.py`).  This run is about
+25% slower for both codes than the previous one on the same type of
+machine; the ratios are what carries over.
 
 ## Installation
 

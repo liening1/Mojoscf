@@ -94,11 +94,14 @@ def main():
               f"{tdfm:7.3f}s {tdfc:7.3f}s {tdfm/tdfc:5.2f} | 1e {d1:.0e} eri {d2:.0e} cderi {d3:.0e}", flush=True)
         if args.scf and not (args.no_eri or nao > 400):
             del cd, cref
+            engine = mi.engine()
+            mi.set_engine("libcint")     # the driver otherwise takes its ERIs from the Mojo engine
             mf = mojoscf.RHF(mol)
             mf.conv_tol = 1e-10
             t0 = time.perf_counter()
             mf.kernel()
             tl = time.perf_counter() - t0
+            mi.set_engine(engine)
             e_l = mf.e_tot
             del mf               # release the ERI tensor before the second run
             mf2 = mojoscf.RHF(mol)
