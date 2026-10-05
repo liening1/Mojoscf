@@ -130,3 +130,38 @@ def test_mm_supported_limits():
     assert not integrals.mm_supported(mol)
     with pytest.raises(NotImplementedError):
         integrals.int1e_grids_sum(mol, [[0.0, 0.0, 3.0]], [1.0])
+
+
+@pytest.mark.parametrize("gaussian", [False, True])
+def test_mm_grad_terms_one_pass(gaussian):
+    """Density-contracted Hermite matrices: atom term and charge forces equal the matrix route."""
+    mol = gto.M(atom=WATER, basis="cc-pvtz", verbose=0)
+    coords, q = _charges(300, rmin=2.0)
+    c = coords / lib.param.BOHR
+    zeta = np.full(len(q), 2.0) if gaussian else None
+    a = np.random.default_rng(2).normal(size=(mol.nao, mol.nao))
+    dm = a + a.T
+    g_atoms, g_charges = integrals.mm_grad_terms(mol, dm, c, q, zeta)
+    m = integrals.int1e_grids_ip_sum(mol, c, q, zeta)
+    ref = np.array([2 * np.einsum("xij,ij->x", m[:, p0:p1], dm[p0:p1]) for p0, p1 in mol.aoslice_by_atom()[:, 2:]])
+    assert abs(g_atoms - ref).max() < 1e-12
+    assert abs(g_charges - integrals.mm_charge_forces(mol, dm, c, q, zeta)).max() < 1e-12
+    # translational invariance: the charge term of the atoms and the charge forces cancel
+    assert abs(g_atoms.sum(0) + g_charges.sum(0)).max() < 1e-10
+
+
+def test_mm_force_cache(monkeypatch):
+    coords, q = _charges(200)
+    mol = gto.M(atom=WATER, basis="cc-pvdz", verbose=0)
+    mf = mojoscf.accelerate(qmmm.mm_charge(scf.RHF(mol), coords, q)).run(conv_tol=1e-10)
+    g = mf.nuc_grad_method()
+    g.kernel()
+    calls = []
+    real = integrals.mm_charge_forces
+    monkeypatch.setattr(integrals, "mm_charge_forces", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    f = g.grad_hcore_mm(mf.make_rdm1())
+    assert not calls                                   # from the gradient's pass
+    dm2 = mf.make_rdm1() * 1.01
+    f2 = g.grad_hcore_mm(dm2)
+    assert calls                                       # another density: recomputed
+    assert abs(f2 - 1.01 * f).max() < 1e-12

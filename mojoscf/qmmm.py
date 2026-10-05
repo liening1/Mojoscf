@@ -39,6 +39,25 @@ def _mm_data(mm_mol):
     return mm_mol.atom_coords(), mm_mol.atom_charges(), zetas
 
 
+def _total_density(dm):
+    """The symmetric part of the total density (the charge integrals are symmetric in the AO pair)."""
+    dm = np.asarray(dm, dtype=np.float64)
+    if dm.ndim == 3:            # (alpha, beta)
+        dm = dm[0] + dm[1]
+    return 0.5 * (dm + dm.T)
+
+
+def _mm_key(mol, mm_mol, dm):
+    coords, charges, zetas = _mm_data(mm_mol)
+    return (mol.atom_coords(), mol._env.copy(), coords, charges, zetas, dm)
+
+
+def _same_key(a, b):
+    return all(
+        (x is None and y is None) or (x is not None and y is not None and np.array_equal(x, y)) for x, y in zip(a, b)
+    )
+
+
 def mojo_ok(mol, mm_mol) -> bool:
     """True if the MM-charge terms of ``mol`` in the field of ``mm_mol`` come from the Mojo engine."""
     return (
@@ -71,7 +90,17 @@ class _MojoQMMMHook:
 
 
 class _MojoQMMMGrad(itrf.QMMMGrad):
-    """pyscf's ``QMMMGrad`` with the MM-charge derivative integrals from the Mojo engine."""
+    """pyscf's ``QMMMGrad`` with the MM-charge derivative integrals from the Mojo engine.
+
+    ``grad_elec`` adds the charge term of the QM-atom gradient from one
+    density-contracted pass (:func:`mojoscf.integrals.mm_grad_terms`), which
+    also yields the forces on the charges; ``grad_hcore_mm`` returns those
+    when called for the same density, geometry and charges, so a gradient
+    step with MM forces evaluates the charge integrals once.
+    """
+
+    _mm_in_hcore = True         # get_hcore includes the charges (not while grad_elec adds them itself)
+    _mm_force_cache = None
 
     def get_hcore(self, mol=None):
         """(QM one-electron derivative) + sum_k q_k <nabla i|1/|r - R_k||j>, as pyscf."""
@@ -80,21 +109,43 @@ class _MojoQMMMGrad(itrf.QMMMGrad):
         if not mojo_ok(mol, mm_mol):
             return super().get_hcore(mol)
         g_qm = super(itrf.QMMMGrad, self).get_hcore(mol)    # without the MM charges
+        if not self._mm_in_hcore:
+            return g_qm
         coords, charges, zetas = _mm_data(mm_mol)
         return g_qm + integrals.int1e_grids_ip_sum(mol, coords, charges, zetas)
+
+    def grad_elec(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
+        mol = self.mol
+        mm_mol = self.base.mm_mol
+        if not mojo_ok(mol, mm_mol):
+            return super().grad_elec(mo_energy, mo_coeff, mo_occ, atmlst)
+        mf = self.base
+        dm = _total_density(mf.make_rdm1(mf.mo_coeff if mo_coeff is None else mo_coeff,
+                                         mf.mo_occ if mo_occ is None else mo_occ))
+        self._mm_in_hcore = False
+        try:
+            de = super().grad_elec(mo_energy, mo_coeff, mo_occ, atmlst)
+        finally:
+            del self._mm_in_hcore
+        coords, charges, zetas = _mm_data(mm_mol)
+        g_atoms, g_charges = integrals.mm_grad_terms(mol, dm, coords, charges, zetas)
+        self._mm_force_cache = (_mm_key(mol, mm_mol, dm), g_charges)
+        if atmlst is None:
+            atmlst = range(mol.natm)
+        return de + g_atoms[list(atmlst)]
 
     def grad_hcore_mm(self, dm, mol=None):
         """Electronic part of the gradient with respect to the MM charge positions, shape (ncharge, 3)."""
         mol = self.mol if mol is None else mol
         mm_mol = self.base.mm_mol
-        dm = np.asarray(dm)
         if not mojo_ok(mol, mm_mol):
             return super().grad_hcore_mm(dm, mol)
-        if dm.ndim == 3:        # (alpha, beta) densities
-            dm = dm[0] + dm[1]
+        dm = _total_density(dm)
+        cache = self._mm_force_cache
+        if cache is not None and _same_key(cache[0], _mm_key(mol, mm_mol, dm)):
+            return cache[1].copy()
         coords, charges, zetas = _mm_data(mm_mol)
-        # the integrals are symmetric in the AO pair, so only the symmetric part of dm contributes
-        return integrals.mm_charge_forces(mol, 0.5 * (dm + dm.T), coords, charges, zetas)
+        return integrals.mm_charge_forces(mol, dm, coords, charges, zetas)
 
     contract_hcore_mm = grad_hcore_mm
 

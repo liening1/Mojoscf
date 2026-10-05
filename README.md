@@ -231,38 +231,41 @@ level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
 
 `benchmarks/bench_qmmm.py` embeds a QM solute in a sphere of TIP3P
 point-charge waters (`pyscf.qmmm.mm_charge`; liquid density, waters within
-2.6 Å of a QM atom left out) and times the SCF, the gradient on the QM atoms
-(`nuc_grad_method().kernel()`) and the forces on the MM charges
-(`grad_hcore_mm(dm) + grad_nuc_mm()`): pyscf versus the same object
-accelerated with `mojoscf.accelerate`, each in its own process, 4 cores of a
-2.1 GHz Xeon, conv_tol 1e-9.
+2.6 Å of a QM atom left out) and times the SCF, then the gradient on the QM
+atoms (`nuc_grad_method().kernel()`) followed by the forces on the MM charges
+(`grad_hcore_mm(dm) + grad_nuc_mm()`), the two together being the forces of
+one QM/MM MD step: pyscf versus the same object accelerated with
+`mojoscf.accelerate`, each in its own process, 4 cores of a 2.1 GHz Xeon,
+conv_tol 1e-9.
 
-| system                                          | nao | MM charges | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | MM forces pyscf [s] | mojoscf [s] | x |
-|-------------------------------------------------|----:|-----:|-----:|-----:|-----:|-----:|-----:|-----:|------:|-----:|------:|
-| benzene / cc-pVDZ, 15 Å (DF)                    | 114 | 1353 |  4.3 |  0.7 | 5.9x |  1.5 |  0.4 | 3.5x |  0.72 | 0.10 |  7.2x |
-| benzene / cc-pVDZ, 25 Å (DF)                    | 114 | 6486 |  3.8 |  0.8 | 4.8x |  2.7 |  0.7 | 3.9x |  3.73 | 0.42 |  8.9x |
-| benzene / cc-pVDZ, 25 Å, Gaussian charges (DF)  | 114 | 6486 |  4.7 |  0.8 | 5.6x |  3.9 |  0.7 | 5.3x |  3.37 | 0.43 |  7.8x |
-| (H2O)5 / aug-cc-pVDZ, 20 Å (in-core)            | 205 | 3366 | 14.1 |  4.0 | 3.5x | 18.2 |  5.4 | 3.4x |  6.29 | 0.70 |  9.0x |
-| C8H18 / 6-31G*, 20 Å (direct)                   | 148 | 3330 | 16.7 |  4.5 | 3.7x | 11.4 |  2.5 | 4.6x |  5.15 | 0.30 | 17.2x |
-| ferrocene / def2-SVP, 25 Å (DF)                 | 221 | 6456 | 23.4 |  8.2 | 2.9x | 13.9 |  3.2 | 4.4x | 10.91 | 1.44 |  7.6x |
-| (H2O)10+ / cc-pVDZ, 20 Å (DF, UHF)              | 240 | 3330 | 31.9 | 11.8 | 2.7x | 19.0 |  3.2 | 6.0x |  7.44 | 0.58 | 12.9x |
+| system                                          | nao | MM charges | SCF pyscf [s] | mojoscf [s] | x | grad + MM forces pyscf [s] | (MM forces) | mojoscf [s] | x |
+|-------------------------------------------------|----:|-----:|-----:|-----:|-----:|------:|------:|-----:|------:|
+| benzene / cc-pVDZ, 15 Å (DF)                    | 114 | 1353 |  3.9 |  0.7 | 5.8x |  2.16 |  0.69 | 0.35 |  6.2x |
+| benzene / cc-pVDZ, 25 Å (DF)                    | 114 | 6486 |  4.2 |  0.7 | 5.9x |  5.54 |  3.23 | 0.41 | 13.5x |
+| benzene / cc-pVDZ, 25 Å, Gaussian charges (DF)  | 114 | 6486 |  3.9 |  0.7 | 5.5x |  6.80 |  3.24 | 0.45 | 15.0x |
+| (H2O)5 / aug-cc-pVDZ, 20 Å (in-core)            | 205 | 3366 |  9.3 |  3.4 | 2.7x | 22.84 |  5.46 | 4.12 |  5.5x |
+| C8H18 / 6-31G*, 20 Å (direct)                   | 148 | 3330 | 15.9 |  3.6 | 4.4x | 14.30 |  3.51 | 1.99 |  7.2x |
+| ferrocene / def2-SVP, 25 Å (DF)                 | 221 | 6456 | 22.5 |  7.7 | 2.9x | 23.31 | 11.98 | 2.26 | 10.3x |
+| (H2O)10+ / cc-pVDZ, 20 Å (DF, UHF)              | 240 | 3330 | 30.3 | 10.1 | 3.0x | 20.45 |  6.63 | 2.28 |  9.0x |
 
 Energies agree to 4e-11 Eh or better, QM gradients to 9e-12 and MM forces
 to 5e-14 Eh/Bohr.  pyscf builds one integral matrix per block of 200
 charges (`int1e_grids` for the Hamiltonian, `int1e_grids_ip` and
 `int3c2e_ip2` with charges of exponent 1e16 for the gradients) and
-contracts it with NumPy.  `_mojo/qmmm.mojo` treats each charge as the
+contracts it with NumPy; its MM forces alone ("(MM forces)") often cost
+more than the QM gradient.  `_mojo/qmmm.mojo` treats each charge as the
 s-type ket of the batched ERI kernel instead (a point charge as exponent
-1e30, exact to double precision; Gaussian charges with their own
-exponent), with up to 64 charges as the SIMD lanes against one AO shell
-pair, and contracts on the fly: the potential in one pass, and the
-derivative matrix and the forces on all charges from the six-component pair
-table (nabla a, nabla b) in another, the charge's derivative following from
-translational invariance.  The MM terms stay a sizeable part for a small
-QM region (benzene with 6486 charges: 0.12 s for the potential, 0.42 s for
-the derivative matrix inside the 0.7 s gradient, 0.42 s for the forces);
-the rest of the speed-up is the SCF loop, J/K and the QM gradient described
-above.
+1e30, exact to double precision; Gaussian charges with their own exponent),
+with up to 64 charges as the SIMD lanes against one AO shell pair, and
+contracts on the fly.  The SCF needs the potential matrix, one pass.  The
+gradient needs only density-contracted derivatives: the derivative Hermite
+matrices of each shell pair (nabla a, nabla b) are contracted with the
+density before the charge loop, so the kernel transforms six components
+instead of 6 n_a n_b, and a single pass gives the charge term of the
+QM-atom gradient and, by translational invariance, the force on every
+charge; `grad_hcore_mm(dm)` returns those forces when called for the
+gradient's density, geometry and charges.  For benzene with 6486 charges
+the potential takes 0.12 s and the gradient pass 0.25 s.
 
 ## Mojo integral engine
 
@@ -287,6 +290,7 @@ four-index and three-centre integrals it is faster than libcint.
 | `int1e_grids_sum(mol, coords, w, zetas=None)` | `einsum('kij,k->ij', mol.intor("int1e_grids", grids=coords), w)`; with `zetas`, Gaussian charges (`int3c2e` with `fakemol_for_charges`) |
 | `int1e_grids_ip_sum(mol, coords, w, zetas=None)` | `einsum('xkij,k->xij', mol.intor("int1e_grids_ip", grids=coords), w)` |
 | `mm_charge_forces(mol, dm, coords, w, zetas=None)` | `pyscf.qmmm` `QMMMGrad.grad_hcore_mm(dm)` (`int3c2e_ip2` contracted with dm) |
+| `mm_grad_terms(mol, dm, coords, w, zetas=None)` | the charge term of the QM-atom gradient and `grad_hcore_mm(dm)` together, from one pass |
 
 **Method.** McMurchie-Davidson: Hermite expansion coefficients `E_t^{ij}`,
 Hermite Coulomb integrals `R_{tuv}` from the Boys function (an 8-term Taylor
@@ -635,7 +639,7 @@ but slow for more than a few dozen orbitals.
 | two-electron integrals (3-index DF tensor, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
 | one-electron integrals (`get_hcore`, `get_ovlp`) | C (libcint)          | unchanged (`attach(mf)` uses the Mojo engine) |
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |
-| QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly; nucleus-charge terms NumPy as in pyscf |
+| QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly (the gradient pass with density-contracted Hermite matrices gives the QM-atom term and all charge forces at once); nucleus-charge terms NumPy as in pyscf |
 
 Source layout:
 

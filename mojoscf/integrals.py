@@ -429,7 +429,7 @@ def int1e_grids_ip_sum(mol, coords, weights, zetas=None):
     nao = mol.nao_nr()
     mat = np.empty((3, nao, nao))
     get_extension().mm_grad(
-        basis_tables(mol), _boys_table(), coords, weights, zetas, point, np.zeros(1), mat, np.zeros(0)
+        basis_tables(mol), _boys_table(), coords, weights, zetas, point, np.zeros(1), mat, np.zeros(0), np.zeros(0)
     )
     return mat
 
@@ -447,8 +447,30 @@ def mm_charge_forces(mol, dm, coords, weights, zetas=None):
     if dm.shape != (nao, nao):
         raise ValueError(f"dm must be ({nao}, {nao})")
     forces = np.empty((coords.shape[0], 3))
-    get_extension().mm_grad(basis_tables(mol), _boys_table(), coords, weights, zetas, point, dm, np.zeros(0), forces)
+    get_extension().mm_grad(
+        basis_tables(mol), _boys_table(), coords, weights, zetas, point, dm, np.zeros(0), forces, np.zeros(0)
+    )
     return forces
+
+
+def mm_grad_terms(mol, dm, coords, weights, zetas=None):
+    """Both density-contracted derivatives of the charge potential from one pass, ``(g_atoms, g_charges)``.
+
+    ``g_atoms[A] = 2 sum_{i on A, j} D_ij sum_k w_k <nabla i|1/|r - R_k||j>``
+    (natm, 3), the term of the QM-atom gradient that pyscf's ``QMMMGrad``
+    gets from its ``get_hcore`` (with ``w`` the MM charges), and
+    ``g_charges = mm_charge_forces(mol, dm, coords, weights, zetas)``
+    (ncharge, 3).  ``dm`` must be symmetric.  No integral matrix is formed.
+    """
+    coords, weights, zetas, point = _mm_args(mol, coords, weights, zetas)
+    dm = np.ascontiguousarray(dm, dtype=np.float64)
+    nao = mol.nao_nr()
+    if dm.shape != (nao, nao):
+        raise ValueError(f"dm must be ({nao}, {nao})")
+    forces = np.empty((coords.shape[0], 3))
+    atoms = np.empty((mol.natm, 3))
+    get_extension().mm_grad(basis_tables(mol), _boys_table(), coords, weights, zetas, point, dm, np.zeros(0), forces, atoms)
+    return atoms, forces
 
 
 def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14):

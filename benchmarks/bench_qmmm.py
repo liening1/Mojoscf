@@ -5,8 +5,10 @@ about liquid density, waters closer than 2.6 A to a QM atom left out).  For
 each case the script converges the QM/MM SCF (``qmmm.mm_charge``, conv_tol
 1e-9; the same pyscf object accelerated with ``mojoscf.accelerate`` for
 mojoscf), then times the nuclear gradient of the QM atoms
-(``nuc_grad_method().kernel()``) and the forces on the MM charges
-(``grad_hcore_mm(dm) + grad_nuc_mm()``).  Usage:
+(``nuc_grad_method().kernel()``) followed by the forces on the MM charges
+(``grad_hcore_mm(dm) + grad_nuc_mm()``), the two together being one MD
+step's worth of forces (mojoscf obtains the MM forces in the gradient's
+pass over the charge integrals).  Usage:
 
     python benchmarks/bench_qmmm.py [--cases a,b,...] [--list]
 """
@@ -87,7 +89,7 @@ def main():
         return
     bench_dir = os.path.dirname(os.path.abspath(__file__))
     print(f"{'system':46s} {'nao':>4s} {'MM q':>6s} | {'SCF pyscf':>9s} {'mojoscf':>8s} {'x':>5s} | {'grad pyscf':>10s} "
-          f"{'mojoscf':>8s} {'x':>5s} | {'MM forces':>9s} {'mojoscf':>8s} {'x':>5s} | {'|dE|':>7s} {'max|dg|':>8s} {'max|dF|':>8s}")
+          f"{'(MM f)':>6s} {'mojoscf':>8s} {'x':>5s} | {'|dE|':>7s} {'max|dg|':>8s} {'max|dF|':>8s}")
     for key in args.cases.split(","):
         name = CASES[key][0]
         ref = run(key, "pyscf", bench_dir)
@@ -95,9 +97,10 @@ def main():
         flag = "" if ref["conv"] and moj["conv"] else "  NOT CONVERGED"
         dg = abs(np.array(ref["de"]) - np.array(moj["de"])).max()
         df = abs(np.array(ref["fmm"]) - np.array(moj["fmm"])).max()
+        tr = ref["tgrad"] + ref["tmm"]
+        tm = moj["tgrad"] + moj["tmm"]
         print(f"{name:46s} {ref['nao']:4d} {ref['nmm']:6d} | {ref['tscf']:9.1f} {moj['tscf']:8.1f} {ref['tscf'] / moj['tscf']:4.1f}x | "
-              f"{ref['tgrad']:10.1f} {moj['tgrad']:8.1f} {ref['tgrad'] / moj['tgrad']:4.1f}x | "
-              f"{ref['tmm']:9.2f} {moj['tmm']:8.2f} {ref['tmm'] / moj['tmm']:4.1f}x | "
+              f"{tr:10.2f} {ref['tmm']:6.2f} {tm:8.2f} {tr / tm:4.1f}x | "
               f"{abs(ref['e'] - moj['e']):7.1e} {dg:8.1e} {df:8.1e}{flag}", flush=True)
 
 

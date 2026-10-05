@@ -16,6 +16,10 @@ charges still spreads over all threads.
                        M_x,ij = sum_k w_k (nabla_x i j|k)              (3 x nao x nao, all i, j)
                        F_k,x = sum_ij D_ij w_k (ij|nabla_x k)
                              = -sum_ij D_ij w_k [(nabla_x i j|k) + (i nabla_x j|k)]   (nch x 3)
+                       G_A,x = 2 sum_{i on A, j} M_x,ij D_ij              (natm x 3)
+                       (the last two from one pass, without forming M: the pair's
+                       derivative Hermite matrices are contracted with D first, so
+                       the kernel transforms six components instead of 6 n_a n_b)
 
 (nabla acts on the electron coordinate, as libcint's ``ip`` integrals;
 the last line is translational invariance.)
@@ -27,7 +31,7 @@ from std.runtime import parallelism_level
 from max.algorithm import parallelize
 from _mojo.linalg import F64Ptr, list_ptr, vfill
 from _mojo.integrals import (
-    Basis, BoysTable, HermTable, PairTable, lanes_dispatch, aligned_addr, nherm, PFIELDS, W, PI, LMAX_POT,
+    Basis, BoysTable, HermTable, PairTable, lanes_dispatch, aligned_addr, nherm, padded, PFIELDS, W, PI, LMAX_POT,
     I_A, I_B, I_LAB, I_NCOMP, I_STRIDE, I_NP,
 )
 
@@ -180,11 +184,13 @@ def mm_potential_core(
 def mm_grad_core(
     basis: Basis, boys: BoysTable, nch: Int, coords: F64Ptr, weights: F64Ptr, zetas: F64Ptr, point: Bool,
     dm: F64Ptr, want_mat: Bool, mat_out: F64Ptr, want_force: Bool, force_out: F64Ptr,
+    want_atoms: Bool, atom_out: F64Ptr,
 ):
-    """M_x,ij into ``mat_out`` (3 x nao x nao) and/or F_k,x into ``force_out`` (nch x 3), both overwritten.
+    """M_x,ij into ``mat_out`` (3 x nao x nao), F_k,x into ``force_out`` (nch x 3) and/or G_A,x into ``atom_out``.
 
-    ``dm`` (nao x nao, symmetric) is read only for the forces.  See the
-    module docstring for the definitions.
+    Each requested output is overwritten.  ``dm`` (nao x nao, symmetric) is
+    read for the forces and the atom gradient.  See the module docstring
+    for the definitions.
     """
     var nbas = basis.nbas
     var nao = basis.nao
@@ -199,25 +205,38 @@ def mm_grad_core(
     var ngroup = max(1, (lanes.nchunk + GROUP - 1) // GROUP)
     var ntask = npairs * ngroup
     var nworkers = max(1, min(parallelism_level(), ntask))
-    var per = (3 * n2 if want_mat else 0) + (3 * nch if want_force else 0)
+    var natm = basis.natm
+    var nmat = 3 * n2 if want_mat else 0
+    var nfor = 3 * nch if want_force else 0
+    var per = nmat + nfor + (3 * natm if want_atoms else 0)
+    # D-contracted Hermite matrices (six components, padded) when M is not wanted
+    var maxnp = 1
+    for sp in range(npairs):
+        maxnp = max(maxnp, tab2.get(sp, I_NP))
+    var st = padded(6)
+    var esize = maxnp * nherm(tab2.maxlab) * st
     var accl = List[Float64](length=nworkers * per + 1, fill=0.0)
     var pacc = list_ptr(accl)
     var btab = list_ptr(boys.table)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm basis, imm tab2, imm lanes, imm btab, imm pacc, imm pcount, imm ntask, imm ngroup, imm npairs, imm nao, imm n2, imm per, imm dm, imm want_mat, imm want_force}:
+    def work(w: Int) {imm basis, imm tab2, imm lanes, imm btab, imm pacc, imm pcount, imm ntask, imm ngroup, imm npairs, imm nao, imm n2, imm per, imm nmat, imm nfor, imm dm, imm want_mat, imm want_force, imm want_atoms, imm st, imm esize}:
         var maxc = tab2.maxcomp
         var ub = List[Float64](length=maxc * CHUNK + 2 * W, fill=0.0)
         var rbl = List[Float64](length=RBUF + 2 * W, fill=0.0)
         var vacc = List[Float64](length=maxc * W + 2 * W, fill=0.0)
         var dloc = List[Float64](length=maxc + 1, fill=0.0)
+        var econ = List[Float64](length=(esize if not want_mat else 1) + 2 * W, fill=0.0)
+        var pe = F64Ptr(unsafe_from_address=aligned_addr(econ))
         var pu = F64Ptr(unsafe_from_address=aligned_addr(ub))
         var prb = F64Ptr(unsafe_from_address=aligned_addr(rbl))
         var pv = F64Ptr(unsafe_from_address=aligned_addr(vacc))
         var pd = list_ptr(dloc)
         var macc = pacc.unsafe_offset(w * per)
-        var facc = macc.unsafe_offset(3 * n2 if want_mat else 0)
+        var facc = macc.unsafe_offset(nmat)
+        var aacc = facc.unsafe_offset(nfor)
+        var contract = want_force or want_atoms
         while True:
             var task = Int(pcount[].fetch_add(1))
             if task >= ntask:
@@ -238,23 +257,70 @@ def mm_grad_core(
             var nb = basis.ao_loc[b + 1] - j0
             var nab = na * nb
             var wpair = 2.0 if a != b else 1.0
-            if want_force:
+            if contract:
                 for i in range(na):
                     for j in range(nb):
-                        pd[unsafe_offset=i * nb + j] = wpair * dm[unsafe_offset=(i0 + i) * nao + j0 + j]
+                        pd[unsafe_offset=i * nb + j] = dm[unsafe_offset=(i0 + i) * nao + j0 + j]
+            # sum over the charges of the D-contracted (nabla a) and (nabla b) components, per x
+            var ga0 = SIMD[DType.float64, W](0.0)
+            var ga1 = SIMD[DType.float64, W](0.0)
+            var ga2 = SIMD[DType.float64, W](0.0)
+            var gb0 = SIMD[DType.float64, W](0.0)
+            var gb1 = SIMD[DType.float64, W](0.0)
+            var gb2 = SIMD[DType.float64, W](0.0)
             if want_mat:
                 vfill(pv, no * W, 0.0)
+            else:
+                # E~[ko][h][c] = sum_ij D_ij E[ko][h][c nab + ij], c = (nabla a)_x, (nabla b)_x
+                var nh = nherm(lo)
+                var e2 = tab2.e_ptr(sp)
+                for r in range(np * nh):
+                    var row = e2.unsafe_offset(r * so)
+                    var dst = pe.unsafe_offset(r * st)
+                    for cc in range(6):
+                        var acc = 0.0
+                        var src = row.unsafe_offset(cc * nab)
+                        for ij in range(nab):
+                            acc += pd[unsafe_offset=ij] * src[unsafe_offset=ij]
+                        dst[unsafe_offset=cc] = acc
             for c in range(g * GROUP, min((g + 1) * GROUP, lanes.nchunk)):
                 var nv = lanes.nvec(c)
-                lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), tab2.e_ptr(sp), so, no, lanes.chunk(c), nv, btab, pu, prb)
                 var ipad = nv * W
+                if not want_mat:
+                    lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), pe, st, 6, lanes.chunk(c), nv, btab, pu, prb)
+                    var k0 = c * CHUNK
+                    var nk = min(CHUNK, lanes.nch - k0)
+                    for v in range(nv):
+                        var a0 = pu.unsafe_load[width=W](v * W)
+                        var a1 = pu.unsafe_load[width=W](ipad + v * W)
+                        var a2 = pu.unsafe_load[width=W](2 * ipad + v * W)
+                        var b0 = pu.unsafe_load[width=W](3 * ipad + v * W)
+                        var b1 = pu.unsafe_load[width=W](4 * ipad + v * W)
+                        var b2 = pu.unsafe_load[width=W](5 * ipad + v * W)
+                        ga0 += a0
+                        ga1 += a1
+                        ga2 += a2
+                        gb0 += b0
+                        gb1 += b1
+                        gb2 += b2
+                        if want_force:
+                            var f0 = (a0 + b0) * wpair
+                            var f1 = (a1 + b1) * wpair
+                            var f2 = (a2 + b2) * wpair
+                            for lane in range(min(W, nk - v * W)):
+                                var fk = facc.unsafe_offset(3 * (k0 + v * W + lane))
+                                fk[unsafe_offset=0] -= f0[lane]
+                                fk[unsafe_offset=1] -= f1[lane]
+                                fk[unsafe_offset=2] -= f2[lane]
+                    continue
+                lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), tab2.e_ptr(sp), so, no, lanes.chunk(c), nv, btab, pu, prb)
                 if want_mat:
                     for o in range(no):
                         var s = pv.unsafe_load[width=W](o * W)
                         for v in range(nv):
                             s += pu.unsafe_load[width=W](o * ipad + v * W)
                         pv.unsafe_store(o * W, s)
-                if want_force:
+                if contract:
                     var k0 = c * CHUNK
                     var nk = min(CHUNK, lanes.nch - k0)
                     for v in range(nv):
@@ -267,9 +333,30 @@ def mm_grad_core(
                                 var d = SIMD[DType.float64, W](pd[unsafe_offset=ij])
                                 s0 += ua.unsafe_load[width=W](ij * ipad) * d
                                 s1 += ubb.unsafe_load[width=W](ij * ipad) * d
-                            var s = s0 + s1
-                            for lane in range(min(W, nk - v * W)):
-                                facc[unsafe_offset=3 * (k0 + v * W + lane) + x] -= s[lane]
+                            if want_force:
+                                var s = (s0 + s1) * wpair
+                                for lane in range(min(W, nk - v * W)):
+                                    facc[unsafe_offset=3 * (k0 + v * W + lane) + x] -= s[lane]
+                            if x == 0:
+                                ga0 += s0
+                                gb0 += s1
+                            elif x == 1:
+                                ga1 += s0
+                                gb1 += s1
+                            else:
+                                ga2 += s0
+                                gb2 += s1
+            if want_atoms:
+                # G_A = 2 sum_{i on A} M_ij D_ij: (nabla a) rows for atom(a), (nabla b) rows (a != b) for atom(b)
+                var pa = aacc.unsafe_offset(3 * basis.atom[a])
+                pa[unsafe_offset=0] += 2.0 * ga0.reduce_add()
+                pa[unsafe_offset=1] += 2.0 * ga1.reduce_add()
+                pa[unsafe_offset=2] += 2.0 * ga2.reduce_add()
+                if a != b:
+                    var pb = aacc.unsafe_offset(3 * basis.atom[b])
+                    pb[unsafe_offset=0] += 2.0 * gb0.reduce_add()
+                    pb[unsafe_offset=1] += 2.0 * gb1.reduce_add()
+                    pb[unsafe_offset=2] += 2.0 * gb2.reduce_add()
             if want_mat:
                 for x in range(3):
                     var mx = macc.unsafe_offset(x * n2)
@@ -288,6 +375,7 @@ def mm_grad_core(
         _ = rbl^
         _ = vacc^
         _ = dloc^
+        _ = econ^
 
     if nworkers == 1:
         work(0)
@@ -300,12 +388,17 @@ def mm_grad_core(
                 v += pacc[unsafe_offset=w2 * per + i]
             mat_out[unsafe_offset=i] = v
     if want_force:
-        var off = 3 * n2 if want_mat else 0
         for i in range(3 * nch):
             var v = 0.0
             for w2 in range(nworkers):
-                v += pacc[unsafe_offset=w2 * per + off + i]
+                v += pacc[unsafe_offset=w2 * per + nmat + i]
             force_out[unsafe_offset=i] = v
+    if want_atoms:
+        for i in range(3 * natm):
+            var v = 0.0
+            for w2 in range(nworkers):
+                v += pacc[unsafe_offset=w2 * per + nmat + nfor + i]
+            atom_out[unsafe_offset=i] = v
     _ = accl^
     _ = counter^
     _ = lanes^

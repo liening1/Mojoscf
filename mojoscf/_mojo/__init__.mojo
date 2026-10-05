@@ -72,7 +72,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix): three-centre term of the DF gradient.")
         m.def_function[py_grad2c]("grad2c", docstring="grad2c(auxbasis, table, w, de): d/dR of -1/2 sum (P|Q) W_PQ.")
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
-        m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces): sum_k w_k (nabla i j|k) (3, nao, nao) and/or sum_ij D_ij w_k (ij|nabla k) (nch, 3); an empty output is skipped.")
+        m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces, atoms): sum_k w_k (nabla i j|k) (3, nao, nao), sum_ij D_ij w_k (ij|nabla k) (nch, 3), 2 sum_{i on A} D_ij sum_k w_k (nabla i j|k) (natm, 3); an empty output is skipped.")
         m.def_function[py_int1e_iprinv_dm]("int1e_iprinv_dm", docstring="int1e_iprinv_dm(basis, table, centers, dm, out): sum_ij D_ij <nabla i|1/|r-R_c||j> per centre (ncenter, 3).")
         m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk.")
         m.def_function[py_direct_jk]("direct_jk", docstring="direct_jk(basis, table, dms, vj, vk, with_j, with_k, tol): integral-direct J/K of symmetric densities.")
@@ -570,13 +570,14 @@ def py_mm_potential(
 
 def py_mm_grad(
     basis: PythonObject, table: PythonObject, coords: PythonObject, weights: PythonObject, zetas: PythonObject,
-    point: PythonObject, dm: PythonObject, mat: PythonObject, forces: PythonObject,
+    point: PythonObject, dm: PythonObject, mat: PythonObject, forces: PythonObject, atoms: PythonObject,
 ) raises -> PythonObject:
     var bs = _basis(basis)
     var boys = _boys(table)
     mm_grad_core(
         bs, boys, Int(py=weights.shape[0]), f64ptr(coords), f64ptr(weights), f64ptr(zetas), Bool(py=point),
         f64ptr(dm), Int(py=mat.size) > 0, f64ptr(mat), Int(py=forces.size) > 0, f64ptr(forces),
+        Int(py=atoms.size) > 0, f64ptr(atoms),
     )
     _ = bs^
     _ = boys^
