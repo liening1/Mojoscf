@@ -127,8 +127,9 @@ def test_unsupported_molecules():
     mol = gto.M(atom="Cu 0 0 0", basis="lanl2dz", ecp="lanl2dz", spin=1, verbose=0)
     assert "core potential" in mi.unsupported_reason(mol)
     assert mi.unsupported_reason(mol, two_electron=True) is None
+    assert mi.unsupported_reason(mol, allow_ecp=True) is None
     with pytest.raises(NotImplementedError):
-        mi.get_ovlp(mol)
+        mi.get_hcore(mol)  # would miss the ECP
     mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", nucmod="G", verbose=0)
     assert "point nuclei" in mi.unsupported_reason(mol)
     assert mi.unsupported_reason(mol, two_electron=True) is None
@@ -148,8 +149,16 @@ def test_two_electron_integrals_with_ecp():
     assert abs(mi.int2e_s8(mol, 0.0) - mol.intor("int2e", aosym="s8")).max() < 1e-12
     auxmol = df.addons.make_auxmol(mol, "def2-universal-jkfit")
     assert abs(mi.int3c2e(mol, auxmol) - df.incore.aux_e2(mol, auxmol, "int3c2e", aosym="s2ij").T).max() < 1e-12
+    # the Gaussian one-electron integrals (ECP atoms are point charges Z - core) match libcint;
+    # the core Hamiltonian would miss the ECP and is refused
+    s, t, v = mi.int1e(mol)
+    assert abs(s - mol.intor("int1e_ovlp")).max() < 1e-13
+    assert abs(t - mol.intor("int1e_kin")).max() < 1e-12
+    assert abs(v - mol.intor("int1e_nuc")).max() < 1e-11
+    s1, t1, v1 = mi.int1e_ip(mol)
+    assert abs(v1 - mol.intor("int1e_ipnuc")).max() < 1e-10
     with pytest.raises(NotImplementedError):
-        mi.int1e(mol)
+        mi.get_hcore(mol)
     # attach keeps pyscf's hcore (with the ECP) and takes the ERIs from the engine
     e_ref = scf.RHF(mol).run(conv_tol=1e-11).e_tot
     mf = mi.attach(mojoscf.RHF(mol))

@@ -89,35 +89,40 @@ def set_engine(name: str) -> None:
     _ENGINE = name
 
 
-def available(mol, two_electron: bool = False) -> bool:
+def available(mol, two_electron: bool = False, allow_ecp: bool = False) -> bool:
     """True when the Mojo engine is enabled and supports ``mol`` (see :func:`unsupported_reason`)."""
-    return _ENGINE == "mojo" and unsupported_reason(mol, two_electron) is None
+    return _ENGINE == "mojo" and unsupported_reason(mol, two_electron, allow_ecp) is None
 
 
-def unsupported_reason(mol, two_electron: bool = False) -> str | None:
+def unsupported_reason(mol, two_electron: bool = False, allow_ecp: bool = False) -> str | None:
     """Why the Mojo engine cannot handle ``mol`` (None if it can).
 
     With ``two_electron`` only the two-electron integrals are considered
     (four-index, three- and two-centre Coulomb integrals and their
     derivatives): effective core potentials and the nuclear charge model
     enter the one-electron Hamiltonian only, so molecules with ECPs or finite
-    nuclei can still use the engine for those.
+    nuclei can still use the engine for those.  ``allow_ecp`` accepts ECPs
+    for the one-electron integrals too: overlap, kinetic and point-charge
+    nuclear attraction (``int1e``, ``int1e_ip``, ...) are the same Gaussian
+    integrals as ``mol.intor`` returns, the ECP terms being separate
+    (``ECPscalar*``) integrals.
     """
     if mol.nbas == 0:
         return "the molecule has no basis functions"
-    if not two_electron and mol.has_ecp():
+    if not two_electron and not allow_ecp and mol.has_ecp():
         return "effective core potentials are not supported"
     if int(mol._bas[:, gto.ANG_OF].max()) > LMAX:
         return f"angular momentum above l = {LMAX}"
-    if not two_electron and (mol._atm[:, gto.NUC_MOD_OF] != NUC_POINT).any():
+    # pyscf marks atoms carrying an ECP with NUC_ECP; they are point charges (Z - core electrons)
+    if not two_electron and (~np.isin(mol._atm[:, gto.NUC_MOD_OF], (NUC_POINT, gto.NUC_ECP))).any():
         return "only point nuclei are supported"
     if getattr(mol, "omega", 0.0):
         return "range-separated Coulomb operator (mol.omega) is not supported"
     return None
 
 
-def _check(mol, two_electron: bool = False):
-    reason = unsupported_reason(mol, two_electron)
+def _check(mol, two_electron: bool = False, allow_ecp: bool = False):
+    reason = unsupported_reason(mol, two_electron, allow_ecp)
     if reason is not None:
         raise NotImplementedError(f"mojoscf.integrals: {reason}")
 
@@ -162,7 +167,7 @@ def basis_tables(mol):
 
 def int1e(mol):
     """``(S, T, V)``: overlap, kinetic energy and nuclear attraction matrices."""
-    _check(mol)
+    _check(mol, allow_ecp=True)
     tables = basis_tables(mol)
     nao = mol.nao_nr()
     s = np.empty((nao, nao))
@@ -186,6 +191,7 @@ def get_nuc(mol):
 
 def get_hcore(mol):
     """``T + V`` (the core Hamiltonian of a molecule without ECPs)."""
+    _check(mol)
     _, t, v = int1e(mol)
     return t + v
 
@@ -237,9 +243,13 @@ def cholesky_eri(mol, auxbasis="weigend+etb", auxmol=None, lindep=1e-12):
     Mirrors ``pyscf.df.incore.cholesky_eri`` (Cholesky factorisation of
     ``(P|Q)``, falling back to an eigen-decomposition with ``lindep`` when the
     metric is not positive definite); the factorisation and triangular solve
-    are LAPACK calls through SciPy, as in pyscf.
+    are LAPACK/BLAS calls through SciPy, as in pyscf.  The solve runs in place
+    on the transposed (Fortran-ordered) view of the C-ordered integrals
+    (``dtrsm`` from the right with L^T), so the result is C-ordered, as the
+    J/K kernels need, without any copy of the (naux, npair) tensor.
     """
     import scipy.linalg
+    from scipy.linalg import blas as sblas
 
     if auxmol is None:
         auxmol = df_addons.make_auxmol(mol, auxbasis)
@@ -247,7 +257,9 @@ def cholesky_eri(mol, auxbasis="weigend+etb", auxmol=None, lindep=1e-12):
     j3c = int3c2e(mol, auxmol)
     try:
         low = scipy.linalg.cholesky(j2c, lower=True)
-        return scipy.linalg.solve_triangular(low, j3c, lower=True, overwrite_b=True, check_finite=False)
+        # X L^T = j3c^T  <=>  X^T = L^-1 j3c
+        out = sblas.dtrsm(1.0, low, j3c.T, side=1, lower=1, trans_a=1, overwrite_b=1)
+        return out.T
     except scipy.linalg.LinAlgError:
         w, v = scipy.linalg.eigh(j2c)
         keep = w > lindep
@@ -330,7 +342,7 @@ def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13):
 
 
 def _int1e_ip(mol, centers, charges, want_st):
-    _check(mol)
+    _check(mol, allow_ecp=True)
     tables = basis_tables(mol)
     nao = mol.nao_nr()
     s = np.zeros((3, nao, nao))
@@ -360,7 +372,7 @@ def int1e_iprinv_dm(mol, dm, centers=None):
     Equals ``einsum('xij,ij->x', int1e_iprinv(mol, origin=R_c), dm)`` for each
     centre, evaluated in one pass instead of one integral matrix per centre.
     """
-    _check(mol)
+    _check(mol, allow_ecp=True)
     if centers is None:
         centers = mol.atom_coords()
     centers = np.ascontiguousarray(centers, dtype=np.float64).reshape(-1, 3)

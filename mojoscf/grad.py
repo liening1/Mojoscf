@@ -21,8 +21,8 @@ the integral work done by ``mojoscf.integrals``; ``DFGradients`` and
   the matrices); the DF classes keep pyscf's DF ``get_jk``.
 
 Results agree with ``pyscf.grad`` / ``pyscf.df.grad`` to the precision of the
-integrals.  With effective core potentials, X2C or finite nuclei the
-one-electron pieces come from pyscf (they carry those terms) and the
+integrals.  With effective core potentials only the ECP derivative integrals
+come from pyscf; with X2C or finite nuclei all one-electron pieces do, the
 two-electron part still from the engine.  Range-separated operators,
 ``only_dfj``, ``auxbasis_response = False`` and subclasses that override
 ``get_veff`` or ``get_jk`` use pyscf's own implementation.
@@ -48,6 +48,13 @@ __all__ = ["Gradients", "UGradients", "DFGradients", "DFUGradients", "grad_tol"]
 grad_tol = 1e-14
 
 
+def _ecp_atoms(mol):
+    """Indices of the atoms that carry an effective core potential."""
+    from pyscf import gto
+
+    return set(mol._ecpbas[:, gto.ATOM_OF].tolist()) if mol.has_ecp() else set()
+
+
 class _MojoGrad1eMixin:
     """One-electron derivative integrals from the Mojo engine and the assembly of ``grad_elec``.
 
@@ -58,10 +65,14 @@ class _MojoGrad1eMixin:
     _unrestricted = False
 
     def _mojo_ok(self, mol=None, omega=None):
-        """The one-electron pieces can come from the Mojo engine (no ECP, X2C, finite nuclei)."""
+        """The one-electron pieces can come from the Mojo engine (no X2C or finite nuclei).
+
+        With effective core potentials the ECP derivative integrals
+        (``ECPscalar_ipnuc``, ``ECPscalar_iprinv``) are added from pyscf.
+        """
         mol = self.mol if mol is None else mol
         return (
-            integrals.available(mol)
+            integrals.available(mol, allow_ecp=True)
             and not getattr(mol, "_pseudo", None)
             and getattr(self.base, "with_x2c", None) is None
             and not omega
@@ -99,7 +110,10 @@ class _MojoGrad1eMixin:
         if not self._mojo_ok(mol):
             return super().get_hcore(mol)
         _, t, v = self._ip_ints(mol)
-        return -(t + v)
+        h = t + v
+        if mol.has_ecp():
+            h = h + mol.intor("ECPscalar_ipnuc", comp=3)
+        return -h
 
     def get_ovlp(self, mol=None):
         mol = self.mol if mol is None else mol
@@ -114,10 +128,14 @@ class _MojoGrad1eMixin:
         charges = -mol.atom_charges().astype(np.float64)
         aoslices = mol.aoslice_by_atom()
         h1 = self.get_hcore(mol)
+        ecp_atoms = _ecp_atoms(mol)
 
         def hcore_deriv(atm_id):
             p0, p1 = aoslices[atm_id, 2:]
             vrinv = integrals.int1e_iprinv(mol, atm_id) * charges[atm_id]
+            if atm_id in ecp_atoms:
+                with mol.with_rinv_at_nucleus(atm_id):
+                    vrinv += mol.intor("ECPscalar_iprinv", comp=3)
             vrinv[:, p0:p1] += h1[:, p0:p1]
             return vrinv + vrinv.transpose(0, 2, 1)
 
@@ -161,6 +179,7 @@ class _MojoGrad1eMixin:
             h1 = self.get_hcore(mol)
             rinv = integrals.int1e_iprinv_dm(mol, dm0_sf)
             charges = mol.atom_charges()
+            ecp_atoms = _ecp_atoms(mol)
 
         t0 = (logger.process_clock(), logger.perf_counter())
         log.debug("Computing Gradients of the Coulomb repulsion (Mojo)")
@@ -175,6 +194,9 @@ class _MojoGrad1eMixin:
             p0, p1 = aoslices[ia, 2:]
             if fast_h1:
                 de[k] += 2 * (np.einsum("xij,ij->x", h1[:, p0:p1], dm0_sf[p0:p1]) - charges[ia] * rinv[ia])
+                if ia in ecp_atoms:
+                    with mol.with_rinv_at_nucleus(ia):
+                        de[k] += 2 * np.einsum("xij,ij->x", mol.intor("ECPscalar_iprinv", comp=3), dm0_sf)
             else:
                 de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm0_sf)
             de[k] += de2[ia]

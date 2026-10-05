@@ -127,12 +127,14 @@ def test_accelerated_objects_and_fallbacks():
         assert type(g) is mojoscf.grad.DFGradients and g._direct_2e()
         assert abs(g.kernel() - ref).max() < 1e-8
     assert type(mojoscf.RHF(mol).density_fit().undo_df().nuc_grad_method()) is mojoscf.grad.Gradients
-    # with an ECP the one-electron pieces (which carry the ECP terms) come from pyscf,
-    # the two-electron part from the Mojo engine
+    # with an ECP only the ECP derivative integrals come from pyscf
     mol = gto.M(atom="Cu 0 0 0; H 0 0 1.5", basis={"Cu": "lanl2dz", "H": "sto-3g"}, ecp={"Cu": "lanl2dz"}, verbose=0)
     mf = scf.RHF(mol).run(conv_tol=1e-12)
     g = mojoscf.grad.Gradients(mf)
-    assert not g._mojo_ok() and g._mojo_2e_ok() and g._direct_2e()
+    assert g._mojo_ok() and g._mojo_2e_ok() and g._direct_2e()
+    ref = mf.nuc_grad_method()
+    assert abs(g.get_hcore() - ref.get_hcore()).max() < 1e-11
+    assert abs(g.hcore_generator()(0) - ref.hcore_generator()(0)).max() < 1e-11
     assert abs(g.kernel() - mf.nuc_grad_method().kernel()).max() < 1e-11
     # range separation is not supported at all: pyscf's code throughout
     mol = _mol("sto-3g")
