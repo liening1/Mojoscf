@@ -115,13 +115,18 @@ def test_accelerated_objects_and_fallbacks():
     mol = _mol("cc-pvdz")
     mf = mojoscf.accelerate(scf.RHF(mol))
     assert type(mf.nuc_grad_method()) is mojoscf.grad.Gradients
-    # density fitting keeps pyscf's DF gradients, whichever way the object was made
-    for mf in (mojoscf.RHF(mol).density_fit(), mojoscf.accelerate(scf.RHF(mol).density_fit())):
+    # density fitting: the DF gradient classes, whichever way the object was made
+    ref = scf.RHF(mol).density_fit().run(conv_tol=1e-12).nuc_grad_method().kernel()
+    for mf in (
+        mojoscf.RHF(mol).density_fit(),
+        mojoscf.accelerate(scf.RHF(mol).density_fit()),
+        mojoscf.accelerate(scf.RHF(mol)).density_fit(),
+    ):
         mf.run(conv_tol=1e-12)
         g = mf.nuc_grad_method()
-        assert not isinstance(g, mojoscf.grad.Gradients)
-        ref = scf.RHF(mol).density_fit().run(conv_tol=1e-12).nuc_grad_method().kernel()
+        assert type(g) is mojoscf.grad.DFGradients and g._direct_2e()
         assert abs(g.kernel() - ref).max() < 1e-8
+    assert type(mojoscf.RHF(mol).density_fit().undo_df().nuc_grad_method()) is mojoscf.grad.Gradients
     # an engine-unsupported molecule (ECP) runs pyscf's code inside the Mojo classes
     mol = gto.M(atom="Cu 0 0 0; H 0 0 1.5", basis={"Cu": "lanl2dz", "H": "sto-3g"}, ecp={"Cu": "lanl2dz"}, verbose=0)
     mf = scf.RHF(mol).run(conv_tol=1e-12)
@@ -158,6 +163,91 @@ def test_gradient_scanner_follows_geometry():
     mf.conv_tol = 1e-12
     scanner = mf.nuc_grad_method().as_scanner()
     ref = scf.RHF(mol)
+    ref.conv_tol = 1e-12
+    ref_scanner = ref.nuc_grad_method().as_scanner()
+    for geom in (mol, _mol("cc-pvdz", atom=H2O_DISTORTED), mol):
+        e, g = scanner(geom)
+        e0, g0 = ref_scanner(geom)
+        assert abs(e - e0) < 1e-9
+        assert abs(g - g0).max() < 1e-8
+
+
+def _pyscf_df_grad2e(g, mol, dm, unrestricted):
+    vhf = g.get_veff(mol, dm)
+    de = np.zeros((mol.natm, 3))
+    for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:, 2:]):
+        if unrestricted:
+            de[ia] = 2 * np.einsum("sxij,sij->x", vhf[:, :, p0:p1], dm[:, p0:p1])
+        else:
+            de[ia] = 2 * np.einsum("xij,ij->x", vhf[:, p0:p1], dm[p0:p1])
+    return de + vhf.aux
+
+
+def test_density_fitted_two_electron_term():
+    """grad2e_df against pyscf's DF J/K gradient plus its auxiliary-basis response."""
+    mol = _mol("def2-svp", atom="C 0 0 0; O 0 0 1.13; H 0.9 0.3 -0.5", spin=1)
+    mf = scf.UHF(mol).density_fit().run(conv_tol=1e-11)
+    dm = mf.make_rdm1()
+    orbs = [mf.mo_coeff[s][:, mf.mo_occ[s] > 0] for s in range(2)]
+    occs = [mf.mo_occ[s][mf.mo_occ[s] > 0] for s in range(2)]
+    ref = _pyscf_df_grad2e(mf.nuc_grad_method(), mol, dm, True)
+    de = mi.grad2e_df(mol, mf.with_df.auxmol, dm[0] + dm[1], orbs, occs, 1.0, 1.0)
+    assert abs(de - ref).max() < 1e-11
+    assert abs(de.sum(axis=0)).max() < 1e-11  # translational invariance
+    # many small auxiliary blocks give the same result
+    small = mi.grad2e_df(mol, mf.with_df.auxmol, dm[0] + dm[1], orbs, occs, 1.0, 1.0, max_memory=0.02)
+    assert abs(small - de).max() < 1e-12
+    mol = _mol("aug-cc-pvtz")
+    mf = scf.RHF(mol).density_fit().run(conv_tol=1e-11)
+    dm = mf.make_rdm1()
+    occ = mf.mo_occ > 0
+    ref = _pyscf_df_grad2e(mf.nuc_grad_method(), mol, dm, False)
+    de = mi.grad2e_df(mol, mf.with_df.auxmol, dm, [mf.mo_coeff[:, occ]], [mf.mo_occ[occ]], 1.0, 0.5)
+    assert abs(de - ref).max() < 1e-11
+
+
+@pytest.mark.parametrize("basis", ["cc-pvdz", "def2-tzvp"])
+def test_df_rhf_gradient_matches_pyscf(basis):
+    mol = _mol(basis, atom=H2O_DISTORTED)
+    mf = scf.RHF(mol).density_fit().run(conv_tol=1e-12)
+    ref = mf.nuc_grad_method().kernel()
+    g = mojoscf.grad.DFGradients(mf)
+    assert g._direct_2e()
+    assert abs(g.kernel() - ref).max() < 1e-11
+    assert abs(mojoscf.RHF(mol).density_fit().run(conv_tol=1e-12).nuc_grad_method().kernel() - ref).max() < 1e-8
+
+
+def test_df_uhf_gradient_matches_pyscf():
+    mol = _mol({"Ne": "cc-pvqz", "H": "cc-pvdz"}, atom="Ne 0 0 0; H 0 0 1.9", spin=1)
+    mf = scf.UHF(mol).density_fit().run(conv_tol=1e-12)
+    ref = mf.nuc_grad_method().kernel()
+    assert abs(mojoscf.grad.DFUGradients(mf).kernel() - ref).max() < 1e-11
+    g = mojoscf.UHF(mol).density_fit().run(conv_tol=1e-12).nuc_grad_method()
+    assert type(g) is mojoscf.grad.DFUGradients
+    assert abs(g.kernel() - ref).max() < 1e-8
+
+
+def test_df_gradient_options_use_pyscf():
+    """auxbasis_response = False and only_dfj keep pyscf's two-electron code (with Mojo 1e integrals)."""
+    mol = _mol("cc-pvdz", atom=H2O_DISTORTED)
+    mf = scf.RHF(mol).density_fit().run(conv_tol=1e-12)
+    g, g0 = mojoscf.grad.DFGradients(mf), mf.nuc_grad_method()
+    g.auxbasis_response = g0.auxbasis_response = False
+    assert not g._direct_2e()
+    assert abs(g.kernel() - g0.kernel()).max() < 1e-11
+    mf = mojoscf.RHF(mol).density_fit(only_dfj=True).run(conv_tol=1e-12)
+    ref = scf.RHF(mol).density_fit(only_dfj=True).run(conv_tol=1e-12).nuc_grad_method().kernel()
+    g = mf.nuc_grad_method()
+    assert not g._direct_2e()
+    assert abs(g.kernel() - ref).max() < 1e-8
+
+
+def test_df_gradient_scanner_follows_geometry():
+    mol = _mol("cc-pvdz")
+    mf = mojoscf.RHF(mol).density_fit()
+    mf.conv_tol = 1e-12
+    scanner = mf.nuc_grad_method().as_scanner()
+    ref = scf.RHF(mol).density_fit()
     ref.conv_tol = 1e-12
     ref_scanner = ref.nuc_grad_method().as_scanner()
     for geom in (mol, _mol("cc-pvdz", atom=H2O_DISTORTED), mol):

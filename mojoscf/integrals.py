@@ -48,6 +48,11 @@ __all__ = [
     "build_df",
     "get_jk",
     "unsupported_reason",
+    "int1e_ip",
+    "int1e_iprinv",
+    "get_jk_ip1",
+    "grad2e",
+    "grad2e_df",
 ]
 
 LMAX = 8
@@ -371,3 +376,102 @@ def grad2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14):
     de = np.zeros((mol.natm, 3))
     get_extension().grad2e(basis_tables(mol), _boys_table(), dmj, dmk, float(j_factor), float(k_factor), float(tol), de)
     return de
+
+
+def _syrk_full(a_t):
+    """``A^T A`` for the Fortran-ordered (k, n) array ``a_t`` (BLAS ``dsyrk``, both triangles returned)."""
+    from scipy.linalg import blas as sblas
+
+    c = sblas.dsyrk(1.0, a_t, trans=1, lower=0)
+    return np.triu(c) + np.triu(c, 1).T
+
+
+def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_memory=4000, tol=1e-14):
+    """Two-electron part of the nuclear gradient with density fitting, shape (natm, 3).
+
+    The derivative, at fixed densities, of the density-fitted energy
+    ``E2 = j_factor/2 rho^T V^-1 rho - k_factor/2 sum_s sum_ij n_i n_j (ij|P) V^-1_PQ (Q|ij)``
+    (``rho_P = (P|mu nu) Dj_mu nu``, V the Coulomb metric of ``auxmol``,
+    orbitals ``orbs[s]`` with occupations ``occs[s]``), including the
+    response of the auxiliary basis, as pyscf's ``df.grad`` gradients with
+    ``auxbasis_response=True``.  RHF: ``dm_j = D``, ``orbs = [C_occ]``,
+    ``occs = [2...]``, ``k_factor = 1/2``; UHF: ``dm_j = Da + Db``,
+    ``orbs = [Ca_occ, Cb_occ]``, ``occs = [1...]``, ``k_factor = 1``.
+
+    With c = V^-1 rho and X_s = V^-1 (P|ij)_s,
+
+        dE2 = sum_{P, mu nu} d(mu nu|P) Gamma_P,mu nu - 1/2 sum_PQ d(P|Q) W_PQ
+        Gamma_P = j_factor c_P Dj - k_factor sum_s (C n) X_s,P (C n)^T
+        W = j_factor c c^T - k_factor sum_s sum_ij n_i n_j X_s,P,ij X_s,Q,ij
+
+    The three-centre integrals and their derivatives are evaluated in Mojo,
+    in blocks of auxiliary functions sized by ``max_memory`` (MB), and
+    contracted as they are produced (the transforms with the orbitals use the
+    sequential BLAS in the worker threads); the metric solves and W are
+    SciPy/NumPy BLAS calls.  The metric is factorised as in pyscf's gradient
+    code (Cholesky, eigen-decomposition fallback).
+    """
+    from pyscf.df.grad.rhf import _gen_metric_solver
+
+    from ._backend import blas_config
+
+    _check(mol)
+    _check(auxmol)
+    ext = get_extension()
+    table = _boys_table()
+    tables = basis_tables(mol)
+    aux_tables = basis_tables(auxmol)
+    (seq_path, seq_prefix), _ = blas_config()
+    nao = mol.nao_nr()
+    naux = auxmol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    dm_j = np.asarray(dm_j, dtype=np.float64).reshape(nao, nao)
+    dm_tril = lib.pack_tril(dm_j + dm_j.T)
+    diag = np.arange(nao)
+    dm_tril[diag * (diag + 1) // 2 + diag] *= 0.5
+    dpack = np.ascontiguousarray(lib.pack_tril(dm_j))
+    nset = len(orbs)
+    occs = [np.asarray(n, dtype=np.float64).reshape(-1) for n in occs]
+    m = max((len(n) for n in occs), default=0)
+    # orbital sets padded with zero columns to a common width m
+    c = np.zeros((max(nset, 1), nao, m))
+    nn = np.zeros((max(nset, 1), m))
+    for st, (orb, n) in enumerate(zip(orbs, occs)):
+        c[st, :, : len(n)] = np.asarray(orb, dtype=np.float64).reshape(nao, len(n))
+        nn[st, : len(n)] = n
+    cn = np.ascontiguousarray(c * nn[:, None, :])
+    blk = int(max_memory * 1e6 / 8 / 2 / npair)
+    blk = max(1, min(blk, naux))
+
+    rhoj = np.empty(naux)
+    q = np.zeros((max(nset, 1), naux, m, m))
+    ext.df_grad_rhs(tables, aux_tables, table, dm_tril, c, blk, rhoj, q, seq_path, seq_prefix)
+
+    # X = V^-1 (P|ij) and W on the packed ij >= columns (X, Q are symmetric in ij):
+    # sum_ij n_i n_j X_Pij X_Qij = sum_{i>=j} w_ij X_Pij X_Qij, w_ij = n_i n_j (2 for i > j)
+    solve = _gen_metric_solver(int2c2e(auxmol))
+    coef = solve(rhoj)
+    xs = np.empty_like(q)
+    w = j_factor * np.outer(coef, coef)
+    tri = np.tril_indices(m)
+    for st in range(nset):
+        xp = solve(np.ascontiguousarray(q[st][:, tri[0], tri[1]]))
+        xs[st] = lib.unpack_tril(xp)
+        wij = np.outer(nn[st], nn[st])[tri] * np.where(tri[0] == tri[1], 1.0, 2.0)
+        if np.all(wij >= 0):
+            xw = np.asfortranarray((xp * np.sqrt(wij)).T)
+            w -= k_factor * _syrk_full(xw)
+        else:
+            w -= k_factor * lib.dot(xp * wij, xp.T)
+        xp = xw = None
+    q = None
+
+    de = np.zeros((auxmol.natm, 3))
+    ext.grad2c(aux_tables, table, np.ascontiguousarray(w), de)
+    w = None
+    d3 = np.zeros((mol.natm, 3))
+    ext.grad_df3c(
+        tables, aux_tables, table, np.ascontiguousarray(coef), dpack, float(j_factor), float(k_factor),
+        xs, cn, blk, float(tol), d3, seq_path, seq_prefix,
+    )
+    return de + d3

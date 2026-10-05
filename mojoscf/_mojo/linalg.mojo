@@ -511,6 +511,32 @@ struct Blas(Movable):
         var f = self.handle.value().get_function[NoneType](self.prefix + "dsyrk_")
         f(anyptr(uplo), anyptr(trans), anyptr(nn), anyptr(kk), anyptr(al), a, anyptr(nn), anyptr(be), c, anyptr(nn))
 
+    def syr2k_lower(self, n: Int, k: Int, alpha: Float64, a: F64Ptr, b: F64Ptr, beta: Float64, c: F64Ptr) raises:
+        """Symmetric rank-2k update C (n x n) = alpha (A B^T + B A^T) + beta C, A and B (n x k) row-major.
+
+        Only the row-major *lower* triangle (i >= j) of C is guaranteed to be
+        written (half the work of the two GEMMs).
+        """
+        if n == 0:
+            return
+        if not self.handle:
+            gemm_native(False, True, n, n, k, alpha, a, b, beta, c)
+            gemm_native(False, True, n, n, k, alpha, b, a, 1.0, c)
+            return
+        # Column-major view: the buffers are A^T, B^T (k x n), so C = A'^T B' + B'^T A'
+        # with trans = 'T'; the column-major upper triangle is the row-major lower one.
+        var uplo = c_char(ord("U"))
+        var trans = c_char(ord("T"))
+        var nn = c_int(n)
+        var kk = c_int(k)
+        var al = alpha
+        var be = beta
+        var f = self.handle.value().get_function[NoneType](self.prefix + "dsyr2k_")
+        f(
+            anyptr(uplo), anyptr(trans), anyptr(nn), anyptr(kk), anyptr(al), a, anyptr(kk), b, anyptr(kk),
+            anyptr(be), c, anyptr(nn),
+        )
+
     def eigh(self, n: Int, h: F64Ptr, w: F64Ptr, c: F64Ptr) raises:
         """Standard symmetric eigenproblem H C = C diag(w); H is preserved.
 

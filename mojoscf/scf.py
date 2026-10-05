@@ -347,16 +347,44 @@ def _fallback_reason(mf):
     return None
 
 
-def _plain_grad_method(mf, mixin, default) -> bool:
-    """True if the ``nuc_grad_method`` ``mf`` inherits past ``mixin`` is pyscf's plain one.
+def _mojo_grad_method(mf, after):
+    """``nuc_grad_method`` for ``mf``, called from class ``after`` of its MRO.
 
-    Decorations that bring their own gradients (density fitting, ...) keep them.
+    The implementation ``mf`` would inherit past ``after`` decides: pyscf's
+    plain RHF/UHF one gives ``mojoscf.grad.Gradients``/``UGradients``, the
+    density-fitting one (``_DFHF``) ``DFGradients``/``DFUGradients``; any
+    other decoration (solvent, ...) keeps its own gradients.
     """
+    from pyscf.df import df_jk
+
+    from . import grad
+
     mro = type(mf).__mro__
-    for cls in mro[mro.index(mixin) + 1:]:
+    nxt = None
+    for cls in mro[mro.index(after) + 1:]:
         if "nuc_grad_method" in cls.__dict__:
-            return cls.__dict__["nuc_grad_method"] is default
-    return False
+            nxt = cls.__dict__["nuc_grad_method"]
+            break
+    uhf = isinstance(mf, pyscf_uhf.UHF)
+    if nxt is (pyscf_uhf.UHF if uhf else pyscf_hf.RHF).nuc_grad_method:
+        return (grad.UGradients if uhf else grad.Gradients)(mf)
+    if nxt is df_jk._DFHF.nuc_grad_method and not mf.istype("_Solvation"):
+        return (grad.DFUGradients if uhf else grad.DFGradients)(mf)
+    return nxt(mf)
+
+
+class _MojoDFHook:
+    """Placed in front of pyscf's ``_DFHF`` by ``density_fit()`` of the Mojo classes.
+
+    ``_DFHF.nuc_grad_method`` comes first in the MRO of a density-fitted object
+    and does not call ``super()``; this class routes it to the Mojo gradients.
+    """
+
+    __name_mixin__ = "Mojo"
+
+    def nuc_grad_method(self):
+        """Density-fitted nuclear gradients with Mojo derivative integrals (:mod:`mojoscf.grad`)."""
+        return _mojo_grad_method(self, _MojoDFHook)
 
 
 class _MojoGlueMixin:
@@ -385,6 +413,12 @@ class _MojoGlueMixin:
         return self.e_tot
 
     scf = kernel
+
+    def density_fit(self, auxbasis=None, with_df=None, only_dfj=False):
+        mf = super().density_fit(auxbasis, with_df, only_dfj)
+        if not isinstance(mf, _MojoDFHook):
+            lib.set_class(mf, (_MojoDFHook, type(mf)))
+        return mf
 
     def _eigh(self, h, s, overwrite=False, x=None):
         if not _is_real(h, s, x):
@@ -463,12 +497,8 @@ class _MojoRHFMixin(_MojoGlueMixin):
         return kernels.get_grad(mo_coeff, mo_occ, fock)
 
     def nuc_grad_method(self):
-        """Nuclear gradients with Mojo derivative integrals (:class:`mojoscf.grad.Gradients`)."""
-        if not _plain_grad_method(self, _MojoRHFMixin, pyscf_hf.RHF.nuc_grad_method):
-            return super().nuc_grad_method()
-        from .grad import Gradients
-
-        return Gradients(self)
+        """Nuclear gradients with Mojo derivative integrals (:mod:`mojoscf.grad`)."""
+        return _mojo_grad_method(self, _MojoRHFMixin)
 
 
 class _MojoUHFMixin(_MojoGlueMixin):
@@ -526,12 +556,8 @@ class _MojoUHFMixin(_MojoGlueMixin):
         return np.hstack((ga, gb))
 
     def nuc_grad_method(self):
-        """Nuclear gradients with Mojo derivative integrals (:class:`mojoscf.grad.UGradients`)."""
-        if not _plain_grad_method(self, _MojoUHFMixin, pyscf_uhf.UHF.nuc_grad_method):
-            return super().nuc_grad_method()
-        from .grad import UGradients
-
-        return UGradients(self)
+        """Nuclear gradients with Mojo derivative integrals (:mod:`mojoscf.grad`)."""
+        return _mojo_grad_method(self, _MojoUHFMixin)
 
 
 class RHF(_MojoRHFMixin, pyscf_hf.RHF):

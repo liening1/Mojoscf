@@ -1879,8 +1879,11 @@ def aux_table(aux: Basis, ht: HermTable) -> PairTable:
 comptime PAIR_BLOCK = 8192
 
 
-def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr):
+def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0: Int = 0, pshell1: Int = -1):
     """(ab|P) into ``dst[P * npair + pair(a, b)]`` (naux x npair, pyscf's cderi layout before the Cholesky step).
+
+    With a shell range [pshell0, pshell1) only those auxiliary shells are
+    computed, into rows counted from the first function of ``pshell0``.
 
     A task is one bra shell a with all partners b <= a: its AO pairs
     (i in a, j <= i) form the contiguous column block
@@ -1895,6 +1898,9 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr):
     var npair_ao = nao * (nao + 1) // 2
     var ht = HermTable(max(2 * basis.lmax, aux.lmax))
     var atab = aux_table(aux, ht)
+    var ps0 = pshell0
+    var ps1 = aux.nbas if pshell1 < 0 else pshell1
+    var plo = aux.ao_loc[ps0]
     var npfmax = 1
     for pshell in range(aux.nbas):
         npfmax = max(npfmax, aux.ao_loc[pshell + 1] - aux.ao_loc[pshell])
@@ -1924,7 +1930,7 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr):
         var nworkers = min(parallelism_level(), ntask)
         counter.store(0)
 
-        def work(w: Int) {imm basis, imm aux, imm boys, imm tab, imm atab, imm ht, imm dst, imm npair_ao, imm pcount, imm ntask, imm s0, imm s1, imm npfmax, imm wmax}:
+        def work(w: Int) {imm basis, imm aux, imm boys, imm tab, imm atab, imm ht, imm dst, imm npair_ao, imm pcount, imm ntask, imm s0, imm s1, imm npfmax, imm wmax, imm ps0, imm ps1, imm plo}:
             var ws = EriWork(tab.maxcomp, tab.maxlab, atab.maxcomp, atab.maxlab)
             var buf = List[Float64](length=npfmax * wmax, fill=0.0)
             var pbuf = list_ptr(buf)
@@ -1940,9 +1946,9 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr):
                 var wdt = (i1 * (i1 + 1)) // 2 - c0
                 # local pair index of (a, 0): pairs of shells s0 .. a-1 come first
                 var pbase = (a * (a + 1) - s0 * (s0 + 1)) // 2
-                for pshell in range(aux.nbas):
-                    var p0 = aux.ao_loc[pshell]
-                    var npf = aux.ao_loc[pshell + 1] - p0
+                for pshell in range(ps0, ps1):
+                    var p0 = aux.ao_loc[pshell] - plo
+                    var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
                     vfill(pbuf, npf * wdt, 0.0)
                     for b in range(a + 1):
                         if not eri_quartet(tab, pbase + b, atab, pshell, ht, boys, ws):
