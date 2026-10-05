@@ -127,12 +127,40 @@ def test_accelerated_objects_and_fallbacks():
         assert type(g) is mojoscf.grad.DFGradients and g._direct_2e()
         assert abs(g.kernel() - ref).max() < 1e-8
     assert type(mojoscf.RHF(mol).density_fit().undo_df().nuc_grad_method()) is mojoscf.grad.Gradients
-    # an engine-unsupported molecule (ECP) runs pyscf's code inside the Mojo classes
+    # with an ECP the one-electron pieces (which carry the ECP terms) come from pyscf,
+    # the two-electron part from the Mojo engine
     mol = gto.M(atom="Cu 0 0 0; H 0 0 1.5", basis={"Cu": "lanl2dz", "H": "sto-3g"}, ecp={"Cu": "lanl2dz"}, verbose=0)
     mf = scf.RHF(mol).run(conv_tol=1e-12)
     g = mojoscf.grad.Gradients(mf)
-    assert not g._mojo_ok()
+    assert not g._mojo_ok() and g._mojo_2e_ok() and g._direct_2e()
     assert abs(g.kernel() - mf.nuc_grad_method().kernel()).max() < 1e-11
+    # range separation is not supported at all: pyscf's code throughout
+    mol = _mol("sto-3g")
+    mol.omega = 0.3
+    mf = scf.RHF(mol).run(conv_tol=1e-12)
+    g = mojoscf.grad.Gradients(mf)
+    assert not g._mojo_ok() and not g._mojo_2e_ok()
+    assert abs(g.kernel() - mf.nuc_grad_method().kernel()).max() < 1e-11
+
+
+def test_ecp_gradients_match_pyscf():
+    """Pt and Ag with def2 ECPs: exact and DF, RHF and UHF, on the same SCF objects."""
+    mol = gto.M(
+        atom="Pt 0 0 0; N 2.05 0 0; Cl 0 2.32 0; H 2.4 0.95 0; H 2.4 -0.48 0.83; H 2.4 -0.48 -0.83",
+        basis="def2-svp", ecp={"Pt": "def2-svp"}, charge=1, verbose=0,
+    )
+    mf = scf.RHF(mol).run(conv_tol=1e-12)
+    assert abs(mojoscf.grad.Gradients(mf).kernel() - mf.nuc_grad_method().kernel()).max() < 1e-10
+    mf = scf.RHF(mol).density_fit().run(conv_tol=1e-12)
+    g = mojoscf.grad.DFGradients(mf)
+    assert g._direct_2e()
+    assert abs(g.kernel() - mf.nuc_grad_method().kernel()).max() < 1e-10
+    mol = gto.M(atom="Ag 0 0 0; H 0 0 1.62", basis="def2-svp", ecp={"Ag": "def2-svp"}, charge=1, spin=1, verbose=0)
+    mf = scf.UHF(mol).run(conv_tol=1e-12)
+    assert mf.converged
+    assert abs(mojoscf.grad.UGradients(mf).kernel() - mf.nuc_grad_method().kernel()).max() < 1e-10
+    mf = scf.UHF(mol).density_fit().run(conv_tol=1e-12)
+    assert abs(mojoscf.grad.DFUGradients(mf).kernel() - mf.nuc_grad_method().kernel()).max() < 1e-10
 
 
 def test_gradient_get_jk_general_densities():

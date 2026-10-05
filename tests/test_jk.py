@@ -276,3 +276,30 @@ def test_restart_uses_initial_orbitals(h2o_dz):
     e0 = mf.e_tot
     mf.kernel()  # dm0 carries mo_coeff/mo_occ: first K build from orbitals
     assert mf.converged and abs(mf.e_tot - e0) < 1e-10 and mf.cycles <= 2
+
+
+@pytest.mark.parametrize("path", ["df", "incore", "direct"])
+@pytest.mark.parametrize("kind", ["rhf", "uhf"])
+def test_scf_native_with_ecp(path, kind):
+    """Molecules with ECPs use the native J/K with Mojo two-electron integrals in every mode."""
+    if kind == "rhf":
+        mol = gto.M(atom="Ag 0 0 0; Cl 0 0 2.28", basis="def2-svp", ecp={"Ag": "def2-svp"}, verbose=0)
+        ref_cls, mojo_cls = scf.RHF, mojoscf.RHF
+    else:
+        mol = gto.M(atom="Ag 0 0 0", basis="def2-svp", ecp={"Ag": "def2-svp"}, spin=1, verbose=0)
+        ref_cls, mojo_cls = scf.UHF, mojoscf.UHF
+
+    def make(cls):
+        mf = cls(mol)
+        if path == "df":
+            mf = mf.density_fit()
+        elif path == "direct":
+            mf.max_memory = 1
+        mf.conv_tol = 1e-10
+        return mf
+
+    ref = make(ref_cls).run()
+    mf = make(mojo_cls).run()
+    assert ref.converged and mf.converged and mf.cycles == ref.cycles
+    assert mf.scf_summary["mojoscf_veff_mode"] == {"df": 1, "incore": 2, "direct": 3}[path]
+    assert abs(mf.e_tot - ref.e_tot) < 1e-9

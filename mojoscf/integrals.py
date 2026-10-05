@@ -16,8 +16,10 @@ the corresponding ``mol.intor`` calls (which use libcint):
 ======================  =============================================
 
 Spherical and Cartesian (``mol.cart``) basis sets are supported for angular
-momenta up to l = 8, with point nuclei and without effective core
-potentials.  :func:`attach` makes a mojoscf SCF object use these integrals.
+momenta up to l = 8.  The one-electron integrals need point nuclei and no
+effective core potentials; the two-electron ones (and the SCF driver's and
+gradients' use of them) work for any such basis, ECPs included.
+:func:`attach` makes a mojoscf SCF object use these integrals.
 """
 from __future__ import annotations
 
@@ -87,28 +89,35 @@ def set_engine(name: str) -> None:
     _ENGINE = name
 
 
-def available(mol) -> bool:
-    """True when the SCF driver will use the Mojo engine for ``mol``."""
-    return _ENGINE == "mojo" and unsupported_reason(mol) is None
+def available(mol, two_electron: bool = False) -> bool:
+    """True when the Mojo engine is enabled and supports ``mol`` (see :func:`unsupported_reason`)."""
+    return _ENGINE == "mojo" and unsupported_reason(mol, two_electron) is None
 
 
-def unsupported_reason(mol) -> str | None:
-    """Why the Mojo engine cannot handle ``mol`` (None if it can)."""
+def unsupported_reason(mol, two_electron: bool = False) -> str | None:
+    """Why the Mojo engine cannot handle ``mol`` (None if it can).
+
+    With ``two_electron`` only the two-electron integrals are considered
+    (four-index, three- and two-centre Coulomb integrals and their
+    derivatives): effective core potentials and the nuclear charge model
+    enter the one-electron Hamiltonian only, so molecules with ECPs or finite
+    nuclei can still use the engine for those.
+    """
     if mol.nbas == 0:
         return "the molecule has no basis functions"
-    if mol.has_ecp():
+    if not two_electron and mol.has_ecp():
         return "effective core potentials are not supported"
     if int(mol._bas[:, gto.ANG_OF].max()) > LMAX:
         return f"angular momentum above l = {LMAX}"
-    if (mol._atm[:, gto.NUC_MOD_OF] != NUC_POINT).any():
+    if not two_electron and (mol._atm[:, gto.NUC_MOD_OF] != NUC_POINT).any():
         return "only point nuclei are supported"
     if getattr(mol, "omega", 0.0):
         return "range-separated Coulomb operator (mol.omega) is not supported"
     return None
 
 
-def _check(mol):
-    reason = unsupported_reason(mol)
+def _check(mol, two_electron: bool = False):
+    reason = unsupported_reason(mol, two_electron)
     if reason is not None:
         raise NotImplementedError(f"mojoscf.integrals: {reason}")
 
@@ -134,7 +143,7 @@ def basis_tables(mol):
     ``l`` and ``c2s`` the concatenated ``(ncart, nf)`` Cartesian-to-final
     transformation matrices for l = 0..lmax.
     """
-    _check(mol)
+    _check(mol, two_electron=True)
     atm = np.ascontiguousarray(mol._atm, dtype=np.int64)
     bas = np.ascontiguousarray(mol._bas, dtype=np.int64)
     env = np.ascontiguousarray(mol._env, dtype=np.float64)
@@ -153,6 +162,7 @@ def basis_tables(mol):
 
 def int1e(mol):
     """``(S, T, V)``: overlap, kinetic energy and nuclear attraction matrices."""
+    _check(mol)
     tables = basis_tables(mol)
     nao = mol.nao_nr()
     s = np.empty((nao, nao))
@@ -255,14 +265,14 @@ def build_df(with_df) -> bool:
     from pyscf import lib as pyscf_lib
 
     mol = with_df.mol
-    if with_df._cderi is not None or not available(mol):
+    if with_df._cderi is not None or not available(mol, two_electron=True):
         return False
     if isinstance(getattr(with_df, "_cderi_to_save", None), str):
         return False
     auxmol = with_df.auxmol
     if auxmol is None:
         auxmol = df_addons.make_auxmol(mol, with_df.auxbasis)
-    if unsupported_reason(auxmol) is not None:
+    if unsupported_reason(auxmol, two_electron=True) is not None:
         return False
     nao = mol.nao_nr()
     max_memory = with_df.max_memory - pyscf_lib.current_memory()[0]
@@ -276,17 +286,19 @@ def build_df(with_df) -> bool:
 def attach(mf, schwarz_tol: float = 1e-14, auxbasis=None):
     """Make the SCF object ``mf`` take its integrals from the Mojo engine.
 
-    ``get_ovlp`` and ``get_hcore`` return precomputed Mojo matrices, the
-    in-core ERI tensor (``mf._eri``) is built here, and for density-fitted
-    objects the DF tensor (``mf.with_df._cderi``) is built from the Mojo
-    three- and two-centre integrals.  Returns ``mf``.
+    ``get_ovlp`` and ``get_hcore`` return precomputed Mojo matrices (left to
+    pyscf for molecules with ECPs or finite nuclei), the in-core ERI tensor
+    (``mf._eri``) is built here, and for density-fitted objects the DF tensor
+    (``mf.with_df._cderi``) is built from the Mojo three- and two-centre
+    integrals.  Returns ``mf``.
     """
     mol = mf.mol
-    _check(mol)
-    s, t, v = int1e(mol)
-    hcore = t + v
-    mf.get_ovlp = lambda mol=None: s
-    mf.get_hcore = lambda mol=None: hcore
+    _check(mol, two_electron=True)
+    if available(mol):
+        s, t, v = int1e(mol)
+        hcore = t + v
+        mf.get_ovlp = lambda mol=None: s
+        mf.get_hcore = lambda mol=None: hcore
     with_df = getattr(mf, "with_df", None)
     if with_df is not None:
         auxmol = with_df.auxmol
@@ -318,6 +330,7 @@ def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13):
 
 
 def _int1e_ip(mol, centers, charges, want_st):
+    _check(mol)
     tables = basis_tables(mol)
     nao = mol.nao_nr()
     s = np.zeros((3, nao, nao))
@@ -347,6 +360,7 @@ def int1e_iprinv_dm(mol, dm, centers=None):
     Equals ``einsum('xij,ij->x', int1e_iprinv(mol, origin=R_c), dm)`` for each
     centre, evaluated in one pass instead of one integral matrix per centre.
     """
+    _check(mol)
     if centers is None:
         centers = mol.atom_coords()
     centers = np.ascontiguousarray(centers, dtype=np.float64).reshape(-1, 3)
@@ -431,8 +445,8 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
 
     from ._backend import blas_config
 
-    _check(mol)
-    _check(auxmol)
+    _check(mol, two_electron=True)
+    _check(auxmol, two_electron=True)
     ext = get_extension()
     table = _boys_table()
     tables = basis_tables(mol)

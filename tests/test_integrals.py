@@ -126,14 +126,35 @@ def test_attach_density_fitting():
 def test_unsupported_molecules():
     mol = gto.M(atom="Cu 0 0 0", basis="lanl2dz", ecp="lanl2dz", spin=1, verbose=0)
     assert "core potential" in mi.unsupported_reason(mol)
+    assert mi.unsupported_reason(mol, two_electron=True) is None
     with pytest.raises(NotImplementedError):
         mi.get_ovlp(mol)
     mol = gto.M(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", nucmod="G", verbose=0)
     assert "point nuclei" in mi.unsupported_reason(mol)
+    assert mi.unsupported_reason(mol, two_electron=True) is None
     assert mi.unsupported_reason(_mol("sto-3g")) is None
     mol = _mol("sto-3g")
     mol.omega = 0.3
     assert "omega" in mi.unsupported_reason(mol)
+    assert "omega" in mi.unsupported_reason(mol, two_electron=True)
+
+
+def test_two_electron_integrals_with_ecp():
+    """ECPs only enter the one-electron Hamiltonian: the ERIs and DF integrals come from the engine."""
+    mol = gto.M(
+        atom="Pt 0 0 0; Cl 0 0 2.32; N 2.05 0 0", basis="def2-svp", ecp={"Pt": "def2-svp"}, charge=0, spin=0,
+        verbose=0,
+    )
+    assert abs(mi.int2e_s8(mol, 0.0) - mol.intor("int2e", aosym="s8")).max() < 1e-12
+    auxmol = df.addons.make_auxmol(mol, "def2-universal-jkfit")
+    assert abs(mi.int3c2e(mol, auxmol) - df.incore.aux_e2(mol, auxmol, "int3c2e", aosym="s2ij").T).max() < 1e-12
+    with pytest.raises(NotImplementedError):
+        mi.int1e(mol)
+    # attach keeps pyscf's hcore (with the ECP) and takes the ERIs from the engine
+    e_ref = scf.RHF(mol).run(conv_tol=1e-11).e_tot
+    mf = mi.attach(mojoscf.RHF(mol))
+    assert "get_hcore" not in mf.__dict__ and mf._eri is not None
+    assert abs(mf.run(conv_tol=1e-11).e_tot - e_ref) < 1e-9
 
 
 def test_basis_tables_layout():

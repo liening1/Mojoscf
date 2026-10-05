@@ -138,14 +138,14 @@ def native_veff(mf):
     if eri is None:
         if mol.incore_anyway or mf._is_mem_enough():
             # what pyscf.scf.hf.RHF.get_jk does on its first call (with the Mojo engine if possible)
-            if integrals.available(mol):
+            if integrals.available(mol, two_electron=True):
                 eri = mf._eri = integrals.int2e_s8(mol)
             else:
                 eri = mf._eri = mol.intor("int2e", aosym="s8")
-        elif integrals.available(mol):
+        elif integrals.available(mol, two_electron=True):
             return 3, (integrals.basis_tables(mol), integrals._boys_table()), None
         else:
-            reason = integrals.unsupported_reason(mol) or "Mojo integral engine disabled"
+            reason = integrals.unsupported_reason(mol, two_electron=True) or "Mojo integral engine disabled"
             return 0, None, f"direct SCF with libcint ({reason})"
     if isinstance(eri, np.ndarray) and eri.dtype == np.float64 and eri.ndim == 1 and eri.size == npair * (npair + 1) // 2:
         return 2, np.ascontiguousarray(eri), None

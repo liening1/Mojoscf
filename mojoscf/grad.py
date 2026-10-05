@@ -21,10 +21,11 @@ the integral work done by ``mojoscf.integrals``; ``DFGradients`` and
   the matrices); the DF classes keep pyscf's DF ``get_jk``.
 
 Results agree with ``pyscf.grad`` / ``pyscf.df.grad`` to the precision of the
-integrals.  Molecules the engine does not support, X2C objects,
-range-separated operators, ``only_dfj``, ``auxbasis_response = False`` and
-subclasses that override ``get_veff`` or ``get_jk`` use pyscf's own
-implementation.
+integrals.  With effective core potentials, X2C or finite nuclei the
+one-electron pieces come from pyscf (they carry those terms) and the
+two-electron part still from the engine.  Range-separated operators,
+``only_dfj``, ``auxbasis_response = False`` and subclasses that override
+``get_veff`` or ``get_jk`` use pyscf's own implementation.
 
 >>> mf = mojoscf.RHF(mol).run()                  # or .density_fit().run()
 >>> g = mf.nuc_grad_method().kernel()
@@ -57,6 +58,7 @@ class _MojoGrad1eMixin:
     _unrestricted = False
 
     def _mojo_ok(self, mol=None, omega=None):
+        """The one-electron pieces can come from the Mojo engine (no ECP, X2C, finite nuclei)."""
         mol = self.mol if mol is None else mol
         return (
             integrals.available(mol)
@@ -64,6 +66,11 @@ class _MojoGrad1eMixin:
             and getattr(self.base, "with_x2c", None) is None
             and not omega
         )
+
+    def _mojo_2e_ok(self, mol=None, omega=None):
+        """The two-electron pieces can come from the Mojo engine (ECPs, X2C and finite nuclei allowed)."""
+        mol = self.mol if mol is None else mol
+        return integrals.available(mol, two_electron=True) and not getattr(mol, "_pseudo", None) and not omega
 
     _mojo_ip_cache = None
 
@@ -124,7 +131,7 @@ class _MojoGrad1eMixin:
 
     def grad_elec(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         """Electronic gradient, as pyscf's ``grad_elec`` with the two-electron term from ``grad_2e``."""
-        if not (self._mojo_ok() and self._direct_2e()):
+        if not (self._mojo_2e_ok() and self._direct_2e()):
             return super().grad_elec(mo_energy, mo_coeff, mo_occ, atmlst)
         mf = self.base
         mol = self.mol
@@ -138,7 +145,7 @@ class _MojoGrad1eMixin:
 
         # sum_ij D_ij hcore_deriv(A)_ij for all atoms from one pass over the integrals when
         # hcore_generator is ours: 2 (sum_{i in A} h1_ij D_ij - Z_A sum_ij D_ij <nabla i|1/r_A|j>)
-        fast_h1 = type(self).hcore_generator is _MojoGrad1eMixin.hcore_generator
+        fast_h1 = type(self).hcore_generator is _MojoGrad1eMixin.hcore_generator and self._mojo_ok()
         if not fast_h1:
             hcore_deriv = self.hcore_generator(mol)
         s1 = self.get_ovlp(mol)
@@ -185,7 +192,7 @@ class _MojoGradMixin(_MojoGrad1eMixin):
 
     def _mojo_jk_ok(self, mol, dm, omega):
         """The Mojo derivative J/K needs real symmetric densities (pyscf also passes others, e.g. in TDHF)."""
-        if not self._mojo_ok(mol, omega):
+        if not self._mojo_2e_ok(mol, omega):
             return False
         dm = np.asarray(dm)
         if dm.ndim < 2 or not np.isrealobj(dm):
@@ -266,7 +273,7 @@ class _MojoDFGradMixin(_MojoGrad1eMixin):
             and cls.get_veff is pyscf_cls.get_veff
             and cls.get_jk is pyscf_cls.get_jk
             and not ({"get_veff", "get_jk"} & self.__dict__.keys())
-            and integrals.available(self._auxmol())
+            and integrals.available(self._auxmol(), two_electron=True)
         )
 
     def _extra_force(self, atom_id, envs):
