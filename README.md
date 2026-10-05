@@ -278,8 +278,27 @@ The implementation is built around a few decisions, each measured:
   8-wide vectors, the transforms keep eight independent FMA chains in
   registers and take R as an embedded broadcast operand, and all lanes of a
   batch accumulate before one store.  Single primitive quartets use a scalar
-  version of the same code.  Vector operands are 64-byte aligned (cache-line
-  splits had cost 1.45x).
+  version of the same code (or, in the drivers, the batches below).  Vector
+  operands are 64-byte aligned (cache-line splits had cost 1.45x).
+* **SIMD over kets.**  Segmented basis sets (def2, Pople) are dominated by
+  quartets whose pairs have one or a few primitive pairs, where vectorising
+  over the primitives of one quartet leaves most lanes empty.  `eri_batch`
+  evaluates one bra pair against many ket pairs at once: every primitive
+  pair of the kets (up to 32; kets of one class, i.e. the same Hermite degree
+  and number of functions) is one SIMD lane of `eri_kernel_lanes`.
+  Prefactors, the Boys function and the Hermite recursion run across the
+  lanes; the bra transform
+  `U[o][h_k] += sum_{h_b} (-1)^{|h_b|} E_B[h_b][o] R[h_b + h_k]` accumulates
+  over the bra's primitive pairs with `E_B` broadcast, and each ket's own
+  transform `(o|k) = sum_{h_k} U[o][h_k] E_K[h_k][k]` runs once per ket
+  primitive pair afterwards.  The direct J/K, the in-core ERIs, the
+  three-centre integrals and the DF gradient queue each bra's kets by class
+  and flush full batches.  `lanes_preferred` keeps a quartet on the
+  single-quartet path where per-class timings showed that to be faster
+  (kets with five or more primitive pairs against a less contracted bra,
+  contracted kets against bras of Hermite degree above 2).  The four-centre
+  derivative integrals of the gradient keep the single-quartet path: there
+  the bra carries six derivative components and batching measured no gain.
 * Higher degrees use a generic kernel with run-time loops and
   register-tiled SIMD products.  Primitive pairs with `mu |AB|^2 > 60` are
   dropped (libcint's `EXPCUTOFF`), shell quartets are Schwarz-screened
@@ -350,8 +369,10 @@ bounds once, then in every cycle recomputes the significant quartets of the
 density change (pyscf's incremental `direct_scf` update and its
 `direct_scf_tol` test, Schwarz bound times the largest density element of the
 six shell blocks involved) and folds them into per-thread J/K accumulators
-with the 8-fold symmetry weights; the exchange digestion costs about 1% of
-the integral evaluation.  Molecules with effective core potentials or finite
+with the 8-fold symmetry weights.  Each unique quartet is evaluated by the
+task of its pair with more primitive pairs, whose kets are batched as above;
+with the batched integrals the J/K fold (scalar code over the quartet's
+functions) is about a quarter of the time for ferrocene/def2-SVP.  Molecules with effective core potentials or finite
 nuclei use the engine too (only their one-electron Hamiltonian differs, and
 it comes from pyscf); range-separated `mol.omega` uses libcint, and
 `MOJOSCF_INTEGRALS=libcint` switches the engine off.  One-electron matrices
@@ -580,7 +601,7 @@ mojoscf/
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
 benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py
-tools/gen_eri_kernel.py  generates the register-blocked ERI kernel in _mojo/integrals.mojo
+tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quartet, batched kets) in _mojo/integrals.mojo
 ```
 
 ## Scope and limitations
