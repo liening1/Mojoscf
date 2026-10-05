@@ -165,3 +165,27 @@ def test_mm_force_cache(monkeypatch):
     f2 = g.grad_hcore_mm(dm2)
     assert calls                                       # another density: recomputed
     assert abs(f2 - 1.01 * f).max() < 1e-12
+
+
+def test_qmmm_gradient_scanner():
+    """MD-style use: the gradient scanner on moving QM atoms, with the MM forces of each step."""
+    coords, q = _charges(200, rmin=3.5)
+
+    def scanner(mojo):
+        mol = gto.M(atom=WATER, basis="cc-pvdz", verbose=0)
+        mf = qmmm.mm_charge(scf.RHF(mol).density_fit(), coords, q)
+        mf.conv_tol = 1e-11
+        if mojo:
+            mojoscf.accelerate(mf)
+        return mf.nuc_grad_method().as_scanner()
+
+    ref, moj = scanner(False), scanner(True)
+    assert isinstance(moj, mojo_qmmm._MojoQMMMGrad)
+    for step in range(2):
+        geom = f"O 0 0 {0.03 * step}; H 0 0.757 0.587; H 0 -0.757 {0.587 + 0.04 * step}"
+        e0, g0 = ref(geom)
+        e1, g1 = moj(geom)
+        assert abs(e0 - e1) < 1e-10 and abs(g0 - g1).max() < 1e-9
+        f0 = ref.grad_hcore_mm(ref.base.make_rdm1()) + ref.grad_nuc_mm()
+        f1 = moj.grad_hcore_mm(moj.base.make_rdm1()) + moj.grad_nuc_mm()
+        assert abs(f0 - f1).max() < 1e-9
