@@ -237,7 +237,8 @@ def df_grad_rhs(
 
     ``dm_tril`` is pyscf's packed density (off-diagonal elements doubled),
     ``orbs`` holds ``nset`` (nao x m) orbital blocks (zero columns allowed),
-    ``q`` receives (nset, naux, m, m).  The three-centre integrals are
+    ``q`` receives the packed lower triangles (nset, naux, m (m + 1) / 2) of
+    the symmetric Q_s,P.  The three-centre integrals are
     evaluated for blocks of about ``blk`` auxiliary functions; within a block
     worker threads unpack one (P|mu nu) at a time and transform it with the
     sequential BLAS (two small GEMMs per set), as the DF exchange build does.
@@ -246,8 +247,10 @@ def df_grad_rhs(
     var naux = aux.nao
     var npair = nao * (nao + 1) // 2
     var n2 = nao * nao
+    var mp = m * (m + 1) // 2
     var nwork = 2 * max(1, parallelism_level())
-    var ebuf = List[Float64](length=nwork * (n2 + m * nao) + 8, fill=0.0)
+    var wsz = n2 + m * nao + m * m
+    var ebuf = List[Float64](length=nwork * wsz + 8, fill=0.0)
     var pe = list_ptr(ebuf)
     var s0 = 0
     while s0 < aux.nbas:
@@ -260,9 +263,10 @@ def df_grad_rhs(
         var pb = list_ptr(b)
         int3c2e_core(basis, aux, boys, pb, s0, s1)
 
-        def work(c: Int) {imm blas_seq, imm pb, imm pe, imm dm_tril, imm orbs, imm rho, imm q, imm nao, imm naux, imm npair, imm n2, imm nset, imm m, imm p0, imm p1, imm nwork}:
-            var e = pe.unsafe_offset(c * (n2 + m * nao))
+        def work(c: Int) {imm blas_seq, imm pb, imm pe, imm dm_tril, imm orbs, imm rho, imm q, imm nao, imm naux, imm npair, imm n2, imm nset, imm m, imm mp, imm wsz, imm p0, imm p1, imm nwork}:
+            var e = pe.unsafe_offset(c * wsz)
             var u = e.unsafe_offset(n2)
+            var qm = u.unsafe_offset(m * nao)
             var pp = p0 + c
             while pp < p1:
                 var row = pb.unsafe_offset((pp - p0) * npair)
@@ -274,9 +278,15 @@ def df_grad_rhs(
                         try:
                             # U (m x nao) = C^T E, Q_P (m x m) = U C
                             blas_seq.gemm(True, False, m, nao, nao, 1.0, cs, e, 0.0, u)
-                            blas_seq.gemm(False, False, m, m, nao, 1.0, u, cs, 0.0, q.unsafe_offset((st * naux + pp) * m * m))
+                            blas_seq.gemm(False, False, m, m, nao, 1.0, u, cs, 0.0, qm)
                         except:
                             pass
+                        var qp = q.unsafe_offset((st * naux + pp) * mp)
+                        var k = 0
+                        for i in range(m):
+                            for j in range(i + 1):
+                                qp[unsafe_offset=k + j] = qm[unsafe_offset=i * m + j]
+                            k += i + 1
                 pp += nwork
 
         parallelize(work, nwork)
@@ -295,11 +305,11 @@ def grad_df3c_core(
     """de[A][x] = d/dR_Ax sum_{P, mu nu} (mu nu|P) Gamma_P,mu nu, overwritten (natm x 3).
 
     Gamma_P = jfac coef_P D - kfac sum_s Cn_s X_s,P Cn_s^T, with ``dpack`` the
-    packed lower triangle of D (not doubled), ``xs`` (nset, naux, m, m) and
-    ``cns`` (nset, nao x m).  Per block of about ``blk`` auxiliary functions
+    packed lower triangle of D (not doubled), ``xs`` the packed lower
+    triangles of the symmetric X_s,P (nset, naux, m (m + 1) / 2) and ``cns``
+    (nset, nao x m).  Per block of about ``blk`` auxiliary functions
     the rows Gamma_P (packed, (np, npair)) are built by worker threads with a
-    sequential GEMM and a rank-2k update per set (``xs`` must be symmetric
-    in its last two indices); then each auxiliary shell is a task that
+    sequential GEMM and a rank-2k update per set; then each auxiliary shell is a task that
     runs over all AO shell pairs a >= b with the six-component derivative
     table (nabla a, nabla b) (weight 2 for a != b), the auxiliary centre
     taking minus their sum.  A triple is skipped when
@@ -328,7 +338,9 @@ def grad_df3c_core(
     var per = 3 * natm
     var accl = List[Float64](length=nthreads * per + 1, fill=0.0)
     var pacc = list_ptr(accl)
-    var fbuf = List[Float64](length=nwork * (n2 + m * nao) + 8, fill=0.0)
+    var mp = m * (m + 1) // 2
+    var wsz = n2 + m * nao + m * m
+    var fbuf = List[Float64](length=nwork * wsz + 8, fill=0.0)
     var pf = list_ptr(fbuf)
     var pq2 = list_ptr(q2)
     var pqa = list_ptr(qa)
@@ -344,9 +356,10 @@ def grad_df3c_core(
         var gbuf = List[Float64](length=(p1 - p0) * npair + 1, fill=0.0)
         var gam = list_ptr(gbuf)
 
-        def build(c: Int) {imm blas_seq, imm pf, imm gam, imm coef, imm dpack, imm jfac, imm kfac, imm xs, imm cns, imm nao, imm n2, imm npair, imm nset, imm m, imm p0, imm p1, imm nwork, imm aux}:
-            var f = pf.unsafe_offset(c * (n2 + m * nao))
+        def build(c: Int) {imm blas_seq, imm pf, imm gam, imm coef, imm dpack, imm jfac, imm kfac, imm xs, imm cns, imm nao, imm n2, imm npair, imm nset, imm m, imm mp, imm wsz, imm p0, imm p1, imm nwork, imm aux}:
+            var f = pf.unsafe_offset(c * wsz)
             var t = f.unsafe_offset(n2)
+            var xm = t.unsafe_offset(m * nao)
             var naux = aux.nao
             var pp = p0 + c
             while pp < p1:
@@ -357,10 +370,18 @@ def grad_df3c_core(
                 if m > 0:
                     for st in range(nset):
                         var cn = cns.unsafe_offset(st * nao * m)
+                        var xp = xs.unsafe_offset((st * naux + pp) * mp)
+                        var k = 0
+                        for i in range(m):
+                            for j in range(i + 1):
+                                var v = xp[unsafe_offset=k + j]
+                                xm[unsafe_offset=i * m + j] = v
+                                xm[unsafe_offset=j * m + i] = v
+                            k += i + 1
                         try:
                             # T (nao x m) = Cn X_P; lower triangle of F (+)= -kfac Cn X_P Cn^T
                             # = -kfac/2 (T Cn^T + Cn T^T) (X_P is symmetric)
-                            blas_seq.gemm(False, False, nao, m, m, 1.0, cn, xs.unsafe_offset((st * naux + pp) * m * m), 0.0, t)
+                            blas_seq.gemm(False, False, nao, m, m, 1.0, cn, xm, 0.0, t)
                             blas_seq.syr2k_lower(nao, m, -0.5 * kfac, t, cn, 0.0 if st == 0 else 1.0, f)
                         except:
                             pass

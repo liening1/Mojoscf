@@ -26,7 +26,7 @@ from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
-from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, eri_s8_core, int3c2e_core, int2c2e_core
+from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
 from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
 from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core
 
@@ -70,6 +70,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_df_grad_rhs]("df_grad_rhs", docstring="df_grad_rhs(basis, auxbasis, table, dm_tril, orbs, blk, rho, q, seq_path, seq_prefix): fit right-hand sides of the DF gradient.")
         m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix): three-centre term of the DF gradient.")
         m.def_function[py_grad2c]("grad2c", docstring="grad2c(auxbasis, table, w, de): d/dR of -1/2 sum (P|Q) W_PQ.")
+        m.def_function[py_int1e_iprinv_dm]("int1e_iprinv_dm", docstring="int1e_iprinv_dm(basis, table, centers, dm, out): sum_ij D_ij <nabla i|1/|r-R_c||j> per centre (ncenter, 3).")
         m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk.")
         m.def_function[py_direct_jk]("direct_jk", docstring="direct_jk(basis, table, dms, vj, vk, with_j, with_k, tol): integral-direct J/K of symmetric densities.")
         return m.finalize()
@@ -536,4 +537,15 @@ def py_grad_df3c(
 
 def py_grad2c(auxbasis: PythonObject, table: PythonObject, w: PythonObject, de: PythonObject) raises -> PythonObject:
     grad2c_core(_basis(auxbasis), _boys(table), f64ptr(w), Int(py=de.shape[0]), f64ptr(de))
+    return PythonObject(None)
+
+
+def py_int1e_iprinv_dm(
+    basis: PythonObject, table: PythonObject, centers: PythonObject, dm: PythonObject, dst: PythonObject
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var boys = _boys(table)
+    int1e_iprinv_dm_core(bs, boys, Int(py=centers.shape[0]), f64ptr(centers), f64ptr(dm), f64ptr(dst))
+    _ = bs^
+    _ = boys^
     return PythonObject(None)

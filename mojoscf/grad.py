@@ -136,7 +136,11 @@ class _MojoGrad1eMixin:
             mo_coeff = mf.mo_coeff
         log = logger.Logger(self.stdout, self.verbose)
 
-        hcore_deriv = self.hcore_generator(mol)
+        # sum_ij D_ij hcore_deriv(A)_ij for all atoms from one pass over the integrals when
+        # hcore_generator is ours: 2 (sum_{i in A} h1_ij D_ij - Z_A sum_ij D_ij <nabla i|1/r_A|j>)
+        fast_h1 = type(self).hcore_generator is _MojoGrad1eMixin.hcore_generator
+        if not fast_h1:
+            hcore_deriv = self.hcore_generator(mol)
         s1 = self.get_ovlp(mol)
         dm0 = lib.tag_array(np.asarray(mf.make_rdm1(mo_coeff, mo_occ)), mo_coeff=mo_coeff, mo_occ=mo_occ)
         dme0 = np.asarray(self.make_rdm1e(mo_energy, mo_coeff, mo_occ))
@@ -145,6 +149,11 @@ class _MojoGrad1eMixin:
             dme0_sf = dme0[0] + dme0[1]
         else:
             dm0_sf, dme0_sf = dm0, dme0
+
+        if fast_h1:
+            h1 = self.get_hcore(mol)
+            rinv = integrals.int1e_iprinv_dm(mol, dm0_sf)
+            charges = mol.atom_charges()
 
         t0 = (logger.process_clock(), logger.perf_counter())
         log.debug("Computing Gradients of the Coulomb repulsion (Mojo)")
@@ -157,8 +166,10 @@ class _MojoGrad1eMixin:
         de = np.zeros((len(atmlst), 3))
         for k, ia in enumerate(atmlst):
             p0, p1 = aoslices[ia, 2:]
-            h1ao = hcore_deriv(ia)
-            de[k] += np.einsum("xij,ij->x", h1ao, dm0_sf)
+            if fast_h1:
+                de[k] += 2 * (np.einsum("xij,ij->x", h1[:, p0:p1], dm0_sf[p0:p1]) - charges[ia] * rinv[ia])
+            else:
+                de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm0_sf)
             de[k] += de2[ia]
             de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0_sf[p0:p1]) * 2
             de[k] += self._extra_force(ia, locals())

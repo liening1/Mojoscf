@@ -50,6 +50,7 @@ __all__ = [
     "unsupported_reason",
     "int1e_ip",
     "int1e_iprinv",
+    "int1e_iprinv_dm",
     "get_jk_ip1",
     "grad2e",
     "grad2e_df",
@@ -340,6 +341,21 @@ def int1e_iprinv(mol, atom_id=None, origin=None):
     return _int1e_ip(mol, np.asarray(origin, dtype=np.float64), np.ones(1), False)[2]
 
 
+def int1e_iprinv_dm(mol, dm, centers=None):
+    """``sum_ij dm_ij <nabla i| 1/|r - R_c| |j>`` for every centre c (default: the nuclei), shape (ncenter, 3).
+
+    Equals ``einsum('xij,ij->x', int1e_iprinv(mol, origin=R_c), dm)`` for each
+    centre, evaluated in one pass instead of one integral matrix per centre.
+    """
+    if centers is None:
+        centers = mol.atom_coords()
+    centers = np.ascontiguousarray(centers, dtype=np.float64).reshape(-1, 3)
+    dm = np.ascontiguousarray(dm, dtype=np.float64)
+    out = np.zeros((centers.shape[0], 3))
+    get_extension().int1e_iprinv_dm(basis_tables(mol), _boys_table(), centers, dm, out)
+    return out
+
+
 def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14):
     """Gradient J/K exactly as ``pyscf.grad.rhf.get_jk``: ``(-sum (nabla i j|kl) D_lk, -sum (nabla i j|kl) D_jk)``.
 
@@ -379,11 +395,11 @@ def grad2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14):
 
 
 def _syrk_full(a_t):
-    """``A^T A`` for the Fortran-ordered (k, n) array ``a_t`` (BLAS ``dsyrk``, both triangles returned)."""
+    """``A^T A`` for the (k, n) array ``a_t``, Fortran-ordered to avoid a copy (BLAS ``dsyrk``, both triangles returned)."""
     from scipy.linalg import blas as sblas
 
     c = sblas.dsyrk(1.0, a_t, trans=1, lower=0)
-    return np.triu(c) + np.triu(c, 1).T
+    return lib.hermi_triu(c)  # Fortran-ordered result: mirrors the upper triangle in place
 
 
 def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_memory=4000, tol=1e-14):
@@ -443,28 +459,25 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
     blk = int(max_memory * 1e6 / 8 / 2 / npair)
     blk = max(1, min(blk, naux))
 
+    # (P|ij) of each set as packed lower triangles (they are symmetric in ij)
+    mp = m * (m + 1) // 2
     rhoj = np.empty(naux)
-    q = np.zeros((max(nset, 1), naux, m, m))
-    ext.df_grad_rhs(tables, aux_tables, table, dm_tril, c, blk, rhoj, q, seq_path, seq_prefix)
+    xs = np.empty((max(nset, 1), naux, mp))
+    ext.df_grad_rhs(tables, aux_tables, table, dm_tril, c, blk, rhoj, xs, seq_path, seq_prefix)
 
-    # X = V^-1 (P|ij) and W on the packed ij >= columns (X, Q are symmetric in ij):
+    # X = V^-1 (P|ij) in place, and W on the packed columns:
     # sum_ij n_i n_j X_Pij X_Qij = sum_{i>=j} w_ij X_Pij X_Qij, w_ij = n_i n_j (2 for i > j)
     solve = _gen_metric_solver(int2c2e(auxmol))
     coef = solve(rhoj)
-    xs = np.empty_like(q)
     w = j_factor * np.outer(coef, coef)
     tri = np.tril_indices(m)
     for st in range(nset):
-        xp = solve(np.ascontiguousarray(q[st][:, tri[0], tri[1]]))
-        xs[st] = lib.unpack_tril(xp)
+        xs[st] = solve(xs[st])
         wij = np.outer(nn[st], nn[st])[tri] * np.where(tri[0] == tri[1], 1.0, 2.0)
         if np.all(wij >= 0):
-            xw = np.asfortranarray((xp * np.sqrt(wij)).T)
-            w -= k_factor * _syrk_full(xw)
+            w -= k_factor * _syrk_full((xs[st] * np.sqrt(wij)).T)
         else:
-            w -= k_factor * lib.dot(xp * wij, xp.T)
-        xp = xw = None
-    q = None
+            w -= k_factor * lib.dot(xs[st] * wij, xs[st].T)
 
     de = np.zeros((auxmol.natm, 3))
     ext.grad2c(aux_tables, table, np.ascontiguousarray(w), de)

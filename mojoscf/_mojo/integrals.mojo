@@ -2459,6 +2459,198 @@ def int1e_ip_core(
     _ = counter^
 
 
+def int1e_iprinv_dm_core(basis: Basis, boys: BoysTable, ncenter: Int, centers: F64Ptr, dm: F64Ptr, dst: F64Ptr):
+    """dst[c][x] = sum_ij D_ij <nabla_x i| 1/|r - R_c| |j> for every centre c (``dst`` is ncenter x 3).
+
+    The contraction of pyscf's ``int1e_iprinv`` at each centre with one
+    (nao x nao) matrix, in one pass over all ordered shell pairs: the
+    potential blocks of every centre are accumulated side by side, then
+    transformed to the final functions and contracted with the matching
+    block of ``dm``.  This replaces one ``int1e_iprinv`` evaluation per
+    nucleus in the one-electron term of the nuclear gradient.
+    """
+    var nbas = basis.nbas
+    var nao = basis.nao
+    var lmax = basis.lmax
+    var npairs = nbas * nbas
+    var ncm = basis.nctr_max * ncart(lmax)
+    var nworkers = min(parallelism_level(), max(1, npairs // 4))
+    var acc_all = List[Float64](length=nworkers * 3 * ncenter + 1, fill=0.0)
+    var pacc = list_ptr(acc_all)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+
+    def work(w: Int) {imm basis, imm boys, imm ncenter, imm centers, imm dm, imm pacc, imm pcount, imm npairs, imm nbas, imm nao, imm lmax, imm ncm}:
+        var acc = pacc.unsafe_offset(w * 3 * ncenter)
+        var s3 = lmax + 1 + lmax + 1
+        var e = List[Float64](length=3 * (lmax + 2) * (lmax + 1) * s3, fill=0.0)
+        var pe = list_ptr(e)
+        var lr = 2 * lmax + 2
+        var r0 = List[Float64](length=lr * lr * lr, fill=0.0)
+        var r1 = List[Float64](length=lr * lr * lr, fill=0.0)
+        var pr0 = list_ptr(r0)
+        var pr1 = list_ptr(r1)
+        var fb = List[Float64](length=lr + BoysTable.NTERMS, fill=0.0)
+        var pfb = list_ptr(fb)
+        var nc2 = ncart(lmax) * ncart(lmax)
+        var prim = List[Float64](length=3 * nc2, fill=0.0)                 # [x][ca cb], one centre, one primitive pair
+        var blk = List[Float64](length=ncenter * 3 * ncm * ncm, fill=0.0)  # contracted, [c][x][ca ia][cb ib]
+        var tmp = List[Float64](length=2 * ncm * ncm, fill=0.0)
+        var pprim = list_ptr(prim)
+        var pblk = list_ptr(blk)
+        var ptmp = list_ptr(tmp)
+        while True:
+            var task = Int(pcount[].fetch_add(1))
+            if task >= npairs:
+                break
+            var a = task // nbas
+            var b = task % nbas
+            var la = basis.l[a]
+            var lb = basis.l[b]
+            var nca = basis.nctr[a]
+            var ncb = basis.nctr[b]
+            var ncarta = ncart(la)
+            var ncartb = ncart(lb)
+            var nblk = ncarta * ncartb
+            var ncab = nca * ncarta * ncb * ncartb
+            var npa = basis.nprim[a]
+            var npb = basis.nprim[b]
+            var ax = basis.shell_coord(a, 0)
+            var ay = basis.shell_coord(a, 1)
+            var az = basis.shell_coord(a, 2)
+            var bx = basis.shell_coord(b, 0)
+            var by = basis.shell_coord(b, 1)
+            var bz = basis.shell_coord(b, 2)
+            var rab2 = (ax - bx) * (ax - bx) + (ay - by) * (ay - by) + (az - bz) * (az - bz)
+            var fac = basis.func_scale(a) * basis.func_scale(b)
+            var offa = basis.cart_off[la]
+            var offb = basis.cart_off[lb]
+            var la1 = la + 1
+            var lb1 = lb + 1
+            var s = la1 + lb + 1
+            var esz = (la1 + 1) * lb1 * s
+            var lv = la + lb + 1
+            var c1 = lv + 1
+            var c2 = c1 * c1
+            vfill(pblk, ncenter * 3 * ncab, 0.0)
+            for ia in range(npa):
+                var ea = basis.env[basis.pexp[a] + ia]
+                for ib in range(npb):
+                    var eb = basis.env[basis.pexp[b] + ib]
+                    var p = ea + eb
+                    var mu = ea * eb / p
+                    if mu * rab2 > EXP_CUTOFF:
+                        continue
+                    var px = (ea * ax + eb * bx) / p
+                    var py = (ea * ay + eb * by) / p
+                    var pz = (ea * az + eb * bz) / p
+                    hermite_e(la1, lb, p, px - ax, px - bx, exp(-mu * (ax - bx) * (ax - bx)), pe)
+                    hermite_e(la1, lb, p, py - ay, py - by, exp(-mu * (ay - by) * (ay - by)), pe.unsafe_offset(esz))
+                    hermite_e(la1, lb, p, pz - az, pz - bz, exp(-mu * (az - bz) * (az - bz)), pe.unsafe_offset(2 * esz))
+                    var vpref = 2.0 * PI / p
+                    for cidx in range(ncenter):
+                        hermite_r(
+                            lv, p, px - centers[unsafe_offset=3 * cidx], py - centers[unsafe_offset=3 * cidx + 1],
+                            pz - centers[unsafe_offset=3 * cidx + 2], boys, pfb, pr0, pr1, vpref,
+                        )
+                        vfill(pprim, 3 * nblk, 0.0)
+                        for ca in range(ncarta):
+                            var ijk = InlineIdx(basis.cx[offa + ca], basis.cy[offa + ca], basis.cz[offa + ca])
+                            for cb in range(ncartb):
+                                var lmn = InlineIdx(basis.cx[offb + cb], basis.cy[offb + cb], basis.cz[offb + cb])
+                                var col = ca * ncartb + cb
+                                for x in range(3):
+                                    var accx = 0.0
+                                    for shift in range(2):
+                                        var wsh: Float64
+                                        var di: Int
+                                        if shift == 0:
+                                            di = -1
+                                            wsh = Float64(ijk.get(x))
+                                        else:
+                                            di = 1
+                                            wsh = -2.0 * ea
+                                        if wsh == 0.0:
+                                            continue
+                                        var ii = ijk.get(0) + (di if x == 0 else 0)
+                                        var kk = ijk.get(1) + (di if x == 1 else 0)
+                                        var mm = ijk.get(2) + (di if x == 2 else 0)
+                                        var jj = lmn.get(0)
+                                        var ll = lmn.get(1)
+                                        var nn = lmn.get(2)
+                                        var ex = (ii * lb1 + jj) * s
+                                        var ey = esz + (kk * lb1 + ll) * s
+                                        var ez = 2 * esz + (mm * lb1 + nn) * s
+                                        var part = 0.0
+                                        for t in range(ii + jj + 1):
+                                            var vx = pe[unsafe_offset=ex + t]
+                                            for u in range(kk + ll + 1):
+                                                var vxy = vx * pe[unsafe_offset=ey + u]
+                                                var rr = pr0.unsafe_offset(t * c2 + u * c1)
+                                                for v in range(mm + nn + 1):
+                                                    part += vxy * pe[unsafe_offset=ez + v] * rr[unsafe_offset=v]
+                                        accx += wsh * part
+                                    pprim[unsafe_offset=x * nblk + col] = accx
+                        var cb0 = pblk.unsafe_offset(cidx * 3 * ncab)
+                        for ca in range(nca):
+                            var cfa = basis.env[basis.pcoef[a] + ca * npa + ia] * fac
+                            for cb in range(ncb):
+                                var wgt = cfa * basis.env[basis.pcoef[b] + cb * npb + ib]
+                                for x in range(3):
+                                    var dst2 = cb0.unsafe_offset(x * ncab)
+                                    var src = pprim.unsafe_offset(x * nblk)
+                                    for ia2 in range(ncarta):
+                                        vaxpy(
+                                            dst2.unsafe_offset(((ca * ncarta + ia2) * ncb + cb) * ncartb), ncartb, wgt,
+                                            src.unsafe_offset(ia2 * ncartb),
+                                        )
+            # spherical transform, contraction with the density block
+            var i0 = basis.ao_loc[a]
+            var j0 = basis.ao_loc[b]
+            var na = basis.ao_loc[a + 1] - i0
+            var nb = basis.ao_loc[b + 1] - j0
+            for cidx in range(ncenter):
+                for x in range(3):
+                    var cur = pblk.unsafe_offset((cidx * 3 + x) * ncab)
+                    var oth = ptmp
+                    var spare = ptmp.unsafe_offset(ncm * ncm)
+                    var d1 = ncb * ncartb
+                    var d0 = nca * ncarta
+                    if basis.needs_transform(a):
+                        transform_axis(cur, oth, nca, ncarta, basis.nf[la], d1, list_ptr(basis.c2s).unsafe_offset(basis.c2s_off[la]))
+                        d0 = na
+                        cur = oth
+                        oth = spare
+                    if basis.needs_transform(b):
+                        transform_axis(cur, oth, d0 * ncb, ncartb, basis.nf[lb], 1, list_ptr(basis.c2s).unsafe_offset(basis.c2s_off[lb]))
+                        cur = oth
+                    var sacc = 0.0
+                    for fa in range(na):
+                        var drow = dm.unsafe_offset((i0 + fa) * nao + j0)
+                        for fbb in range(nb):
+                            sacc += cur[unsafe_offset=fa * nb + fbb] * drow[unsafe_offset=fbb]
+                    acc[unsafe_offset=3 * cidx + x] += sacc
+        _ = e^
+        _ = r0^
+        _ = r1^
+        _ = fb^
+        _ = prim^
+        _ = blk^
+        _ = tmp^
+
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    for i in range(3 * ncenter):
+        var v = 0.0
+        for w2 in range(nworkers):
+            v += pacc[unsafe_offset=w2 * 3 * ncenter + i]
+        dst[unsafe_offset=i] = v
+    _ = acc_all^
+    _ = counter^
+
+
 @fieldwise_init
 struct InlineIdx(Copyable, Movable):
     var x: Int
