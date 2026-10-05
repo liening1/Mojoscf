@@ -34,6 +34,11 @@ iteration then runs without touching Python or pyscf's C code at all.
   integrals and falls back to libcint for molecules it does not support (ECPs,
   finite nuclei, `mol.omega`); `MOJOSCF_INTEGRALS=libcint` or
   `mojoscf.integrals.set_engine("libcint")` switches it off.
+* **Nuclear gradients** (`mojoscf.grad`): `nuc_grad_method()` of `mojoscf.RHF`
+  and `UHF` returns pyscf's gradient classes with the derivative integrals
+  from the Mojo engine; the two-electron term is evaluated directly from the
+  unique shell quartets, 3.8 to 9.9x faster than `pyscf.grad` with the same
+  gradients to about 1e-13.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -182,6 +187,9 @@ four-index and three-centre integrals it is faster than libcint.
 | `int3c2e(mol, auxmol)`, `int2c2e(auxmol)` | `df.incore.aux_e2(..., aosym="s2ij").T`, `auxmol.intor("int2c2e")` |
 | `cholesky_eri(mol, auxbasis)`     | `df.incore.cholesky_eri`                           |
 | `attach(mf)`                      | makes an RHF/UHF object (plain or density-fitted) use all of the above |
+| `int1e_ip(mol)`, `int1e_iprinv(mol, atom)` | `mol.intor("int1e_ipovlp" / "int1e_ipkin" / "int1e_ipnuc")`, `int1e_iprinv` at a nucleus |
+| `get_jk_ip1(mol, dm)`             | `pyscf.grad.rhf.get_jk` (derivative J/K matrices)  |
+| `grad2e(mol, dm_j, dm_k, j_factor, k_factor)` | the two-electron term of `pyscf.grad.rhf/uhf.grad_elec` |
 
 **Method.** McMurchie-Davidson: Hermite expansion coefficients `E_t^{ij}`,
 Hermite Coulomb integrals `R_{tuv}` from the Boys function (an 8-term Taylor
@@ -292,8 +300,67 @@ with the 8-fold symmetry weights; the exchange digestion costs about 1% of
 the integral evaluation.  Molecules the engine does not support (ECPs, finite
 nuclei, range-separated `mol.omega`) use libcint as before, and
 `MOJOSCF_INTEGRALS=libcint` switches the engine off.  One-electron matrices
-still come from pyscf unless `attach(mf)` is used; the engine provides no
-derivative integrals yet.
+still come from pyscf unless `attach(mf)` is used.
+
+### Nuclear gradients
+
+`nuc_grad_method()` (and `Gradients()`) of `mojoscf.RHF`/`UHF` and of
+`accelerate`d objects returns `mojoscf.grad.Gradients`/`UGradients`:
+pyscf's `grad.rhf`/`grad.uhf` classes with the integral work done by the
+engine.  The classes also take plain pyscf objects,
+`mojoscf.grad.Gradients(scf.RHF(mol).run()).kernel()`.
+
+* **Derivative integrals.**  A derivative pair table stores, like the plain
+  one, coefficient-weighted Hermite matrices, built from
+  `d/dx x^i e^{-a x^2} = i x^{i-1} e^{-a x^2} - 2a x^{i+1} e^{-a x^2}`
+  (Hermite degree la + lb + 1, three components per differentiated
+  function), so the same kernels produce derivative integrals.  The
+  one-electron derivatives (`int1e_ipovlp`, `ipkin`, `ipnuc`, `iprinv`) come
+  from the same expansion.
+* **Two-electron term from the energy, not from matrices.**  pyscf builds
+  `sum_kl (nabla i j|kl) D_lk` and `sum_jk (nabla i j|kl) D_jk` as
+  (3, nao, nao) matrices, which can only use the 4-fold symmetry of
+  `(nabla i j|kl)`.  `mojoscf.grad` differentiates
+  `E2 = 1/2 sum (ij|kl) G_ijkl` instead (`integrals.grad2e`, with
+  `G = D_ij D_kl - (D_ik D_jl + D_il D_jk)/4` for RHF and the spin-resolved
+  form for UHF): every unique quartet a >= b, c >= d, ab >= cd is evaluated
+  once with its eight permutations folded into a weight, as two kernel calls
+  (a six-component (nabla a, nabla b) bra against the plain ket, the ket's
+  nabla c against the plain bra), the derivative on d follows from
+  translational invariance, and each block is contracted with the block of G
+  as it is produced.  Quartets with
+  `max(q'_ab q_cd, q_ab q'_cd) max|G| < 1e-14` are skipped (q' the Schwarz
+  bound of the derivative pair).  This is 1.6 to 2.2x faster than the
+  J/K-matrix formulation in the same engine, which is still provided
+  (`get_jk_ip1`, `Gradients.get_jk`) for code that asks for the matrices.
+  Contracting G into the half-transformed Hermite intermediate, so that the
+  six derivative components share one outer transform, was tried as well:
+  for benzene / cc-pVDZ its integral kernels alone took 0.58 s against
+  0.70 s for this whole contraction, leaving no room for a gain.  It fixes
+  the derivative pair as the outer one, so the kernel can no longer put the
+  pair with more primitives on the inner, vectorised side.
+* **Same assembly as pyscf.**  The one-electron and overlap terms
+  (`hcore_generator`, `make_rdm1e`) are put together exactly as in
+  `pyscf.grad.rhf.grad_elec`; scanners, `atmlst`, TDHF gradients on top of
+  a Mojo SCF and pyscf code calling `get_jk` (also with the non-symmetric
+  densities of TDHF, which go to pyscf) keep working.  Density-fitted, X2C
+  and ECP objects and range-separated operators use pyscf's gradient code.
+
+Timings (`benchmarks/bench_grad.py`, 4 cores of a 2.1 GHz Xeon; the same
+converged pyscf SCF in both processes, only the gradient timed; "2e" is the
+two-electron term alone, `get_veff` for pyscf and `grad_2e` for mojoscf):
+
+| system                         | nao | pyscf [s] | (2e) | mojoscf [s] | (2e) | speedup | max \|dg\| |
+|--------------------------------|----:|----------:|-----:|------------:|-----:|--------:|----------:|
+| H2O / cc-pVTZ                  |  58 |      0.47 | 0.37 |        0.05 | 0.04 |   9.88x |   5.2e-14 |
+| benzene / cc-pVDZ              | 114 |      4.37 | 3.58 |        0.74 | 0.65 |   5.90x |   6.7e-13 |
+| benzene cation / cc-pVDZ (UHF) | 114 |      3.89 | 4.00 |        0.76 | 0.73 |   5.09x |   1.6e-11 |
+| C8H18 / cc-pVDZ                | 202 |     17.55 | 17.31 |       3.82 | 3.27 |   4.59x |   8.9e-12 |
+| (H2O)5 / aug-cc-pVDZ           | 205 |     14.00 | 14.20 |       3.67 | 3.73 |   3.81x |   5.4e-12 |
+
+Each process converges its own SCF, so `max |dg|` (Eh/Bohr) includes the
+SCF convergence (1e-11 Eh); on the same SCF object the gradients agree to
+about 1e-13 (`tests/test_grad.py`).
 
 ## Installation
 
@@ -339,6 +406,11 @@ eri = integrals.int2e_s8(mol)                   # == mol.intor("int2e", aosym="s
 cderi = integrals.cholesky_eri(mol, "cc-pvdz-jkfit")   # == pyscf.df.incore.cholesky_eri
 mf = integrals.attach(mojoscf.RHF(mol))         # hcore, overlap and ERIs from Mojo
 mf.kernel()
+
+# Nuclear gradients with derivative integrals from the Mojo engine
+mf = mojoscf.RHF(mol).run()
+g = mf.nuc_grad_method().kernel()               # mojoscf.grad.Gradients, == pyscf's to ~1e-13
+g = mojoscf.grad.Gradients(scf.RHF(mol).run()).kernel()   # also for pyscf objects
 
 # Use the individual kernels
 from mojoscf import kernels
@@ -391,6 +463,7 @@ but slow for more than a few dozen orbitals.
 | J/K, direct SCF (integrals every cycle)     | C (libcint + `libcvhf`)   | Mojo (`_mojo/directjk.mojo`): Mojo integrals, libcvhf's screening, incremental build |
 | two-electron integrals (3-index DF tensor, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
 | one-electron integrals (`get_hcore`, `get_ovlp`) | C (libcint)          | unchanged (`attach(mf)` uses the Mojo engine) |
+| nuclear gradients (`nuc_grad_method().kernel()`) | C (libcint derivative integrals, `libcvhf` J/K) + NumPy | Mojo derivative integrals (`_mojo/directjk.mojo` `grad2e_core`, `int1e_ip_core`), terms assembled in NumPy as in pyscf |
 
 Source layout:
 
@@ -403,16 +476,17 @@ mojoscf/
   _mojo/diis.mojo      pyscf-compatible CDIIS bookkeeping and extrapolation
   _mojo/driver.mojo    the RHF/UHF SCF loop (port of pyscf.scf.hf.kernel) with native J/K modes
   _mojo/integrals.mojo Gaussian integral engine (Boys function, Hermite recursions, S/T/V, ERIs, 3c2e/2c2e)
-  _mojo/directjk.mojo  integral-direct J/K (screening, 8-fold digestion) for direct SCF
+  _mojo/directjk.mojo  integral-direct J/K (screening, 8-fold digestion) for direct SCF; derivative J/K and 2e gradient
   _mojo/__init__.mojo  Python bindings (module mojoscf._mojoscf)
   _backend.py          build/load the extension, discover BLAS/LAPACK
   kernels.py           NumPy-facing wrappers
   integrals.py         pyscf-compatible integral functions and attach()
   diis.py              CDIIS drop-in class
   scf.py               RHF/UHF classes, kernel(), accelerate()
+  grad.py              RHF/UHF nuclear gradient classes (nuc_grad_method)
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
-tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint
-benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py
+tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
+benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py
 tools/gen_eri_kernel.py  generates the register-blocked ERI kernel in _mojo/integrals.mojo
 ```
 
@@ -448,8 +522,12 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernel in _mojo/inte
 * The integral engine handles contracted Gaussians up to l = 8 (spherical or
   Cartesian), point nuclei and no effective core potentials; it provides the
   overlap, kinetic, nuclear-attraction, four-index and 3-/2-centre Coulomb
-  integrals only (no derivatives, multipoles or range-separated operators).
+  integrals and the first derivatives needed for HF gradients (no second
+  derivatives, multipoles or range-separated operators).
   `unsupported_reason(mol)` says why a molecule is rejected.
+* Nuclear gradients are native for RHF and UHF with exact (non-DF)
+  two-electron integrals; density-fitted gradients run pyscf's `df.grad`
+  code (with the SCF still in Mojo).
 * The first call in a process starts the Mojo runtime and loads BLAS
   (about 50 ms); time a second run when benchmarking tiny systems.
 * Only the LP64 (32-bit integer) BLAS/LAPACK interface is supported.
