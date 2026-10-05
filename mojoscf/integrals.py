@@ -309,3 +309,65 @@ def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13):
     vj = vj.reshape(shape) if with_j else None
     vk = vk.reshape(shape) if with_k else None
     return vj, vk
+
+
+def _int1e_ip(mol, centers, charges, want_st):
+    tables = basis_tables(mol)
+    nao = mol.nao_nr()
+    s = np.zeros((3, nao, nao))
+    t = np.zeros((3, nao, nao))
+    v = np.zeros((3, nao, nao))
+    centers = np.ascontiguousarray(centers, dtype=np.float64).reshape(-1, 3)
+    charges = np.ascontiguousarray(charges, dtype=np.float64).reshape(-1)
+    get_extension().int1e_ip(tables, _boys_table(), centers, charges, bool(want_st), s, t, v)
+    return s, t, v
+
+
+def int1e_ip(mol):
+    """``(ipovlp, ipkin, ipnuc)``: pyscf's ``int1e_ipovlp``, ``int1e_ipkin``, ``int1e_ipnuc`` (each (3, nao, nao))."""
+    return _int1e_ip(mol, mol.atom_coords(), -mol.atom_charges().astype(np.float64), True)
+
+
+def int1e_iprinv(mol, atom_id=None, origin=None):
+    """pyscf's ``int1e_iprinv``: <nabla i| 1/|r - R| |j> with R the nucleus ``atom_id`` (or ``origin``)."""
+    if origin is None:
+        origin = mol.atom_coord(atom_id)
+    return _int1e_ip(mol, np.asarray(origin, dtype=np.float64), np.ones(1), False)[2]
+
+
+def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14):
+    """Gradient J/K exactly as ``pyscf.grad.rhf.get_jk``: ``(-sum (nabla i j|kl) D_lk, -sum (nabla i j|kl) D_jk)``.
+
+    ``dm`` is (nao, nao) or (n, nao, nao) and must be symmetric; the results
+    have shape (3, nao, nao) or (n, 3, nao, nao).
+    """
+    dm = np.asarray(dm, dtype=np.float64)
+    single = dm.ndim == 2
+    dms = np.ascontiguousarray(dm.reshape(-1, dm.shape[-2], dm.shape[-1]))
+    nset, nao = dms.shape[0], dms.shape[1]
+    vj = np.zeros((nset, 3, nao, nao))
+    vk = np.zeros((nset, 3, nao, nao))
+    get_extension().jk_ip1(basis_tables(mol), _boys_table(), dms, vj, vk, bool(with_j), bool(with_k), float(tol))
+    vj, vk = -vj, -vk
+    if single:
+        vj, vk = vj[0], vk[0]
+    return (vj if with_j else None), (vk if with_k else None)
+
+
+def grad2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14):
+    """Two-electron part of the nuclear gradient at fixed densities, shape (natm, 3).
+
+    The derivative of ``E2 = 1/2 sum_ijkl (ij|kl) G_ijkl`` with respect to the
+    nuclear coordinates, where
+    ``G_ijkl = j_factor Dj_ij Dj_kl - k_factor/2 sum_s (Dk_s,ik Dk_s,jl + Dk_s,il Dk_s,jk)``
+    for the symmetric density ``dm_j`` and the symmetric densities
+    ``dm_k`` ((nao, nao) or (n, nao, nao)).  RHF: ``grad2e(mol, D, D, 1, 0.5)``;
+    UHF: ``grad2e(mol, Da + Db, (Da, Db))``.  The derivative integrals are
+    contracted with ``G`` as they are evaluated (8-fold symmetry, nothing stored).
+    """
+    nao = mol.nao_nr()
+    dmj = np.ascontiguousarray(dm_j, dtype=np.float64).reshape(nao, nao)
+    dmk = np.ascontiguousarray(dm_k, dtype=np.float64).reshape(-1, nao, nao)
+    de = np.zeros((mol.natm, 3))
+    get_extension().grad2e(basis_tables(mol), _boys_table(), dmj, dmk, float(j_factor), float(k_factor), float(tol), de)
+    return de

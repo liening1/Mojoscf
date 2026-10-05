@@ -347,6 +347,18 @@ def _fallback_reason(mf):
     return None
 
 
+def _plain_grad_method(mf, mixin, default) -> bool:
+    """True if the ``nuc_grad_method`` ``mf`` inherits past ``mixin`` is pyscf's plain one.
+
+    Decorations that bring their own gradients (density fitting, ...) keep them.
+    """
+    mro = type(mf).__mro__
+    for cls in mro[mro.index(mixin) + 1:]:
+        if "nuc_grad_method" in cls.__dict__:
+            return cls.__dict__["nuc_grad_method"] is default
+    return False
+
+
 class _MojoGlueMixin:
     """Pieces shared by the RHF and UHF mixins: driver entry point and eigensolver."""
 
@@ -450,6 +462,14 @@ class _MojoRHFMixin(_MojoGlueMixin):
             return super().get_grad(mo_coeff, mo_occ, fock)
         return kernels.get_grad(mo_coeff, mo_occ, fock)
 
+    def nuc_grad_method(self):
+        """Nuclear gradients with Mojo derivative integrals (:class:`mojoscf.grad.Gradients`)."""
+        if not _plain_grad_method(self, _MojoRHFMixin, pyscf_hf.RHF.nuc_grad_method):
+            return super().nuc_grad_method()
+        from .grad import Gradients
+
+        return Gradients(self)
+
 
 class _MojoUHFMixin(_MojoGlueMixin):
     """Mojo implementations of the UHF glue; mixed in front of a pyscf UHF class.
@@ -504,6 +524,14 @@ class _MojoUHFMixin(_MojoGlueMixin):
         ga = kernels.get_grad(mo_coeff[0], mo_occ[0], fock[0], 1.0)
         gb = kernels.get_grad(mo_coeff[1], mo_occ[1], fock[1], 1.0)
         return np.hstack((ga, gb))
+
+    def nuc_grad_method(self):
+        """Nuclear gradients with Mojo derivative integrals (:class:`mojoscf.grad.UGradients`)."""
+        if not _plain_grad_method(self, _MojoUHFMixin, pyscf_uhf.UHF.nuc_grad_method):
+            return super().nuc_grad_method()
+        from .grad import UGradients
+
+        return UGradients(self)
 
 
 class RHF(_MojoRHFMixin, pyscf_hf.RHF):

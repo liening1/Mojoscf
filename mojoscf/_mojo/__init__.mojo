@@ -26,8 +26,8 @@ from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
-from _mojo.integrals import Basis, BoysTable, int1e_core, eri_s8_core, int3c2e_core, int2c2e_core
-from _mojo.directjk import DirectJK, basis_from_py
+from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, eri_s8_core, int3c2e_core, int2c2e_core
+from _mojo.directjk import DirectJK, basis_from_py, grad2e_core, jk_ip1_core
 
 comptime VERSION = "0.6.0"
 
@@ -63,6 +63,9 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_int2e_s8]("int2e_s8", docstring="int2e_s8(basis, eri_out, schwarz_tol, table): 8-fold packed electron repulsion integrals.")
         m.def_function[py_int3c2e]("int3c2e", docstring="int3c2e(basis, auxbasis, out, table): (ab|P) as a (naux, npair) array.")
         m.def_function[py_int2c2e]("int2c2e", docstring="int2c2e(auxbasis, out, table): (P|Q) as a dense (naux, naux) array.")
+        m.def_function[py_int1e_ip]("int1e_ip", docstring="int1e_ip(basis, table, centers, charges, want_st, s_out, t_out, v_out): <nabla i|j>, <nabla i|T|j>, <nabla i|sum q/r|j>.")
+        m.def_function[py_grad2e]("grad2e", docstring="grad2e(basis, table, dmj, dmk, jfac, kfac, tol, de): two-electron energy gradient (natm, 3).")
+        m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk.")
         m.def_function[py_direct_jk]("direct_jk", docstring="direct_jk(basis, table, dms, vj, vk, with_j, with_k, tol): integral-direct J/K of symmetric densities.")
         return m.finalize()
     except e:
@@ -448,4 +451,41 @@ def py_direct_jk(
             1 if wk else 0, pd.unsafe_offset(s * n2), pk.unsafe_offset(s * n2), t,
         )
     _ = jk^
+    return PythonObject(None)
+
+
+def py_int1e_ip(
+    basis: PythonObject, table: PythonObject, centers: PythonObject, charges: PythonObject, want_st: PythonObject,
+    s_out: PythonObject, t_out: PythonObject, v_out: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var boys = _boys(table)
+    int1e_ip_core(
+        bs, boys, Int(py=charges.shape[0]), f64ptr(centers), f64ptr(charges), Bool(py=want_st),
+        f64ptr(s_out), f64ptr(t_out), f64ptr(v_out),
+    )
+    _ = bs^
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_jk_ip1(
+    basis: PythonObject, table: PythonObject, dms: PythonObject, vj: PythonObject, vk: PythonObject,
+    with_j: PythonObject, with_k: PythonObject, tol: PythonObject,
+) raises -> PythonObject:
+    jk_ip1_core(
+        _basis(basis), _boys(table), Int(py=dms.shape[0]), f64ptr(dms), f64ptr(vj), f64ptr(vk),
+        Bool(py=with_j), Bool(py=with_k), Float64(py=tol),
+    )
+    return PythonObject(None)
+
+
+def py_grad2e(
+    basis: PythonObject, table: PythonObject, dmj: PythonObject, dmk: PythonObject, jfac: PythonObject,
+    kfac: PythonObject, tol: PythonObject, de: PythonObject,
+) raises -> PythonObject:
+    grad2e_core(
+        _basis(basis), _boys(table), f64ptr(dmj), Int(py=dmk.shape[0]), f64ptr(dmk), Float64(py=jfac),
+        Float64(py=kfac), Float64(py=tol), f64ptr(de),
+    )
     return PythonObject(None)

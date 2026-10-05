@@ -551,7 +551,8 @@ def shell_nfunc(bs: Basis, sh: Int) -> Int:
 
 
 def fill_pair(
-    ba: Basis, a: Int, bb: Basis, b: Int, ht: HermTable, prim: F64Ptr, npad: Int, e: F64Ptr, escr: F64Ptr, cscr: F64Ptr
+    ba: Basis, a: Int, bb: Basis, b: Int, ht: HermTable, prim: F64Ptr, npad: Int, e: F64Ptr, escr: F64Ptr, cscr: F64Ptr,
+    nderiv: Int = 0,
 ) -> Int:
     """Primitive data and coefficient-weighted Hermite matrices of the shell pair (a, b).
 
@@ -566,6 +567,13 @@ def fill_pair(
     ``b < 0`` is the dummy s partner (exponent 0, coefficient 1).  ``escr``
     and ``cscr`` are scratch for the 1D coefficients and the Cartesian
     matrix.  Returns the number of primitive pairs written.
+
+    With ``nderiv`` = 1 the pair stands for (nabla a) b: the Hermite degree is
+    la + lb + 1 and the functions are ``x ncomp + j`` for the three directions
+    x, using ``d/dx x^i e^{-a x^2} = i x^{i-1} e^{-a x^2} - 2a x^{i+1} e^{-a x^2}``.
+    With ``nderiv`` = 2 three more components follow, a (nabla b) (functions
+    ``(3 + x) ncomp + j``).  nabla is the derivative with respect to the
+    electron coordinate, minus the derivative with respect to the centre.
     """
     var la = ba.l[a]
     var lb = bb.l[b] if b >= 0 else 0
@@ -579,9 +587,13 @@ def fill_pair(
     var ta = ba.needs_transform(a)
     var tbb = b >= 0 and bb.needs_transform(b)
     var transform = ta or tbb
-    var ccomp = nca * ncarta * ncb * ncartb
-    var ncomp = nca * nfa * ncb * nfb
-    var nh = nherm(lab)
+    var deriv = nderiv > 0
+    var ndir = 3 * nderiv if deriv else 1
+    var ccomp0 = nca * ncarta * ncb * ncartb
+    var ncomp0 = nca * nfa * ncb * nfb
+    var ccomp = ndir * ccomp0
+    var ncomp = ndir * ncomp0
+    var nh = nherm(lab + 1 if deriv else lab)
     var stride = padded(ncomp)
     var cstride = ccomp if transform else stride
     var c2sa = list_ptr(ba.c2s).unsafe_offset(ba.c2s_off[la])
@@ -596,9 +608,11 @@ def fill_pair(
     var bz = bb.shell_coord(b, 2) if b >= 0 else az
     var rab2 = (ax - bx) * (ax - bx) + (ay - by) * (ay - by) + (az - bz) * (az - bz)
     var fac = ba.func_scale(a) * (bb.func_scale(b) if b >= 0 else 1.0)
-    var s = lab + 1
-    var lb1 = lb + 1
-    var esz = (la + 1) * lb1 * s
+    var la_e = la + 1 if deriv else la
+    var lb_e = lb + 1 if nderiv == 2 else lb
+    var s = la_e + lb_e + 1
+    var lb1 = lb_e + 1
+    var esz = (la_e + 1) * lb1 * s
     var offa = ba.cart_off[la]
     var offb = bb.cart_off[lb] if b >= 0 else 0
     var side = ht.side
@@ -619,9 +633,9 @@ def fill_pair(
             prim[unsafe_offset=2 * npad + kk] = px
             prim[unsafe_offset=3 * npad + kk] = py
             prim[unsafe_offset=4 * npad + kk] = pz
-            hermite_e(la, lb, p, px - ax, px - bx, exp(-mu * (ax - bx) * (ax - bx)), escr)
-            hermite_e(la, lb, p, py - ay, py - by, exp(-mu * (ay - by) * (ay - by)), escr.unsafe_offset(esz))
-            hermite_e(la, lb, p, pz - az, pz - bz, exp(-mu * (az - bz) * (az - bz)), escr.unsafe_offset(2 * esz))
+            hermite_e(la_e, lb_e, p, px - ax, px - bx, exp(-mu * (ax - bx) * (ax - bx)), escr)
+            hermite_e(la_e, lb_e, p, py - ay, py - by, exp(-mu * (ay - by) * (ay - by)), escr.unsafe_offset(esz))
+            hermite_e(la_e, lb_e, p, pz - az, pz - bz, exp(-mu * (az - bz) * (az - bz)), escr.unsafe_offset(2 * esz))
             var blk = e.unsafe_offset(kk * nh * stride)
             var cart = cscr if transform else blk
             vfill(cart, nh * cstride, 0.0)
@@ -637,41 +651,81 @@ def fill_pair(
                         j = bb.cx[offb + icb]
                         l = bb.cy[offb + icb]
                         n = bb.cz[offb + icb]
-                    var ex = (i * lb1 + j) * s
-                    var ey = esz + (k * lb1 + l) * s
-                    var ez = 2 * esz + (m * lb1 + n) * s
-                    for t in range(i + j + 1):
-                        var vx = escr[unsafe_offset=ex + t]
-                        for u in range(k + l + 1):
-                            var vxy = vx * escr[unsafe_offset=ey + u]
-                            for v in range(m + n + 1):
-                                var val = vxy * escr[unsafe_offset=ez + v]
-                                var row = cart.unsafe_offset(ht.idx[(t * side + u) * side + v] * cstride)
-                                for ca in range(nca):
-                                    var cfa = ba.env[ba.pcoef[a] + ca * npa + ia] * fac * val
-                                    for cb in range(ncb):
-                                        var cfb = bb.env[bb.pcoef[b] + cb * npb + ib] if b >= 0 else 1.0
-                                        row[unsafe_offset=((ca * ncarta + ica) * ncb + cb) * ncartb + icb] = cfa * cfb
+                    for x in range(ndir):
+                        for term in range(2 if deriv else 1):
+                            var ii = i
+                            var kk2 = k
+                            var mm = m
+                            var jj = j
+                            var ll = l
+                            var nn = n
+                            var wterm = 1.0
+                            if deriv:
+                                var shift = -1 if term == 0 else 1
+                                var dirn = x % 3
+                                if x < 3:
+                                    # nabla on a
+                                    if term == 0:
+                                        wterm = Float64(i if dirn == 0 else (k if dirn == 1 else m))
+                                    else:
+                                        wterm = -2.0 * ea
+                                    if dirn == 0:
+                                        ii += shift
+                                    elif dirn == 1:
+                                        kk2 += shift
+                                    else:
+                                        mm += shift
+                                else:
+                                    # nabla on b
+                                    if term == 0:
+                                        wterm = Float64(j if dirn == 0 else (l if dirn == 1 else n))
+                                    else:
+                                        wterm = -2.0 * eb
+                                    if dirn == 0:
+                                        jj += shift
+                                    elif dirn == 1:
+                                        ll += shift
+                                    else:
+                                        nn += shift
+                                if wterm == 0.0:
+                                    continue
+                            var ex = (ii * lb1 + jj) * s
+                            var ey = esz + (kk2 * lb1 + ll) * s
+                            var ez = 2 * esz + (mm * lb1 + nn) * s
+                            var colx = x * ccomp0
+                            for t in range(ii + jj + 1):
+                                var vx = escr[unsafe_offset=ex + t] * wterm
+                                for u in range(kk2 + ll + 1):
+                                    var vxy = vx * escr[unsafe_offset=ey + u]
+                                    for v in range(mm + nn + 1):
+                                        var val = vxy * escr[unsafe_offset=ez + v]
+                                        var row = cart.unsafe_offset(ht.idx[(t * side + u) * side + v] * cstride + colx)
+                                        for ca in range(nca):
+                                            var cfa = ba.env[ba.pcoef[a] + ca * npa + ia] * fac * val
+                                            for cb in range(ncb):
+                                                var cfb = bb.env[bb.pcoef[b] + cb * npb + ib] if b >= 0 else 1.0
+                                                row[unsafe_offset=((ca * ncarta + ica) * ncb + cb) * ncartb + icb] += cfa * cfb
             if transform:
-                # columns (ca, ia, cb, ib) -> (ca, fa, cb, fb) with the cart2sph matrices
+                # columns (x, ca, ia, cb, ib) -> (x, ca, fa, cb, fb) with the cart2sph matrices
                 vfill(blk, nh * stride, 0.0)
                 for h in range(nh):
-                    var src = cart.unsafe_offset(h * ccomp)
-                    var dst = blk.unsafe_offset(h * stride)
-                    for ca in range(nca):
-                        for fa in range(nfa):
-                            for cb in range(ncb):
-                                for fb in range(nfb):
-                                    var acc = 0.0
-                                    for ica in range(ncarta):
-                                        var wa = c2sa[unsafe_offset=ica * nfa + fa] if ta else (1.0 if ica == fa else 0.0)
-                                        if wa == 0.0:
-                                            continue
-                                        var srow = src.unsafe_offset(((ca * ncarta + ica) * ncb + cb) * ncartb)
-                                        for icb in range(ncartb):
-                                            var wb = c2sb[unsafe_offset=icb * nfb + fb] if tbb else (1.0 if icb == fb else 0.0)
-                                            acc += wa * wb * srow[unsafe_offset=icb]
-                                    dst[unsafe_offset=((ca * nfa + fa) * ncb + cb) * nfb + fb] = acc
+                    for x in range(ndir):
+                        var src = cart.unsafe_offset(h * ccomp + x * ccomp0)
+                        var dst = blk.unsafe_offset(h * stride + x * ncomp0)
+                        for ca in range(nca):
+                            for fa in range(nfa):
+                                for cb in range(ncb):
+                                    for fb in range(nfb):
+                                        var acc = 0.0
+                                        for ica in range(ncarta):
+                                            var wa = c2sa[unsafe_offset=ica * nfa + fa] if ta else (1.0 if ica == fa else 0.0)
+                                            if wa == 0.0:
+                                                continue
+                                            var srow = src.unsafe_offset(((ca * ncarta + ica) * ncb + cb) * ncartb)
+                                            for icb in range(ncartb):
+                                                var wb = c2sb[unsafe_offset=icb * nfb + fb] if tbb else (1.0 if icb == fb else 0.0)
+                                                acc += wa * wb * srow[unsafe_offset=icb]
+                                        dst[unsafe_offset=((ca * nfa + fa) * ncb + cb) * nfb + fb] = acc
             kk += 1
     return kk
 
@@ -694,7 +748,10 @@ struct PairTable(Movable):
     var maxcomp: Int
     var maxlab: Int
 
-    def __init__(out self, ba: Basis, bb: Basis, sa: List[Int], sb: List[Int], ht: HermTable):
+    def __init__(out self, ba: Basis, bb: Basis, sa: List[Int], sb: List[Int], ht: HermTable, nderiv: Int = 0):
+        """Pairs (sa[i], sb[i]); ``nderiv`` as in ``fill_pair`` (then ``ht`` must reach la + lb + 1)."""
+        var deriv = nderiv > 0
+        var ndir = 3 * nderiv if deriv else 1
         var n = len(sa)
         var info = List[Int](length=max(n, 1) * NINFO, fill=0)
         var maxcomp = 1
@@ -706,21 +763,22 @@ struct PairTable(Movable):
             var b = sb[i]
             var la = ba.l[a]
             var lb = bb.l[b] if b >= 0 else 0
-            var ncomp = shell_nfunc(ba, a) * shell_nfunc(bb, b)
+            var lab = la + lb + (1 if deriv else 0)
+            var ncomp = ndir * shell_nfunc(ba, a) * shell_nfunc(bb, b)
             var np = pair_nprim(ba, a, bb, b)
             var stride = padded(ncomp)
             info[i * NINFO + I_A] = a
             info[i * NINFO + I_B] = b
-            info[i * NINFO + I_LAB] = la + lb
+            info[i * NINFO + I_LAB] = lab
             info[i * NINFO + I_NCOMP] = ncomp
             info[i * NINFO + I_STRIDE] = stride
             info[i * NINFO + I_NP] = np
             info[i * NINFO + I_POFF] = ptot
             info[i * NINFO + I_EOFF] = etot
             ptot += PFIELDS * padded(np)
-            etot += np * nherm(la + lb) * stride
+            etot += np * nherm(lab) * stride
             maxcomp = max(maxcomp, ncomp)
-            maxlab = max(maxlab, la + lb)
+            maxlab = max(maxlab, lab)
         var prim = List[Float64](length=max(ptot, 1) + W, fill=0.0)
         var e = List[Float64](length=max(etot, 1) + W, fill=0.0)
         var pbase = aligned_addr(prim)
@@ -734,10 +792,10 @@ struct PairTable(Movable):
         var nworkers = max(1, min(parallelism_level(), n // 16))
 
         var nctr_max = max(ba.nctr_max, bb.nctr_max)
-        var csize = nherm(2 * lmax) * (nctr_max * ncart(lmax)) * (nctr_max * ncart(lmax))
+        var csize = ndir * nherm(2 * lmax + 1) * (nctr_max * ncart(lmax)) * (nctr_max * ncart(lmax))
 
-        def work(w: Int) {imm ba, imm bb, imm ht, imm pp, imm pe, imm pinfo, imm pcount, imm n, imm lmax, imm csize}:
-            var escr = List[Float64](length=3 * (lmax + 1) * (lmax + 1) * (2 * lmax + 1), fill=0.0)
+        def work(w: Int) {imm ba, imm bb, imm ht, imm pp, imm pe, imm pinfo, imm pcount, imm n, imm lmax, imm csize, imm nderiv}:
+            var escr = List[Float64](length=3 * (lmax + 2) * (lmax + 2) * (2 * lmax + 3), fill=0.0)
             var cscr = List[Float64](length=csize, fill=0.0)
             var pescr = list_ptr(escr)
             var pcscr = list_ptr(cscr)
@@ -752,7 +810,7 @@ struct PairTable(Movable):
                     _ = fill_pair(
                         ba, info_i[unsafe_offset=I_A], bb, info_i[unsafe_offset=I_B], ht,
                         pp.unsafe_offset(info_i[unsafe_offset=I_POFF]), padded(info_i[unsafe_offset=I_NP]),
-                        pe.unsafe_offset(info_i[unsafe_offset=I_EOFF]), pescr, pcscr,
+                        pe.unsafe_offset(info_i[unsafe_offset=I_EOFF]), pescr, pcscr, nderiv,
                     )
             _ = escr^
             _ = cscr^
@@ -2163,3 +2221,282 @@ def int1e_core(basis: Basis, boys: BoysTable, s_out: F64Ptr, t_out: F64Ptr, v_ou
     else:
         parallelize(work, nworkers)
     _ = counter^
+
+
+# --------------------------------------------------------------------------
+# First derivatives (nabla acting on the first function), for gradients
+# --------------------------------------------------------------------------
+
+
+def int1e_ip_core(
+    basis: Basis, boys: BoysTable, ncenter: Int, centers: F64Ptr, charges: F64Ptr,
+    want_st: Bool, s_out: F64Ptr, t_out: F64Ptr, v_out: F64Ptr,
+):
+    """<nabla i|j>, <nabla i|-1/2 nabla^2|j> and <nabla i|sum_c q_c / |r - R_c||j>, each (3, nao, nao).
+
+    These are pyscf's ``int1e_ipovlp``, ``int1e_ipkin`` and, with q_c = -Z_c at
+    the nuclei, ``int1e_ipnuc`` (with one centre of charge 1, ``int1e_iprinv``).
+    The derivative of a Cartesian primitive is
+    ``d/dx x^i e^{-a x^2} = i x^{i-1} e^{-a x^2} - 2a x^{i+1} e^{-a x^2}``, so
+    every 1D factor is a combination of the factors with i - 1 and i + 1.
+    With ``want_st`` False only the potential is computed.
+    """
+    var nbas = basis.nbas
+    var nao = basis.nao
+    var n2 = nao * nao
+    var lmax = basis.lmax
+    var npairs = nbas * nbas
+    var ncm = basis.nctr_max * ncart(lmax)
+    var nworkers = min(parallelism_level(), max(1, npairs // 4))
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+
+    def work(w: Int) {imm basis, imm boys, imm ncenter, imm centers, imm charges, imm want_st, imm s_out, imm t_out, imm v_out, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm lmax, imm ncm}:
+        var s3 = lmax + 1 + lmax + 2 + 1      # Hermite range of E with la + 1, lb + 2
+        var e = List[Float64](length=3 * (lmax + 2) * (lmax + 3) * s3, fill=0.0)
+        var pe = list_ptr(e)
+        var lr = 2 * lmax + 2
+        var r0 = List[Float64](length=lr * lr * lr, fill=0.0)
+        var r1 = List[Float64](length=lr * lr * lr, fill=0.0)
+        var pr0 = list_ptr(r0)
+        var pr1 = list_ptr(r1)
+        var fb = List[Float64](length=lr + BoysTable.NTERMS, fill=0.0)
+        var pfb = list_ptr(fb)
+        var nc2 = ncart(lmax) * ncart(lmax)
+        var prim = List[Float64](length=9 * nc2, fill=0.0)      # [which][x][ca cb] for one primitive pair
+        var blk = List[Float64](length=9 * ncm * ncm, fill=0.0)  # contracted, [which][x][ca ia][cb ib]
+        var tmp = List[Float64](length=2 * ncm * ncm, fill=0.0)
+        var pprim = list_ptr(prim)
+        var pblk = list_ptr(blk)
+        var ptmp = list_ptr(tmp)
+        while True:
+            var task = Int(pcount[].fetch_add(1))
+            if task >= npairs:
+                break
+            var a = task // nbas
+            var b = task % nbas
+            var la = basis.l[a]
+            var lb = basis.l[b]
+            var lab = la + lb
+            var nca = basis.nctr[a]
+            var ncb = basis.nctr[b]
+            var ncarta = ncart(la)
+            var ncartb = ncart(lb)
+            var nblk = ncarta * ncartb
+            var ncab = nca * ncarta * ncb * ncartb
+            var npa = basis.nprim[a]
+            var npb = basis.nprim[b]
+            var ax = basis.shell_coord(a, 0)
+            var ay = basis.shell_coord(a, 1)
+            var az = basis.shell_coord(a, 2)
+            var bx = basis.shell_coord(b, 0)
+            var by = basis.shell_coord(b, 1)
+            var bz = basis.shell_coord(b, 2)
+            var rab2 = (ax - bx) * (ax - bx) + (ay - by) * (ay - by) + (az - bz) * (az - bz)
+            var fac = basis.func_scale(a) * basis.func_scale(b)
+            var offa = basis.cart_off[la]
+            var offb = basis.cart_off[lb]
+            var la1 = la + 1
+            var lb3 = lb + 3
+            var s = la1 + lb + 3                 # Hermite indices t <= (la + 1) + (lb + 2)
+            var esz = (la1 + 1) * lb3 * s
+            var lv = lab + 1                     # Hermite degree of the potential terms
+            var c1 = lv + 1
+            var c2 = c1 * c1
+            vfill(pblk, 9 * ncab, 0.0)
+            for ia in range(npa):
+                var ea = basis.env[basis.pexp[a] + ia]
+                for ib in range(npb):
+                    var eb = basis.env[basis.pexp[b] + ib]
+                    var p = ea + eb
+                    var mu = ea * eb / p
+                    if mu * rab2 > EXP_CUTOFF:
+                        continue
+                    var px = (ea * ax + eb * bx) / p
+                    var py = (ea * ay + eb * by) / p
+                    var pz = (ea * az + eb * bz) / p
+                    hermite_e(la1, lb + 2, p, px - ax, px - bx, exp(-mu * (ax - bx) * (ax - bx)), pe)
+                    hermite_e(la1, lb + 2, p, py - ay, py - by, exp(-mu * (ay - by) * (ay - by)), pe.unsafe_offset(esz))
+                    hermite_e(la1, lb + 2, p, pz - az, pz - bz, exp(-mu * (az - bz) * (az - bz)), pe.unsafe_offset(2 * esz))
+                    var spp = sqrt(PI / p)
+                    vfill(pprim, 9 * nblk, 0.0)
+                    if want_st:
+                        for ca in range(ncarta):
+                            var ijk = InlineIdx(basis.cx[offa + ca], basis.cy[offa + ca], basis.cz[offa + ca])
+                            for cb in range(ncartb):
+                                var lmn = InlineIdx(basis.cx[offb + cb], basis.cy[offb + cb], basis.cz[offb + cb])
+                                var sv = InlineVec()
+                                var tv = InlineVec()
+                                var dv = InlineVec()
+                                var dtv = InlineVec()
+                                for d in range(3):
+                                    var i = ijk.get(d)
+                                    var j = lmn.get(d)
+                                    var eoff = d * esz
+                                    sv.set(d, _s1(pe, eoff, lb3, s, i, j, spp))
+                                    tv.set(d, _t1(pe, eoff, lb3, s, i, j, spp, eb))
+                                    var dd = -2.0 * ea * _s1(pe, eoff, lb3, s, i + 1, j, spp)
+                                    var dt = -2.0 * ea * _t1(pe, eoff, lb3, s, i + 1, j, spp, eb)
+                                    if i > 0:
+                                        dd += Float64(i) * _s1(pe, eoff, lb3, s, i - 1, j, spp)
+                                        dt += Float64(i) * _t1(pe, eoff, lb3, s, i - 1, j, spp, eb)
+                                    dv.set(d, dd)
+                                    dtv.set(d, dt)
+                                var col = ca * ncartb + cb
+                                for x in range(3):
+                                    var y = (x + 1) % 3
+                                    var z = (x + 2) % 3
+                                    pprim[unsafe_offset=x * nblk + col] = dv.get(x) * sv.get(y) * sv.get(z)
+                                    pprim[unsafe_offset=(3 + x) * nblk + col] = (
+                                        dtv.get(x) * sv.get(y) * sv.get(z) + dv.get(x) * tv.get(y) * sv.get(z)
+                                        + dv.get(x) * sv.get(y) * tv.get(z)
+                                    )
+                    # potential: sum_c q_c (2 pi / p) sum_tuv DE_tuv R_tuv(p, P - C)
+                    var vpref = 2.0 * PI / p
+                    for cidx in range(ncenter):
+                        var q = charges[unsafe_offset=cidx]
+                        if q == 0.0:
+                            continue
+                        hermite_r(
+                            lv, p, px - centers[unsafe_offset=3 * cidx], py - centers[unsafe_offset=3 * cidx + 1],
+                            pz - centers[unsafe_offset=3 * cidx + 2], boys, pfb, pr0, pr1, vpref * q,
+                        )
+                        for ca in range(ncarta):
+                            var ijk = InlineIdx(basis.cx[offa + ca], basis.cy[offa + ca], basis.cz[offa + ca])
+                            for cb in range(ncartb):
+                                var lmn = InlineIdx(basis.cx[offb + cb], basis.cy[offb + cb], basis.cz[offb + cb])
+                                var col = ca * ncartb + cb
+                                for x in range(3):
+                                    # derivative in direction x: index i of dimension x shifted by -1 and +1
+                                    var acc = 0.0
+                                    for shift in range(2):
+                                        var w: Float64
+                                        var di: Int
+                                        if shift == 0:
+                                            di = -1
+                                            w = Float64(ijk.get(x))
+                                        else:
+                                            di = 1
+                                            w = -2.0 * ea
+                                        if w == 0.0:
+                                            continue
+                                        var ii = ijk.get(0) + (di if x == 0 else 0)
+                                        var kk = ijk.get(1) + (di if x == 1 else 0)
+                                        var mm = ijk.get(2) + (di if x == 2 else 0)
+                                        var jj = lmn.get(0)
+                                        var ll = lmn.get(1)
+                                        var nn = lmn.get(2)
+                                        var ex = (ii * lb3 + jj) * s
+                                        var ey = esz + (kk * lb3 + ll) * s
+                                        var ez = 2 * esz + (mm * lb3 + nn) * s
+                                        var part = 0.0
+                                        for t in range(ii + jj + 1):
+                                            var vx = pe[unsafe_offset=ex + t]
+                                            for u in range(kk + ll + 1):
+                                                var vxy = vx * pe[unsafe_offset=ey + u]
+                                                var rr = pr0.unsafe_offset(t * c2 + u * c1)
+                                                for v in range(mm + nn + 1):
+                                                    part += vxy * pe[unsafe_offset=ez + v] * rr[unsafe_offset=v]
+                                        acc += w * part
+                                    pprim[unsafe_offset=(6 + x) * nblk + col] += acc
+                    # contraction coefficients
+                    for ca in range(nca):
+                        var cfa = basis.env[basis.pcoef[a] + ca * npa + ia] * fac
+                        for cb in range(ncb):
+                            var wgt = cfa * basis.env[basis.pcoef[b] + cb * npb + ib]
+                            for which in range(9):
+                                var dst = pblk.unsafe_offset(which * ncab)
+                                var src = pprim.unsafe_offset(which * nblk)
+                                for ia2 in range(ncarta):
+                                    vaxpy(
+                                        dst.unsafe_offset(((ca * ncarta + ia2) * ncb + cb) * ncartb), ncartb, wgt,
+                                        src.unsafe_offset(ia2 * ncartb),
+                                    )
+            # spherical transform and store
+            var i0 = basis.ao_loc[a]
+            var j0 = basis.ao_loc[b]
+            var na = basis.ao_loc[a + 1] - i0
+            var nb = basis.ao_loc[b + 1] - j0
+            for which in range(9):
+                if which < 6 and not want_st:
+                    continue
+                var mat = s_out if which < 3 else (t_out if which < 6 else v_out)
+                var x = which % 3
+                var cur = pblk.unsafe_offset(which * ncab)
+                var oth = ptmp
+                var spare = ptmp.unsafe_offset(ncm * ncm)
+                var d1 = ncb * ncartb
+                var d0 = nca * ncarta
+                if basis.needs_transform(a):
+                    transform_axis(cur, oth, nca, ncarta, basis.nf[la], d1, list_ptr(basis.c2s).unsafe_offset(basis.c2s_off[la]))
+                    d0 = na
+                    cur = oth
+                    oth = spare
+                if basis.needs_transform(b):
+                    transform_axis(cur, oth, d0 * ncb, ncartb, basis.nf[lb], 1, list_ptr(basis.c2s).unsafe_offset(basis.c2s_off[lb]))
+                    cur = oth
+                for fa in range(na):
+                    for fbb in range(nb):
+                        mat[unsafe_offset=x * n2 + (i0 + fa) * nao + j0 + fbb] = cur[unsafe_offset=fa * nb + fbb]
+        _ = e^
+        _ = r0^
+        _ = r1^
+        _ = fb^
+        _ = prim^
+        _ = blk^
+        _ = tmp^
+
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    _ = counter^
+
+
+@fieldwise_init
+struct InlineIdx(Copyable, Movable):
+    var x: Int
+    var y: Int
+    var z: Int
+
+    def get(self, d: Int) -> Int:
+        return self.x if d == 0 else (self.y if d == 1 else self.z)
+
+
+struct InlineVec(Copyable, Movable):
+    var x: Float64
+    var y: Float64
+    var z: Float64
+
+    def __init__(out self):
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+
+    def get(self, d: Int) -> Float64:
+        return self.x if d == 0 else (self.y if d == 1 else self.z)
+
+    def set(mut self, d: Int, v: Float64):
+        if d == 0:
+            self.x = v
+        elif d == 1:
+            self.y = v
+        else:
+            self.z = v
+
+
+def _s1(e: F64Ptr, eoff: Int, lb3: Int, s: Int, i: Int, j: Int, spp: Float64) -> Float64:
+    """1D overlap factor E_0^{ij} sqrt(pi/p) (zero for negative indices)."""
+    if i < 0 or j < 0:
+        return 0.0
+    return e[unsafe_offset=eoff + (i * lb3 + j) * s] * spp
+
+
+def _t1(e: F64Ptr, eoff: Int, lb3: Int, s: Int, i: Int, j: Int, spp: Float64, b: Float64) -> Float64:
+    """1D kinetic factor <i| -1/2 d^2/dx^2 |j> (zero for negative indices)."""
+    if i < 0:
+        return 0.0
+    var t = -2.0 * b * b * _s1(e, eoff, lb3, s, i, j + 2, spp) + b * Float64(2 * j + 1) * _s1(e, eoff, lb3, s, i, j, spp)
+    if j >= 2:
+        t -= 0.5 * Float64(j * (j - 1)) * _s1(e, eoff, lb3, s, i, j - 2, spp)
+    return t
