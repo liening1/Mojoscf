@@ -35,7 +35,7 @@ from max.algorithm import parallelize
 from _mojo.linalg import F64Ptr, list_ptr, vfill, vaxpy
 from _mojo.integrals import (
     Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, I64Ptr, IntPtr, eri_quartet, eri_batch, schwarz_bounds,
-    shell_nfunc, batch_supported, int_ptr, BATCH_LANES, I_A, I_B, I_LAB, I_NCOMP, I_NP,
+    shell_nfunc, batch_supported, batch_classes, lanes_preferred, int_ptr, KetQueue, I_A, I_B, I_LAB, I_NCOMP, I_NP,
 )
 
 
@@ -224,30 +224,6 @@ def digest_any[DO_J: Bool, DO_K: Bool](
         digest[DO_J, DO_K](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dj, aj, dk, ak, loc)
 
 
-def batch_classes(tab: PairTable, mut kcls: List[Int]) -> Int:
-    """Class of every pair as a ket of ``eri_batch`` (-1: not batched); returns the number of classes.
-
-    Kets whose primitive pairs fit one batch and whose Hermite degree is
-    within the lane kernels are grouped by (degree, component count), which
-    fixes their layout.
-    """
-    var keys = List[Int]()
-    for sp in range(tab.npairs):
-        var cls = -1
-        var lab = tab.get(sp, I_LAB)
-        var np = tab.get(sp, I_NP)
-        if np >= 1 and np <= BATCH_LANES and batch_supported(0, lab):
-            var key = lab * 100000 + tab.get(sp, I_NCOMP)
-            for k in range(len(keys)):
-                if keys[k] == key:
-                    cls = k
-            if cls < 0:
-                cls = len(keys)
-                keys.append(key)
-        kcls[sp] = cls
-    return len(keys)
-
-
 def digest_quartet(
     basis: Basis, a: Int, b: Int, c: Int, d: Int, same_pair: Bool, blk: F64Ptr, nao: Int, n2: Int,
     nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, ploc: F64Ptr,
@@ -411,12 +387,7 @@ struct DirectJK(Movable):
             var ploc = list_ptr(loc)
             var aj = pacc.unsafe_offset(w * nacc * n2)
             var ak = aj.unsafe_offset(nj * n2)
-            # kets of the current bra waiting for a batch, per class
-            var ncls = max(self.nclass, 1)
-            var pend = List[Int](length=ncls * BATCH_LANES, fill=0)
-            var cnt = List[Int](length=ncls, fill=0)        # queued kets per class
-            var lanes = List[Int](length=ncls, fill=0)      # their primitive pairs
-            var ppend = int_ptr(pend)
+            var queue = KetQueue(self.nclass)    # kets of the current bra waiting for a batch
             var pkcls = int_ptr(self.kcls)
             while True:
                 var task = Int(pcount[].fetch_add(1))
@@ -448,32 +419,22 @@ struct DirectJK(Movable):
                     if qq * dmax < tol:
                         continue
                     var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
-                    if kc >= 0:
-                        var qk = ppend.unsafe_offset(kc * BATCH_LANES)
-                        if lanes[kc] + npk > BATCH_LANES:
-                            flush_batch(self, sp, qk, cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
-                            cnt[kc] = 0
-                            lanes[kc] = 0
-                        qk[unsafe_offset=cnt[kc]] = spk
-                        cnt[kc] += 1
-                        lanes[kc] += npk
+                    if kc >= 0 and lanes_preferred(self.tab, sp, self.tab, spk):
+                        if queue.full(kc, npk):
+                            flush_batch(self, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+                            queue.clear(kc)
+                        queue.push(kc, spk, npk)
                         continue
                     if not eri_quartet(self.tab, sp, self.tab, spk, self.ht, self.boys, ws):
                         continue
                     digest_quartet(self.basis, a, b, c, d, sp == spk, list_ptr(ws.out), nao, n2, nj, nk, dmj, dmk, aj, ak, ploc)
                 # the rest of this bra's batches
-                for kc in range(ncls):
-                    if cnt[kc] > 0:
-                        flush_batch(
-                            self, sp, ppend.unsafe_offset(kc * BATCH_LANES), cnt[kc], ws, wb, n2, nj, nk, dmj, dmk,
-                            aj, ak, ploc,
-                        )
-                        cnt[kc] = 0
-                        lanes[kc] = 0
+                for kc in range(self.nclass):
+                    if queue.cnt[kc] > 0:
+                        flush_batch(self, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+                        queue.clear(kc)
             _ = wb^
-            _ = pend^
-            _ = cnt^
-            _ = lanes^
+            _ = queue^
             _ = ws^
             _ = loc^
 

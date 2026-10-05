@@ -2084,6 +2084,77 @@ def eri_batch(
             return
 
 
+def lanes_preferred(tb: PairTable, ib: Int, tk: PairTable, ik: Int) -> Bool:
+    """True if ``eri_batch`` (bra ``ib``, the ket's primitive pairs as lanes) beats ``eri_quartet`` here.
+
+    The lane kernel transforms the bra once per W ket primitive pairs and
+    the ket once per primitive pair, while ``eri_quartet`` vectorises over
+    the inner primitives (from VMIN on) and transforms the outer side once.
+    Measured per class: lanes win for single-primitive kets (which
+    ``eri_quartet`` runs in scalar code) and, for bras of Hermite degree up
+    to 2, for kets with up to 4 or at most as many primitive pairs as the
+    bra; otherwise ``eri_quartet`` is faster.
+    """
+    var npk = tk.get(ik, I_NP)
+    if npk == 1:
+        return True
+    return tb.get(ib, I_LAB) <= 2 and npk <= max(4, tb.get(ib, I_NP))
+
+
+def batch_classes(tab: PairTable, mut kcls: List[Int]) -> Int:
+    """Class of every pair of ``tab`` as a ket of ``eri_batch`` (-1: not batched); returns the class count.
+
+    Kets whose primitive pairs fit one batch and whose Hermite degree is
+    within the lane kernels are grouped by (degree, component count), which
+    fixes their layout.
+    """
+    var keys = List[Int]()
+    for sp in range(tab.npairs):
+        var cls = -1
+        var lab = tab.get(sp, I_LAB)
+        var np = tab.get(sp, I_NP)
+        if np >= 1 and np <= BATCH_LANES and batch_supported(0, lab):
+            var key = lab * 100000 + tab.get(sp, I_NCOMP)
+            for k in range(len(keys)):
+                if keys[k] == key:
+                    cls = k
+            if cls < 0:
+                cls = len(keys)
+                keys.append(key)
+        kcls[sp] = cls
+    return len(keys)
+
+
+struct KetQueue(Movable):
+    """Kets of one bra waiting for ``eri_batch``, per class of ``batch_classes``."""
+
+    var pend: List[Int]
+    var cnt: List[Int]          # queued kets per class
+    var lanes: List[Int]        # their primitive pairs
+
+    def __init__(out self, nclass: Int):
+        var n = max(nclass, 1)
+        self.pend = List[Int](length=n * BATCH_LANES, fill=0)
+        self.cnt = List[Int](length=n, fill=0)
+        self.lanes = List[Int](length=n, fill=0)
+
+    def full(self, kc: Int, np: Int) -> Bool:
+        """True if a ket with ``np`` primitive pairs does not fit class ``kc``'s batch any more."""
+        return self.lanes[kc] + np > BATCH_LANES
+
+    def push(mut self, kc: Int, ket: Int, np: Int):
+        self.pend[kc * BATCH_LANES + self.cnt[kc]] = ket
+        self.cnt[kc] += 1
+        self.lanes[kc] += np
+
+    def kets(self, kc: Int) -> IntPtr:
+        return int_ptr(self.pend).unsafe_offset(kc * BATCH_LANES)
+
+    def clear(mut self, kc: Int):
+        self.cnt[kc] = 0
+        self.lanes[kc] = 0
+
+
 def eri_quartet(
     tb: PairTable, ib: Int, tk: PairTable, ik: Int, ht: HermTable, boys: BoysTable, mut ws: EriWork
 ) -> Bool:
@@ -2225,6 +2296,26 @@ def schwarz_bounds(boys: BoysTable, tab: PairTable, ht: HermTable) -> List[Float
     return qb^
 
 
+def scatter_batch(
+    basis: Basis, tab: PairTable, sp: Int, kets: IntPtr, nket: Int, boys: BoysTable, ws: EriWork,
+    mut wb: EriBatch, eri: F64Ptr,
+):
+    """``eri_batch`` of bra ``sp`` and the queued kets, stored into the 8-fold packed ``eri``."""
+    eri_batch(tab, sp, tab, kets, nket, boys, ws, wb)
+    var a = tab.get(sp, I_A)
+    var b = tab.get(sp, I_B)
+    var na = basis.ao_loc[a + 1] - basis.ao_loc[a]
+    var nb = basis.ao_loc[b + 1] - basis.ao_loc[b]
+    for k in range(nket):
+        var spk = kets[unsafe_offset=k]
+        var c = tab.get(spk, I_A)
+        var d = tab.get(spk, I_B)
+        scatter_s8(
+            basis, a, b, c, d, wb.block(k), na, nb,
+            basis.ao_loc[c + 1] - basis.ao_loc[c], basis.ao_loc[d + 1] - basis.ao_loc[d], eri,
+        )
+
+
 def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64):
     """8-fold packed ERIs of ``basis`` into ``eri`` (length npair (npair + 1) / 2).
 
@@ -2268,25 +2359,42 @@ def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64
     # Schwarz bounds per shell pair.
     var qb = schwarz_bounds(boys, tab, ht)
     var pq = list_ptr(qb)
+    var kcls = List[Int](length=max(npairs, 1), fill=-1)
+    var nclass = batch_classes(tab, kcls)
+    var pkcls = int_ptr(kcls)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm basis, imm boys, imm tab, imm ht, imm pq, imm eri, imm schwarz_tol, imm npairs, imm pcount}:
+    def work(w: Int) {imm basis, imm boys, imm tab, imm ht, imm pq, imm pkcls, imm nclass, imm eri, imm schwarz_tol, imm npairs, imm pcount}:
         var ws = EriWork(tab.maxcomp, tab.maxlab, tab.maxcomp, tab.maxlab)
+        var wb = EriBatch(tab.maxcomp, tab.maxcomp)
+        var queue = KetQueue(nclass)
         while True:
             var task = Int(pcount[].fetch_add(1))
             if task >= npairs:
                 break
             var sp = npairs - 1 - task
             var qab = pq[unsafe_offset=sp]
-            if tab.get(sp, I_NP) == 0:
+            var npb = tab.get(sp, I_NP)
+            if npb == 0:
                 continue
             var a = tab.get(sp, I_A)
             var b = tab.get(sp, I_B)
             var na = basis.ao_loc[a + 1] - basis.ao_loc[a]
             var nb = basis.ao_loc[b + 1] - basis.ao_loc[b]
+            var batch_bra = batch_supported(tab.get(sp, I_LAB), 0)
+            # kets spk <= sp (the elements of a bra are contiguous rows of the packed output),
+            # batched by class (see ``DirectJK``)
             for spk in range(sp + 1):
+                var npk = tab.get(spk, I_NP)
                 if qab * pq[unsafe_offset=spk] < schwarz_tol:
+                    continue
+                var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
+                if kc >= 0 and lanes_preferred(tab, sp, tab, spk):
+                    if queue.full(kc, npk):
+                        scatter_batch(basis, tab, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb, eri)
+                        queue.clear(kc)
+                    queue.push(kc, spk, npk)
                     continue
                 if not eri_quartet(tab, sp, tab, spk, ht, boys, ws):
                     continue
@@ -2296,13 +2404,20 @@ def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64
                     basis, a, b, c, d, list_ptr(ws.out), na, nb,
                     basis.ao_loc[c + 1] - basis.ao_loc[c], basis.ao_loc[d + 1] - basis.ao_loc[d], eri,
                 )
+            for kc in range(nclass):
+                if queue.cnt[kc] > 0:
+                    scatter_batch(basis, tab, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb, eri)
+                    queue.clear(kc)
         _ = ws^
+        _ = wb^
+        _ = queue^
 
     if nworkers == 1:
         work(0)
     else:
         parallelize(work, nworkers)
     _ = qb^
+    _ = kcls^
     _ = counter^
     _ = tab^
     _ = ht^
