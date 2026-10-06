@@ -1,8 +1,12 @@
-"""Nuclear gradients of RHF/UHF with derivative integrals from the Mojo engine.
+"""Nuclear gradients of RHF/UHF and RKS/UKS with derivative integrals from the Mojo engine.
 
 ``Gradients`` (RHF) and ``UGradients`` (UHF) are pyscf's gradient classes with
 the integral work done by ``mojoscf.integrals``; ``DFGradients`` and
-``DFUGradients`` are pyscf's density-fitted ones (``pyscf.df.grad``) likewise:
+``DFUGradients`` are pyscf's density-fitted ones (``pyscf.df.grad``) likewise.
+``KSGradients``, ``UKSGradients``, ``DFKSGradients`` and ``DFUKSGradients``
+do the same for Kohn-Sham objects (``mojoscf.dft.accelerate``), adding the
+exact exchange scaled by the functional's fraction and the XC term at fixed
+grids (``mojoscf.dft.grad_xc``) to ``grad_2e``:
 
 * ``grad_elec``: the two-electron part is the derivative of the two-electron
   energy evaluated directly from derivative integrals, contracted with the
@@ -23,9 +27,10 @@ the integral work done by ``mojoscf.integrals``; ``DFGradients`` and
 Results agree with ``pyscf.grad`` / ``pyscf.df.grad`` to the precision of the
 integrals.  With effective core potentials only the ECP derivative integrals
 come from pyscf; with X2C or finite nuclei all one-electron pieces do, the
-two-electron part still from the engine.  Range-separated operators,
-``only_dfj``, ``auxbasis_response = False`` and subclasses that override
-``get_veff`` or ``get_jk`` use pyscf's own implementation.
+two-electron part still from the engine.  Range-separated operators and
+functionals, non-local correlation, ``grid_response``, ``only_dfj``,
+``auxbasis_response = False`` and subclasses that override ``get_veff`` or
+``get_jk`` use pyscf's own implementation.
 
 >>> mf = mojoscf.RHF(mol).run()                  # or .density_fit().run()
 >>> g = mf.nuc_grad_method().kernel()
@@ -35,14 +40,21 @@ from __future__ import annotations
 import numpy as np
 from pyscf import lib
 from pyscf.df.grad import rhf as df_rhf_grad
+from pyscf.df.grad import rks as df_rks_grad
 from pyscf.df.grad import uhf as df_uhf_grad
+from pyscf.df.grad import uks as df_uks_grad
 from pyscf.grad import rhf as rhf_grad
+from pyscf.grad import rks as rks_grad
 from pyscf.grad import uhf as uhf_grad
+from pyscf.grad import uks as uks_grad
 from pyscf.lib import logger
 
 from . import integrals
 
-__all__ = ["Gradients", "UGradients", "DFGradients", "DFUGradients", "grad_tol"]
+__all__ = [
+    "Gradients", "UGradients", "DFGradients", "DFUGradients",
+    "KSGradients", "UKSGradients", "DFKSGradients", "DFUKSGradients", "grad_tol",
+]
 
 #: Screening threshold of the derivative integrals (``grad2e``, ``grad2e_df`` and the derivative J/K matrices).
 grad_tol = 1e-14
@@ -63,6 +75,7 @@ class _MojoGrad1eMixin:
     """
 
     _unrestricted = False
+    _pyscf_grad = rhf_grad.Gradients      # the pyscf class whose get_veff/get_jk/extra_force grad_2e stands in for
 
     def _mojo_ok(self, mol=None, omega=None):
         """The one-electron pieces can come from the Mojo engine (no X2C or finite nuclei).
@@ -251,20 +264,23 @@ class _MojoGradMixin(_MojoGrad1eMixin):
     def _direct_2e(self):
         """True if the two-electron term can bypass ``get_veff`` (it is not overridden)."""
         cls = type(self)
-        pyscf_cls = uhf_grad.Gradients if self._unrestricted else rhf_grad.Gradients
         return (
-            cls.get_veff is pyscf_cls.get_veff
+            cls.get_veff is self._pyscf_grad.get_veff
             and cls.get_jk is _MojoGradMixin.get_jk
             and not ({"get_veff", "get_jk"} & self.__dict__.keys())
         )
 
     def grad_2e(self, dm0, mol=None):
         """d/dR of the two-electron energy at fixed density (natm, 3); ``dm0`` as from ``base.make_rdm1()``."""
+        return self._grad_jk(dm0, mol, 1.0)
+
+    def _grad_jk(self, dm0, mol, k_scale):
+        """Coulomb and (``k_scale`` times) exchange part of ``grad_2e``."""
         mol = self.mol if mol is None else mol
         dm0 = np.asarray(dm0)
         if self._unrestricted:
-            return integrals.grad2e(mol, dm0[0] + dm0[1], dm0, 1.0, 1.0, tol=grad_tol)
-        return integrals.grad2e(mol, dm0, dm0, 1.0, 0.5, tol=grad_tol)
+            return integrals.grad2e(mol, dm0[0] + dm0[1], dm0, 1.0, k_scale, tol=grad_tol)
+        return integrals.grad2e(mol, dm0, dm0, 1.0, 0.5 * k_scale, tol=grad_tol)
 
 
 class _MojoDFGradMixin(_MojoGrad1eMixin):
@@ -286,7 +302,7 @@ class _MojoDFGradMixin(_MojoGrad1eMixin):
         base = self.base
         with_df = getattr(base, "with_df", None)
         cls = type(self)
-        pyscf_cls = df_uhf_grad.Gradients if self._unrestricted else df_rhf_grad.Gradients
+        pyscf_cls = self._pyscf_grad
         return (
             type(with_df) is df.DF
             and not getattr(base, "only_dfj", False)
@@ -299,8 +315,9 @@ class _MojoDFGradMixin(_MojoGrad1eMixin):
         )
 
     def _extra_force(self, atom_id, envs):
-        # pyscf's DF classes add the auxiliary-basis response here; grad_2e includes it
-        if type(self).extra_force in (df_rhf_grad.Gradients.extra_force, df_uhf_grad.Gradients.extra_force):
+        # pyscf's DF classes add the auxiliary-basis response (and the KS grid response, not used
+        # with grad_2e) here; grad_2e includes it
+        if type(self).extra_force is self._pyscf_grad.extra_force:
             return 0
         return self.extra_force(atom_id, envs)
 
@@ -311,9 +328,16 @@ class _MojoDFGradMixin(_MojoGrad1eMixin):
         the ``mo_coeff``/``mo_occ`` tags (or a decomposition of the density),
         as in pyscf's DF gradient.
         """
+        return self._grad_jk(dm0, mol, 1.0)
+
+    def _grad_jk(self, dm0, mol, k_scale):
+        """Coulomb and (``k_scale`` times) exchange part of ``grad_2e``; no orbitals are needed without exchange."""
         mol = self.mol if mol is None else mol
-        orbol, orbor = df_rhf_grad._decompose_rdm1(self, mol, dm0)
-        occs = [np.einsum("pi,pi->i", r, o) / np.einsum("pi,pi->i", o, o) for o, r in zip(orbol, orbor)]
+        if k_scale != 0:
+            orbol, orbor = df_rhf_grad._decompose_rdm1(self, mol, dm0)
+            occs = [np.einsum("pi,pi->i", r, o) / np.einsum("pi,pi->i", o, o) for o, r in zip(orbol, orbor)]
+        else:
+            orbol, occs = [], []
         dm0 = np.asarray(dm0)
         max_memory = max(1000, self.max_memory - lib.current_memory()[0])
         auxmol = self._auxmol()
@@ -321,28 +345,108 @@ class _MojoDFGradMixin(_MojoGrad1eMixin):
             dm_j, k_factor = dm0[0] + dm0[1], 1.0
         else:
             dm_j, k_factor = dm0, 0.5
-        return integrals.grad2e_df(mol, auxmol, dm_j, orbol, occs, 1.0, k_factor, max_memory=max_memory, tol=grad_tol)
+        return integrals.grad2e_df(
+            mol, auxmol, dm_j, orbol, occs, 1.0, k_factor * k_scale, max_memory=max_memory, tol=grad_tol
+        )
+
+
+class _MojoKSGradMixin:
+    """Kohn-Sham: ``grad_2e`` is the Coulomb and scaled exact-exchange term plus the XC term.
+
+    The XC term (at fixed grids) is :func:`mojoscf.dft.grad_xc`: the Mojo
+    kernels for ``mojoscf.dft.NumInt`` with LDA/GGA functionals, pyscf's
+    ``get_vxc`` otherwise.  Range-separated functionals, non-local
+    correlation (``nlc``) and ``grid_response`` keep pyscf's ``get_veff``.
+    """
+
+    def _hybrid(self):
+        """(supported, exact-exchange fraction) of the functional."""
+        mf = self.base
+        if self.grid_response or mf.do_nlc():
+            return False, 0.0
+        omega, _, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=self.mol.spin)
+        return omega == 0, hyb
+
+    def _direct_2e(self):
+        return self._hybrid()[0] and super()._direct_2e()
+
+    def grad_2e(self, dm0, mol=None):
+        """d/dR of the Coulomb, exact-exchange and XC energies at fixed density (natm, 3)."""
+        from . import dft
+
+        mol = self.mol if mol is None else mol
+        mf = self.base
+        de = self._grad_jk(dm0, mol, self._hybrid()[1])
+        grids = rks_grad._initialize_grids(self)[0]
+        return de + dft.grad_xc(mf._numint, mol, grids, mf.xc, np.asarray(dm0), spin=int(self._unrestricted))
 
 
 class Gradients(_MojoGradMixin, rhf_grad.Gradients):
     """RHF nuclear gradients with Mojo derivative integrals (see the module docstring)."""
 
     _unrestricted = False
+    _pyscf_grad = rhf_grad.Gradients
 
 
 class UGradients(_MojoGradMixin, uhf_grad.Gradients):
     """UHF nuclear gradients with Mojo derivative integrals (see the module docstring)."""
 
     _unrestricted = True
+    _pyscf_grad = uhf_grad.Gradients
 
 
 class DFGradients(_MojoDFGradMixin, df_rhf_grad.Gradients):
     """Density-fitted RHF nuclear gradients with Mojo derivative integrals (see the module docstring)."""
 
     _unrestricted = False
+    _pyscf_grad = df_rhf_grad.Gradients
 
 
 class DFUGradients(_MojoDFGradMixin, df_uhf_grad.Gradients):
     """Density-fitted UHF nuclear gradients with Mojo derivative integrals (see the module docstring)."""
 
     _unrestricted = True
+    _pyscf_grad = df_uhf_grad.Gradients
+
+
+class KSGradients(_MojoKSGradMixin, _MojoGradMixin, rks_grad.Gradients):
+    """RKS nuclear gradients with Mojo derivative integrals and XC kernels (see the module docstring)."""
+
+    _unrestricted = False
+    _pyscf_grad = rks_grad.Gradients
+
+
+class UKSGradients(_MojoKSGradMixin, _MojoGradMixin, uks_grad.Gradients):
+    """UKS nuclear gradients with Mojo derivative integrals and XC kernels (see the module docstring)."""
+
+    _unrestricted = True
+    _pyscf_grad = uks_grad.Gradients
+
+
+class DFKSGradients(_MojoKSGradMixin, _MojoDFGradMixin, df_rks_grad.Gradients):
+    """Density-fitted RKS nuclear gradients with Mojo derivative integrals and XC kernels."""
+
+    _unrestricted = False
+    _pyscf_grad = df_rks_grad.Gradients
+
+
+class DFUKSGradients(_MojoKSGradMixin, _MojoDFGradMixin, df_uks_grad.Gradients):
+    """Density-fitted UKS nuclear gradients with Mojo derivative integrals and XC kernels."""
+
+    _unrestricted = True
+    _pyscf_grad = df_uks_grad.Gradients
+
+
+_KS_GRADIENTS = {
+    rks_grad.Gradients: KSGradients,
+    uks_grad.Gradients: UKSGradients,
+    df_rks_grad.Gradients: DFKSGradients,
+    df_uks_grad.Gradients: DFUKSGradients,
+}
+
+
+def ks_gradients(g):
+    """The Mojo counterpart of a pyscf Kohn-Sham gradient object ``g`` of exactly one of pyscf's RKS/UKS
+    classes (plain or density-fitted), else ``g`` itself."""
+    cls = _KS_GRADIENTS.get(type(g))
+    return g if cls is None else cls(g.base)

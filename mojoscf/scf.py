@@ -369,8 +369,9 @@ def _mojo_grad_method(mf, after):
     plain RHF/UHF one gives ``mojoscf.grad.Gradients``/``UGradients``, the
     density-fitting one (``_DFHF``) ``DFGradients``/``DFUGradients``, a QM/MM
     one (``pyscf.qmmm``) the gradients of the method underneath with the Mojo
-    QM/MM terms (:mod:`mojoscf.qmmm`); any other decoration (solvent, ...)
-    keeps its own gradients.
+    QM/MM terms (:mod:`mojoscf.qmmm`); pyscf's RKS/UKS gradients (plain or
+    density-fitted) become their Mojo counterparts (``grad.ks_gradients``);
+    any other decoration (solvent, ...) keeps its own gradients.
     """
     from pyscf.df import df_jk
 
@@ -383,7 +384,7 @@ def _mojo_grad_method(mf, after):
             nxt = cls.__dict__["nuc_grad_method"]
             break
     uhf = isinstance(mf, pyscf_uhf.UHF)
-    if _is_hf(mf):          # mojoscf's gradients are Hartree-Fock ones (no ROHF or Kohn-Sham)
+    if _is_hf(mf):          # Hartree-Fock (no ROHF); Kohn-Sham below
         if nxt is (pyscf_uhf.UHF if uhf else pyscf_hf.RHF).nuc_grad_method:
             return (grad.UGradients if uhf else grad.Gradients)(mf)
         if nxt is df_jk._DFHF.nuc_grad_method and not mf.istype("_Solvation"):
@@ -393,7 +394,7 @@ def _mojo_grad_method(mf, after):
         from . import qmmm
 
         return qmmm.qmmm_grad_for_scf(_mojo_grad_method(mf, qmmm_itrf.QMMMSCF))
-    return nxt(mf)
+    return grad.ks_gradients(nxt(mf))
 
 
 class _MojoDFHook:
@@ -638,7 +639,7 @@ def unsupported_reason(mf):
         from pyscf.dft.rks import KohnShamDFT
 
         if isinstance(mf, KohnShamDFT):
-            return "Kohn-Sham DFT is not supported"
+            return "Kohn-Sham DFT is not supported by the native loop (mojoscf.dft.accelerate gives it the Mojo kernels)"
     except ImportError:  # pragma: no cover
         pass
     try:

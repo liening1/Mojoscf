@@ -15,7 +15,7 @@ from . import dft, grad, guess, integrals, kernels, qmmm
 from .diis import CDIIS
 from .scf import RHF, UHF, accelerate, is_supported, kernel, native_veff
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 __all__ = [
     "RHF",

@@ -30,9 +30,9 @@ from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_i
 from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
 from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core
 from _mojo.qmmm import mm_potential_core, mm_grad_core
-from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core
+from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core
 
-comptime VERSION = "0.9.0"
+comptime VERSION = "0.10.0"
 
 
 @export
@@ -72,9 +72,11 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_df_grad_rhs]("df_grad_rhs", docstring="df_grad_rhs(basis, auxbasis, table, dm_tril, orbs, blk, rho, q, seq_path, seq_prefix): fit right-hand sides of the DF gradient.")
         m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix): three-centre term of the DF gradient.")
         m.def_function[py_grad2c]("grad2c", docstring="grad2c(auxbasis, table, w, de): d/dR of -1/2 sum (P|Q) W_PQ.")
-        m.def_function[py_eval_ao]("eval_ao", docstring="eval_ao(basis, coords, deriv, out): AO values (and gradients) on the points, out (ncomp, ngrid, nao).")
+        m.def_function[py_eval_ao]("eval_ao", docstring="eval_ao(basis, coords, deriv, out): AO values and derivatives (deriv <= 2) on the points, out (ncomp, ngrid, nao).")
         m.def_function[py_xc_rho]("xc_rho", docstring="xc_rho(basis, coords, deriv, dms, rho, seq_path, seq_prefix): densities (and gradients) of symmetric dms (nset, nao, nao) into rho (nset, ncomp, ngrid).")
         m.def_function[py_xc_vmat]("xc_vmat", docstring="xc_vmat(basis, coords, deriv, wv, vmat, seq_path, seq_prefix): sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T into vmat (nset, nao, nao).")
+        m.def_function[py_xc_grad]("xc_grad", docstring="xc_grad(basis, coords, gga, wv, vmat, seq_path, seq_prefix): XC gradient matrices (nset, 3, nao, nao) of pyscf's grad.rks.get_vxc, before its sign flip.")
+        m.def_function[py_xc_grad_dm]("xc_grad_dm", docstring="xc_grad_dm(basis, coords, gga, wv, dms, de, seq_path, seq_prefix): XC term of the nuclear gradient (natm, 3), the XC gradient matrices contracted with the densities.")
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
         m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces, atoms): sum_k w_k (nabla i j|k) (3, nao, nao), sum_ij D_ij w_k (ij|nabla k) (nch, 3), 2 sum_{i on A} D_ij sum_k w_k (nabla i j|k) (natm, 3); an empty output is skipped.")
         m.def_function[py_int1e_iprinv_dm]("int1e_iprinv_dm", docstring="int1e_iprinv_dm(basis, table, centers, dm, out): sum_ij D_ij <nabla i|1/|r-R_c||j> per centre (ncenter, 3).")
@@ -590,7 +592,7 @@ def py_mm_grad(
 
 def py_eval_ao(basis: PythonObject, coords: PythonObject, deriv: PythonObject, ao_out: PythonObject) raises -> PythonObject:
     var bs = _basis(basis)
-    eval_ao_core(bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv) > 0, f64ptr(ao_out))
+    eval_ao_core(bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv), f64ptr(ao_out))
     _ = bs^
     return PythonObject(None)
 
@@ -616,6 +618,32 @@ def py_xc_vmat(
     xc_vmat_core(
         _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv) > 0,
         Int(py=wv.shape[0]), f64ptr(wv), f64ptr(vmat),
+    )
+    _ = bs^
+    return PythonObject(None)
+
+
+def py_xc_grad(
+    basis: PythonObject, coords: PythonObject, gga: PythonObject, wv: PythonObject, vmat: PythonObject,
+    seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    xc_grad_core(
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=gga) > 0,
+        Int(py=wv.shape[0]), f64ptr(wv), f64ptr(vmat),
+    )
+    _ = bs^
+    return PythonObject(None)
+
+
+def py_xc_grad_dm(
+    basis: PythonObject, coords: PythonObject, gga: PythonObject, wv: PythonObject, dms: PythonObject,
+    de: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    xc_grad_dm_core(
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=gga) > 0,
+        Int(py=wv.shape[0]), f64ptr(wv), f64ptr(dms), f64ptr(de),
     )
     _ = bs^
     return PythonObject(None)
