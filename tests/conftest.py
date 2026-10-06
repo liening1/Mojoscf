@@ -10,14 +10,35 @@ def ext():
     return mojoscf._backend.get_extension()
 
 
-@pytest.fixture(scope="session", params=["blas", "native"])
+def _bundled(kind):
+    """NumPy's ILP64 or SciPy's LP64 OpenBLAS as (path, prefix), if installed and loadable."""
+    import glob
+    import os
+
+    import scipy
+
+    root = os.path.dirname(os.path.dirname(np.__file__ if kind == "numpy" else scipy.__file__))
+    pattern = "numpy.libs/libscipy_openblas64_*.so*" if kind == "numpy" else "scipy.libs/libscipy_openblas-*.so*"
+    for path in sorted(glob.glob(os.path.join(root, pattern))):
+        if mojoscf._backend._probe(mojoscf._backend.get_extension(), path, "scipy_"):
+            return (path, "scipy_")
+    return None
+
+
+@pytest.fixture(scope="session", params=["blas", "native", "numpy-ilp64", "scipy-lp64"])
 def blas(request, ext):
-    """Both the BLAS/LAPACK-backed and the pure-Mojo code paths."""
+    """The BLAS/LAPACK-backed and the pure-Mojo code paths; NumPy's ILP64 and SciPy's LP64
+    OpenBLAS each for all matrix sizes."""
     if request.param == "blas":
         small, large = mojoscf.blas_config()
         if not small[0]:
             pytest.skip("no BLAS/LAPACK library found; only the native path is available")
         return (small, large)
+    if request.param != "native":
+        lib = _bundled(request.param.split("-")[0])
+        if lib is None:
+            pytest.skip(f"{request.param} OpenBLAS not installed")
+        return (lib, lib)
     return (("", ""), ("", ""))
 
 

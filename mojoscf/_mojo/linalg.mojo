@@ -411,7 +411,12 @@ struct Blas(Movable):
 
     ``path`` may be empty to force the native Mojo fallbacks.  ``prefix`` is
     prepended to the Fortran symbol names (e.g. ``"scipy_"`` for the OpenBLAS
-    bundled with SciPy).  Only the LP64 (32-bit integer) interface is used.
+    bundled with SciPy).  Both the LP64 (32-bit integer, ``dgemm_``) and the
+    ILP64 interface with suffixed symbols (``dgemm_64_``, as NumPy's
+    ``scipy_openblas64``) are supported; which one a library provides is
+    detected when it is opened.  Integer arguments are passed in 64-bit
+    slots, which an LP64 library reads as 32-bit integers on little-endian
+    machines (x86-64, AArch64).
 
     Opening an already-loaded library is a cheap ``dlopen`` (a few
     microseconds), so a ``Blas`` is created per kernel call; the symbol check
@@ -421,23 +426,37 @@ struct Blas(Movable):
     var handle: Optional[OwnedDLHandle]
     var prefix: String
     var path: String
+    var ilp64: Bool
+    var suffix: String          # "_" (LP64) or "_64_" (ILP64)
 
     def __init__(out self, path: String, prefix: String, verify: Bool = False):
         self.path = path
         self.prefix = prefix
         self.handle = None
+        self.ilp64 = False
+        self.suffix = "_"
         if path.byte_length() > 0:
             try:
                 var h = OwnedDLHandle(path)
+                if not h.check_symbol(prefix + "dgemm_") and h.check_symbol(prefix + "dgemm_64_"):
+                    self.ilp64 = True
+                    self.suffix = "_64_"
                 if not verify or (
-                    h.check_symbol(prefix + "dgemm_")
-                    and h.check_symbol(prefix + "dsyrk_")
-                    and h.check_symbol(prefix + "dsygvd_")
-                    and h.check_symbol(prefix + "dsyevd_")
+                    h.check_symbol(prefix + "dgemm" + self.suffix)
+                    and h.check_symbol(prefix + "dsyrk" + self.suffix)
+                    and h.check_symbol(prefix + "dsygvd" + self.suffix)
+                    and h.check_symbol(prefix + "dsyevd" + self.suffix)
                 ):
                     self.handle = h^
             except:
                 pass
+
+    def sym(self, name: String) -> String:
+        """Symbol of the Fortran routine ``name`` (e.g. "dgemm") in this library."""
+        return self.prefix + name + self.suffix
+
+    def _thread_sym(self, name: String) -> String:
+        return self.prefix + name + ("64_" if self.ilp64 else "")
 
     def available(self) -> Bool:
         return Bool(self.handle)
@@ -446,7 +465,7 @@ struct Blas(Movable):
         """OpenBLAS's thread count, or 0 for a library without ``openblas_get_num_threads``."""
         if not self.handle:
             return 0
-        var name = self.prefix + "openblas_get_num_threads"
+        var name = self._thread_sym("openblas_get_num_threads")
         if not self.handle.value().check_symbol(name):
             return 0
         try:
@@ -459,7 +478,7 @@ struct Blas(Movable):
         """Set OpenBLAS's thread count (no-op for other libraries or n <= 0)."""
         if not self.handle or n <= 0:
             return
-        var name = self.prefix + "openblas_set_num_threads"
+        var name = self._thread_sym("openblas_set_num_threads")
         if not self.handle.value().check_symbol(name):
             return
         try:
@@ -467,6 +486,10 @@ struct Blas(Movable):
             f(c_int(n))
         except:
             pass
+
+    def info(self, v: Int64) -> Int:
+        """A LAPACK ``info`` output written into a 64-bit slot (an LP64 library writes its low half)."""
+        return Int(v) if self.ilp64 else Int(v.cast[DType.int32]())
 
     def serial_begin(self) -> Int:
         """Before worker threads call this library concurrently: one OpenBLAS thread; returns the old count."""
@@ -512,15 +535,15 @@ struct Blas(Movable):
         # Row-major C = op(A) op(B)  <=>  column-major C^T = op(B)^T op(A)^T.
         var ta = c_char(ord("T")) if transa else c_char(ord("N"))
         var tb = c_char(ord("T")) if transb else c_char(ord("N"))
-        var mm = c_int(m)
-        var nn = c_int(n)
-        var kk = c_int(k)
-        var lda = c_int(m) if transa else c_int(k)
-        var ldb = c_int(k) if transb else c_int(n)
-        var ldc = c_int(n)
+        var mm = Int64(m)
+        var nn = Int64(n)
+        var kk = Int64(k)
+        var lda = Int64(m) if transa else Int64(k)
+        var ldb = Int64(k) if transb else Int64(n)
+        var ldc = Int64(n)
         var al = alpha
         var be = beta
-        var f = self.handle.value().get_function[NoneType](self.prefix + "dgemm_")
+        var f = self.handle.value().get_function[NoneType](self.sym("dgemm"))
         f(
             anyptr(tb), anyptr(ta), anyptr(nn), anyptr(mm), anyptr(kk),
             anyptr(al), b, anyptr(ldb), a, anyptr(lda), anyptr(be), c, anyptr(ldc),
@@ -542,11 +565,11 @@ struct Blas(Movable):
         # with trans = 'N'; the column-major lower triangle is the row-major upper one.
         var uplo = c_char(ord("L"))
         var trans = c_char(ord("N"))
-        var nn = c_int(n)
-        var kk = c_int(k)
+        var nn = Int64(n)
+        var kk = Int64(k)
         var al = alpha
         var be = beta
-        var f = self.handle.value().get_function[NoneType](self.prefix + "dsyrk_")
+        var f = self.handle.value().get_function[NoneType](self.sym("dsyrk"))
         f(anyptr(uplo), anyptr(trans), anyptr(nn), anyptr(kk), anyptr(al), a, anyptr(nn), anyptr(be), c, anyptr(nn))
 
     def syr2k_lower(self, n: Int, k: Int, alpha: Float64, a: F64Ptr, b: F64Ptr, beta: Float64, c: F64Ptr) raises:
@@ -565,11 +588,11 @@ struct Blas(Movable):
         # with trans = 'T'; the column-major upper triangle is the row-major lower one.
         var uplo = c_char(ord("U"))
         var trans = c_char(ord("T"))
-        var nn = c_int(n)
-        var kk = c_int(k)
+        var nn = Int64(n)
+        var kk = Int64(k)
         var al = alpha
         var be = beta
-        var f = self.handle.value().get_function[NoneType](self.prefix + "dsyr2k_")
+        var f = self.handle.value().get_function[NoneType](self.sym("dsyr2k"))
         f(
             anyptr(uplo), anyptr(trans), anyptr(nn), anyptr(kk), anyptr(al), a, anyptr(kk), b, anyptr(kk),
             anyptr(be), c, anyptr(nn),
@@ -587,21 +610,21 @@ struct Blas(Movable):
         if self.handle:
             var jobz = c_char(ord("V"))
             var uplo = c_char(ord("L"))
-            var nn = c_int(n)
-            var lwork = c_int(1 + 6 * n + 2 * n * n)
-            var liwork = c_int(3 + 5 * n)
+            var nn = Int64(n)
+            var lwork = Int64(1 + 6 * n + 2 * n * n)
+            var liwork = Int64(3 + 5 * n)
             var work = List[Float64](length=Int(lwork), fill=0.0)
-            var iwork = List[c_int](length=Int(liwork), fill=0)
-            var info = c_int(0)
-            var f = self.handle.value().get_function[NoneType](self.prefix + "dsyevd_")
+            var iwork = List[Int64](length=Int(liwork), fill=0)
+            var info = Int64(0)
+            var f = self.handle.value().get_function[NoneType](self.sym("dsyevd"))
             f(
                 anyptr(jobz), anyptr(uplo), anyptr(nn), a, anyptr(nn), w,
                 work.unsafe_ptr(), anyptr(lwork), iwork.unsafe_ptr(), anyptr(liwork), anyptr(info),
             )
             _ = work^
             _ = iwork^
-            if Int(info) != 0:
-                raise Error("LAPACK dsyevd failed with info=" + String(Int(info)))
+            if self.info(info) != 0:
+                raise Error("LAPACK dsyevd failed with info=" + String(self.info(info)))
             # LAPACK leaves eigenvectors column-major in a; expose them row-major.
             transpose(c, a, n, n)
         else:
@@ -618,24 +641,24 @@ struct Blas(Movable):
         vcopy(a, h, n * n)
         vcopy(b, s, n * n)
         if self.handle:
-            var itype = c_int(1)
+            var itype = Int64(1)
             var jobz = c_char(ord("V"))
             var uplo = c_char(ord("L"))
-            var nn = c_int(n)
-            var lwork = c_int(1 + 6 * n + 2 * n * n)
-            var liwork = c_int(3 + 5 * n)
+            var nn = Int64(n)
+            var lwork = Int64(1 + 6 * n + 2 * n * n)
+            var liwork = Int64(3 + 5 * n)
             var work = List[Float64](length=Int(lwork), fill=0.0)
-            var iwork = List[c_int](length=Int(liwork), fill=0)
-            var info = c_int(0)
-            var f = self.handle.value().get_function[NoneType](self.prefix + "dsygvd_")
+            var iwork = List[Int64](length=Int(liwork), fill=0)
+            var info = Int64(0)
+            var f = self.handle.value().get_function[NoneType](self.sym("dsygvd"))
             f(
                 anyptr(itype), anyptr(jobz), anyptr(uplo), anyptr(nn), a, anyptr(nn), b, anyptr(nn), w,
                 work.unsafe_ptr(), anyptr(lwork), iwork.unsafe_ptr(), anyptr(liwork), anyptr(info),
             )
             _ = work^
             _ = iwork^
-            if Int(info) != 0:
-                raise Error("LAPACK dsygvd failed with info=" + String(Int(info)))
+            if self.info(info) != 0:
+                raise Error("LAPACK dsygvd failed with info=" + String(self.info(info)))
             transpose(c, a, n, n)
         else:
             eigh_gen_native(n, a, b, w, c)

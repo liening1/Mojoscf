@@ -89,6 +89,12 @@ def _xc_grad(mol, coords, gga, wv):
     return v
 
 
+def _wsum(a, b) -> float:
+    """sum_p a_p b_p without BLAS: a threaded ``ddot`` over the grid would leave OpenBLAS threads
+    spinning (~0.1 s) while the next Mojo pass runs."""
+    return float(np.einsum("p,p->", a, np.asarray(b).ravel()))
+
+
 def _grid(grids):
     if grids.coords is None:
         grids.build()
@@ -118,7 +124,7 @@ class NumInt(pyscf_numint.NumInt):
             exc, vxc = self.eval_xc_eff(xc_code, r, deriv=1, xctype=xctype, spin=0)[:2]
             den = rho[i, 0] * weights
             nelec[i] = den.sum()
-            excsum[i] = np.dot(den, exc)
+            excsum[i] = _wsum(den, exc)
             wv[i] = weights * np.asarray(vxc).reshape(-1, weights.size)
             wv[i, 0] *= 0.5                     # V + V^T below
         vmat = _vmat(mol, coords, deriv, wv)
@@ -150,7 +156,7 @@ class NumInt(pyscf_numint.NumInt):
             den_b = rb[0] * weights
             nelec[0, i] = den_a.sum()
             nelec[1, i] = den_b.sum()
-            excsum[i] = np.dot(den_a, exc) + np.dot(den_b, exc)
+            excsum[i] = _wsum(den_a + den_b, exc)
             vxc = np.asarray(vxc).reshape(2, -1, weights.size)
             wv[i] = weights * vxc[0]
             wv[nset + i] = weights * vxc[1]
@@ -367,6 +373,33 @@ class _MojoKSHook:
     def get_k(self, mol=None, dm=None, hermi=1, omega=None):
         return self.get_jk(mol, dm, hermi, False, True, omega)[1]
 
+    @property
+    def DIIS(self):
+        """mojoscf's CDIIS in place of pyscf's default CDIIS (the same iterates).
+
+        pyscf's CDIIS takes overlaps of error vectors with NumPy, whose
+        threaded ``ddot`` leaves OpenBLAS threads spinning while the next Mojo
+        pass runs (about 6% of a ferrocene SCF).  A DIIS class set on the
+        object, another scheme (EDIIS, ADIIS), ``diis_space_rollback`` and
+        ``diis_file`` keep pyscf's.
+        """
+        own = self.__dict__.get("DIIS")
+        if own is not None:
+            return own
+        from pyscf.scf import diis as scf_diis
+
+        mro = type(self).__mro__
+        cls = next(c.__dict__["DIIS"] for c in mro[mro.index(_MojoKSHook) + 1:] if "DIIS" in c.__dict__)
+        if cls is scf_diis.CDIIS and not self.diis_space_rollback and not self.diis_file:
+            from .diis import CDIIS
+
+            return CDIIS
+        return cls
+
+    @DIIS.setter
+    def DIIS(self, value):
+        self.__dict__["DIIS"] = value
+
     def nuc_grad_method(self):
         """Nuclear gradients with Mojo derivative integrals and XC kernels (``mojoscf.grad.KSGradients`` ...)."""
         from .scf import _mojo_grad_method
@@ -397,7 +430,8 @@ def accelerate(mf):
       or integral-direct (:func:`mojoscf.integrals.get_jk`);
     * nuclear gradients: :class:`mojoscf.grad.KSGradients` and its UKS and
       density-fitted variants (Mojo derivative integrals and XC kernels);
-    * the eigensolver: :func:`mojoscf.kernels.eigh`;
+    * the eigensolver: :func:`mojoscf.kernels.eigh`; DIIS: :class:`mojoscf.CDIIS`
+      (when pyscf's default CDIIS would be used);
     * QM/MM objects: the Mojo MM-charge terms (:func:`mojoscf.qmmm.attach`).
 
     The SCF loop itself stays pyscf's.

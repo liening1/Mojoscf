@@ -190,6 +190,21 @@ def test_accelerate_qmmm_dft():
     assert abs(g.kernel() - ref.nuc_grad_method().kernel()).max() < 1e-7
 
 
+def test_diis_choice():
+    from pyscf.scf import diis as scf_diis
+
+    mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
+    mf = mdft.accelerate(dft.RKS(mol))
+    assert mf.DIIS is mojoscf.CDIIS
+    mf.diis_space_rollback = 2
+    assert mf.DIIS is scf_diis.CDIIS
+    mf = mdft.accelerate(dft.RKS(mol))
+    mf.DIIS = scf_diis.ADIIS                    # a scheme set on the object wins
+    assert mf.DIIS is scf_diis.ADIIS
+    mf.kernel()
+    assert abs(mf.e_tot - dft.RKS(mol).run(DIIS=scf_diis.ADIIS).e_tot) < 1e-8
+
+
 def test_accelerate_rejects_hf():
     with pytest.raises(TypeError):
         mdft.accelerate(scf.RHF(gto.M(atom=WATER, basis="sto-3g", verbose=0)))

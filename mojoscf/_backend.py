@@ -162,9 +162,13 @@ def _bundled_libraries() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     small matrices of a small-molecule SCF it is the better choice: a threaded
     BLAS then competes with pyscf's OpenMP integral code for the cores
     (measured: up to 40% slower SCF runs).  From a few hundred orbitals on,
-    the threaded OpenBLAS bundled with SciPy (LP64, symbols prefixed
-    ``scipy_``) makes the glue 2-4x faster than the sequential one.  NumPy's
-    own copy is skipped because it uses 64-bit integers.
+    a threaded OpenBLAS makes the glue 2-4x faster than the sequential one.
+    NumPy's own copy (``scipy_openblas64``: ILP64, symbols ``scipy_dgemm_64_``)
+    comes first: pyscf's Python code (DIIS, ``make_rdm1``, ...) runs its
+    matrix products on it, and OpenBLAS worker threads keep spinning for about
+    0.1 s after each call, so a second thread pool (SciPy's LP64 copy, the
+    fallback) called in between would compete with them for the cores
+    (measured: 25% of a Kohn-Sham SCF loop).
     """
     seq: list[tuple[str, str]] = []
     thr: list[tuple[str, str]] = []
@@ -175,6 +179,14 @@ def _bundled_libraries() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         for path in sorted(glob.glob(os.path.join(libdir, "libopenblas*.so*"))):
             seq.append((path, ""))
     except ImportError:
+        pass
+    try:
+        import numpy
+
+        libdir = os.path.join(os.path.dirname(os.path.dirname(numpy.__file__)), "numpy.libs")
+        for path in sorted(glob.glob(os.path.join(libdir, "libscipy_openblas64_*.so*"))):
+            thr.append((path, "scipy_"))
+    except ImportError:  # pragma: no cover
         pass
     try:
         import scipy  # noqa: F401
@@ -265,8 +277,10 @@ def _openblas_thread_control(path: str, prefix: str):
                 import ctypes
 
                 lib = ctypes.CDLL(path)
-                get = getattr(lib, prefix + "openblas_get_num_threads")
-                set_ = getattr(lib, prefix + "openblas_set_num_threads")
+                # ILP64 builds with suffixed symbols name them openblas_get_num_threads64_
+                sfx = "" if hasattr(lib, prefix + "openblas_get_num_threads") else "64_"
+                get = getattr(lib, prefix + "openblas_get_num_threads" + sfx)
+                set_ = getattr(lib, prefix + "openblas_set_num_threads" + sfx)
                 get.restype = ctypes.c_int
                 set_.argtypes = [ctypes.c_int]
                 ctl = (get, set_)
