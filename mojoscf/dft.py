@@ -3,17 +3,19 @@
 pyscf's :class:`~pyscf.dft.numint.NumInt` evaluates the basis functions on
 blocks of grid points, the density, the functional (libxc) and the XC
 potential matrix.  :class:`NumInt` here keeps pyscf's grids and libxc and
-replaces the rest for LDA and GGA functionals (``_mojo/numint.mojo``): one
-Mojo pass computes the densities (and gradients) on all grid points, pyscf's
+replaces the rest for LDA, GGA and meta-GGA functionals (``_mojo/numint.mojo``;
+not those using the laplacian): one Mojo pass computes the densities (with
+gradients and kinetic-energy densities) on all grid points, pyscf's
 ``eval_xc_eff`` evaluates the functional on the whole grid at once, and a
 second Mojo pass assembles the potential matrix.  Both passes evaluate only
 the shells significant on each block of 128 points and do the contractions
 as per-block GEMMs.  The XC part of the nuclear gradient (pyscf's
 ``grad.rks.get_vxc``/``grad.uks.get_vxc``, used by every RKS/UKS gradient
 class) runs the same way for :class:`NumInt` objects: one density pass and
-one pass over the basis-function second derivatives; the gradient classes of
-:mod:`mojoscf.grad` contract it with the density inside that pass
-(:func:`grad_xc`).  Meta-GGA, non-symmetric densities, response kernels
+one pass over the basis-function second derivatives (LDA and GGA; meta-GGA
+keeps pyscf's ``get_vxc``); the gradient classes of :mod:`mojoscf.grad`
+contract it with the density inside that pass (:func:`grad_xc`, meta-GGA
+included).  Laplacian meta-GGAs, non-symmetric densities, response kernels
 (``nr_rks_fxc`` ...) and the grid response of the gradient keep pyscf's code.
 
 :func:`accelerate` gives a pyscf RKS/UKS object this ``NumInt``, J/K from
@@ -40,9 +42,22 @@ def supported(mol) -> bool:
     return mol.nbas > 0 and integrals.available(mol, allow_ecp=True)
 
 
-def _passes_ok(ni, mol, xc_code, dms, hermi) -> bool:
+_KINDS = {"LDA": 0, "GGA": 1, "MGGA": 2}
+
+
+def _kind(ni, xc_code):
+    """0 (LDA), 1 (GGA), 2 (meta-GGA without the laplacian) or None (other functionals)."""
+    kind = _KINDS.get(ni._xc_type(xc_code))
+    if kind == 2 and any(x in xc_code.upper() for x in ("CC06", "CS", "BR89", "MK00")):
+        return None                         # laplacian meta-GGAs (pyscf rejects them too)
+    return kind
+
+
+def _passes_ok(ni, mol, xc_code, dms, hermi, max_kind=2) -> bool:
+    kind = _kind(ni, xc_code)
     return (
-        ni._xc_type(xc_code) in ("LDA", "GGA")
+        kind is not None
+        and kind <= max_kind
         and hermi == 1
         and np.isrealobj(dms)
         and integrals.engine() == "mojo"
@@ -86,27 +101,29 @@ def _orbitals(dm, nset, nao):
     return orbs, occs
 
 
-def _rho(mol, coords, deriv, dms, orbitals=None):
-    """(nset, ncomp, ngrid) densities (and gradients) of the symmetric ``dms`` (nset, nao, nao).
+def _rho(mol, coords, kind, dms, orbitals=None):
+    """(nset, ncomp, ngrid) densities of the symmetric ``dms`` (nset, nao, nao): rho (kind 0), with its
+    gradient (1, GGA) and tau (2, meta-GGA; pyscf's 1/2 sum |grad psi|^2).
 
     ``orbitals`` (from :func:`_orbitals`) describe the same densities; the
     kernel uses them where that is cheaper.
     """
     nset, nao = dms.shape[0], dms.shape[-1]
-    rho = np.empty((nset, 4 if deriv else 1, coords.shape[0]))
+    rho = np.empty((nset, (1, 4, 5)[kind], coords.shape[0]))
     orbs, occs = orbitals if orbitals is not None else (np.zeros((nset, nao, 0)), np.zeros((nset, 0)))
     path, prefix = worker_blas()
-    get_extension().xc_rho(integrals.basis_tables(mol), coords, int(deriv), dms, np.ascontiguousarray(orbs),
+    get_extension().xc_rho(integrals.basis_tables(mol), coords, int(kind), dms, np.ascontiguousarray(orbs),
                            np.ascontiguousarray(occs), rho, path, prefix)
     return rho
 
 
-def _vmat(mol, coords, deriv, wv):
-    """(nset, nao, nao) sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T, symmetrised (the caller halves wv_0)."""
+def _vmat(mol, coords, kind, wv):
+    """(nset, nao, nao) sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T (meta-GGA: + sum_c d_c phi (wv_4 d_c phi)^T),
+    symmetrised (the caller halves wv_0 and quarters wv_4)."""
     nao = mol.nao_nr()
     v = np.empty((wv.shape[0], nao, nao))
     path, prefix = worker_blas()
-    get_extension().xc_vmat(integrals.basis_tables(mol), coords, int(deriv), np.ascontiguousarray(wv), v,
+    get_extension().xc_vmat(integrals.basis_tables(mol), coords, int(kind), np.ascontiguousarray(wv), v,
                             path, prefix)
     return v + v.transpose(0, 2, 1)
 
@@ -127,6 +144,14 @@ def _wsum(a, b) -> float:
     return float(np.einsum("p,p->", a, np.asarray(b).ravel()))
 
 
+def _halve(w):
+    """pyscf's weights for the symmetrised matrix V + V^T (in place): w_0 / 2, and w_tau / 4 (the
+    tau term sum_c d_c phi (w_tau d_c phi)^T / 2 is symmetric already)."""
+    w[0] *= 0.5
+    if w.shape[0] == 5:
+        w[4] *= 0.25
+
+
 def _grid(grids):
     if grids.coords is None:
         grids.build()
@@ -134,32 +159,32 @@ def _grid(grids):
 
 
 class NumInt(pyscf_numint.NumInt):
-    """pyscf's ``NumInt`` with ``nr_rks``/``nr_uks`` for LDA and GGA functionals from the Mojo kernels."""
+    """pyscf's ``NumInt`` with ``nr_rks``/``nr_uks`` for LDA, GGA and meta-GGA functionals from the Mojo kernels."""
 
     def nr_rks(self, mol, grids, xc_code, dms, relativity=0, hermi=1, max_memory=2000, verbose=None):
         if not _passes_ok(self, mol, xc_code, dms, hermi):
             return super().nr_rks(mol, grids, xc_code, dms, relativity, hermi, max_memory, verbose)
         xctype = self._xc_type(xc_code)
-        deriv = 0 if xctype == "LDA" else 1
+        kind = _kind(self, xc_code)
         nao = mol.nao_nr()
         dm = np.asarray(dms, dtype=np.float64)
         single = dm.ndim == 2
         dm = np.ascontiguousarray(dm.reshape(-1, nao, nao))
         nset = dm.shape[0]
         coords, weights = _grid(grids)
-        rho = _rho(mol, coords, deriv, dm, _orbitals(dms, nset, nao))
+        rho = _rho(mol, coords, kind, dm, _orbitals(dms, nset, nao))
         nelec = np.zeros(nset)
         excsum = np.zeros(nset)
         wv = np.empty_like(rho)
         for i in range(nset):
-            r = rho[i, 0] if deriv == 0 else rho[i]
+            r = rho[i, 0] if kind == 0 else rho[i]
             exc, vxc = self.eval_xc_eff(xc_code, r, deriv=1, xctype=xctype, spin=0)[:2]
             den = rho[i, 0] * weights
             nelec[i] = den.sum()
             excsum[i] = _wsum(den, exc)
             wv[i] = weights * np.asarray(vxc).reshape(-1, weights.size)
-            wv[i, 0] *= 0.5                     # V + V^T below
-        vmat = _vmat(mol, coords, deriv, wv)
+            _halve(wv[i])
+        vmat = _vmat(mol, coords, kind, wv)
         if single:
             return nelec[0], excsum[0], vmat[0]
         return nelec, excsum, vmat
@@ -168,7 +193,7 @@ class NumInt(pyscf_numint.NumInt):
         if not _passes_ok(self, mol, xc_code, dms, hermi):
             return super().nr_uks(mol, grids, xc_code, dms, relativity, hermi, max_memory, verbose)
         xctype = self._xc_type(xc_code)
-        deriv = 0 if xctype == "LDA" else 1
+        kind = _kind(self, xc_code)
         nao = mol.nao_nr()
         dma, dmb = pyscf_numint._format_uks_dm(dms)
         single = np.asarray(dma).ndim == 2
@@ -177,13 +202,13 @@ class NumInt(pyscf_numint.NumInt):
         nset = dma.shape[0]
         coords, weights = _grid(grids)
         orbitals = _orbitals(dms, 2, nao) if nset == 1 else None
-        rho = _rho(mol, coords, deriv, np.ascontiguousarray(np.concatenate([dma, dmb])), orbitals)
+        rho = _rho(mol, coords, kind, np.ascontiguousarray(np.concatenate([dma, dmb])), orbitals)
         nelec = np.zeros((2, nset))
         excsum = np.zeros(nset)
         wv = np.empty_like(rho)
         for i in range(nset):
             ra, rb = rho[i], rho[nset + i]
-            r = (ra[0], rb[0]) if deriv == 0 else (ra, rb)
+            r = (ra[0], rb[0]) if kind == 0 else (ra, rb)
             exc, vxc = self.eval_xc_eff(xc_code, r, deriv=1, xctype=xctype, spin=1)[:2]
             den_a = ra[0] * weights
             den_b = rb[0] * weights
@@ -193,9 +218,9 @@ class NumInt(pyscf_numint.NumInt):
             vxc = np.asarray(vxc).reshape(2, -1, weights.size)
             wv[i] = weights * vxc[0]
             wv[nset + i] = weights * vxc[1]
-            wv[i, 0] *= 0.5
-            wv[nset + i, 0] *= 0.5
-        vmat = _vmat(mol, coords, deriv, wv).reshape(2, nset, nao, nao)
+            _halve(wv[i])
+            _halve(wv[nset + i])
+        vmat = _vmat(mol, coords, kind, wv).reshape(2, nset, nao, nao)
         if single:
             return nelec[:, 0], excsum[0], vmat[:, 0]
         return nelec, excsum, vmat
@@ -220,8 +245,10 @@ def _grad_weights(ni, xc_code, rho, weights, spin):
         for k in range(1 + spin):
             j = k * nset + i
             wv[j] = weights * vxc[k]
-            if xctype == "GGA":
+            if xctype in ("GGA", "MGGA"):
                 wv[j, 0] *= 0.5
+            if xctype == "MGGA":
+                wv[j, 4] *= 0.5                 # the 1/2 of tau
     return wv
 
 
@@ -258,7 +285,7 @@ def grad_xc(ni, mol, grids, xc_code, dms, spin=0):
     ``2 sum_{mu on A} (vxc[:, mu] * D[mu]).sum()`` with ``vxc`` from
     ``grad.rks.get_vxc`` (``spin=0``, ``dms`` the total density) or
     ``grad.uks.get_vxc`` (``spin=1``, ``dms`` (2, nao, nao), summed over
-    spins).  For :class:`NumInt` objects with LDA/GGA functionals the Mojo
+    spins).  For :class:`NumInt` objects with LDA, GGA and meta-GGA functionals the Mojo
     kernels contract the derivative matrices with the density as they are
     produced; otherwise pyscf's ``get_vxc`` provides the matrices.
     """
@@ -268,17 +295,17 @@ def grad_xc(ni, mol, grids, xc_code, dms, spin=0):
     nao = mol.nao_nr()
     dm = np.asarray(dms, dtype=np.float64).reshape(-1, nao, nao)
     if isinstance(ni, NumInt) and _passes_ok(ni, mol, xc_code, dm, 1):
-        gga = ni._xc_type(xc_code) == "GGA"
+        kind = _kind(ni, xc_code)
         coords, weights = _grid(grids)
         dm = np.ascontiguousarray(dm)
         orbitals = _orbitals(dms, dm.shape[0], nao)
-        rho = _rho(mol, coords, int(gga), dm, orbitals)
+        rho = _rho(mol, coords, kind, dm, orbitals)
         wv = _grad_weights(ni, xc_code, rho, weights, spin)
         de = np.empty((mol.natm, 3))
         if orbitals is None:
             orbitals = (np.zeros((dm.shape[0], nao, 0)), np.zeros((dm.shape[0], 0)))
         path, prefix = worker_blas()
-        get_extension().xc_grad_dm(integrals.basis_tables(mol), coords, int(gga), np.ascontiguousarray(wv), dm,
+        get_extension().xc_grad_dm(integrals.basis_tables(mol), coords, int(kind), np.ascontiguousarray(wv), dm,
                                    np.ascontiguousarray(orbitals[0]), np.ascontiguousarray(orbitals[1]), de,
                                    path, prefix)
         return de
@@ -306,7 +333,8 @@ def _install_grad_vxc():
             return
 
         def get_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1, max_memory=2000, verbose=None):
-            if isinstance(ni, NumInt) and relativity == 0 and nset_ok(mol, dms) and _passes_ok(ni, mol, xc_code, dms, hermi):
+            if (isinstance(ni, NumInt) and relativity == 0 and nset_ok(mol, dms)
+                    and _passes_ok(ni, mol, xc_code, dms, hermi, max_kind=1)):
                 return mojo_fn(ni, mol, grids, xc_code, dms, relativity, hermi, max_memory, verbose)
             return orig(ni, mol, grids, xc_code, dms, relativity, hermi, max_memory, verbose)
 

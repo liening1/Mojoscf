@@ -354,8 +354,8 @@ class _MojoKSGradMixin:
     """Kohn-Sham: ``grad_2e`` is the Coulomb and scaled exact-exchange term plus the XC term.
 
     The XC term (at fixed grids) is :func:`mojoscf.dft.grad_xc`: the Mojo
-    kernels for ``mojoscf.dft.NumInt`` with LDA/GGA functionals, pyscf's
-    ``get_vxc`` otherwise.  Range-separated functionals, non-local
+    kernels for ``mojoscf.dft.NumInt`` with LDA, GGA and meta-GGA
+    functionals, pyscf's ``get_vxc`` otherwise.  Range-separated functionals, non-local
     correlation (``nlc``) and ``grid_response`` keep pyscf's ``get_veff``.
     """
 

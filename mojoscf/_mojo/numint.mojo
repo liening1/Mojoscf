@@ -487,30 +487,58 @@ def gather_rows(c: F64Ptr, ncol: Int, ws: AOWork):
             k += 1
 
 
+def _store_pts(dst: F64Ptr, v: Int, npt: Int, acc: F64V):
+    """Store the W values of block vector ``v`` at dst[v W:], only those before ``npt``."""
+    if v * W + W <= npt:
+        dst.unsafe_store(v * W, acc)
+    else:
+        for lane in range(W):
+            if v * W + lane < npt:
+                dst[unsafe_offset=v * W + lane] = acc[lane]
+
+
+def _nrho(kind: Int) -> Int:
+    """Density components per set: 1 (LDA), 4 (GGA: rho, grad rho), 5 (meta-GGA: + tau)."""
+    return 1 if kind == 0 else (4 if kind == 1 else 5)
+
+
 def xc_rho_core(
-    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, deriv: Bool, nset: Int, dms: F64Ptr, norb: Int,
+    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, kind: Int, nset: Int, dms: F64Ptr, norb: Int,
     orbs: F64Ptr, occs: F64Ptr, rho_out: F64Ptr,
 ) raises:
-    """rho_out[s][c][p]: density (c = 0) and, with ``deriv``, its gradient (c = 1..3) of each D_s (symmetric).
+    """rho_out[s][c][p] for each symmetric D_s: the density (c = 0); for ``kind`` 1 (GGA) and 2
+    (meta-GGA) its gradient (c = 1..3); for meta-GGA tau = 1/2 sum_c sum_ij D_ij d_c phi_i d_c phi_j
+    (c = 4, pyscf's convention).
 
     With ``norb`` > 0, D_s = C_s diag(n_s) C_s^T is also given by orbitals
     ``orbs[s]`` (nao x norb, row-major) and occupations ``occs[s]`` (norb);
     blocks where it is cheaper use them: psi = C_sub^T phi, rho = sum_k n_k
-    psi_k^2 and Y = D_sub phi = C_sub (n psi) (GGA), two GEMMs of norb x nrow
-    instead of one of nrow x nrow.
+    psi_k^2 and, for GGA, Y = D_sub phi = C_sub (n psi), two GEMMs of
+    norb x nrow instead of one of nrow x nrow; for meta-GGA psi_c = C_sub^T
+    d_c phi too, grad rho = 2 sum_k n_k psi_k psi_c,k and tau = 1/2 sum_k n_k
+    sum_c psi_c,k^2 (four GEMMs of norb x nrow instead of four of nrow x nrow).
     """
+    var nderiv = 0 if kind == 0 else 1
+    var nout = _nrho(kind)
     var grid = Grid(ngrid, coords)
-    var rcut = _rcuts(basis, 1 if deriv else 0)
+    var rcut = _rcuts(basis, nderiv)
     var nao = basis.nao
     var n2 = nao * nao
-    var ncomp = 4 if deriv else 1
+    var ncomp = _ncomp(nderiv)
     var nblk = grid.nblk
     var nworkers = max(1, min(parallelism_level(), nblk))
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm deriv, imm nset, imm dms, imm norb, imm orbs, imm occs, imm rho_out, imm ngrid}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nout, imm kind, imm nset, imm dms, imm norb, imm orbs, imm occs, imm rho_out, imm ngrid}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
+        var pl = List[Float64](length=(4 if kind == 2 else 1) * max(norb, 1) * BLK + W, fill=0.0)
+        var pbuf = F64Ptr(unsafe_from_address=aligned_addr(pl))     # psi_c (meta-GGA orbital route)
+        var tl = List[Float64](length=BLK + W, fill=0.0)
+        var tau = F64Ptr(unsafe_from_address=aligned_addr(tl))
+        # orbitals when their GEMMs are cheaper than the products with D_sub
+        var ngemm_orb = 1 if kind == 0 else (2 if kind == 1 else 4)
+        var ngemm_d = 4 if kind == 2 else 1
         while True:
             var blk = Int(pcount[].fetch_add(1))
             if blk >= nblk:
@@ -521,35 +549,63 @@ def xc_rho_core(
             var npt = min(BLK, ngrid - p0)
             if nrow == 0:
                 for s in range(nset):
-                    for c in range(ncomp):
-                        vfill(rho_out.unsafe_offset((s * ncomp + c) * ngrid + p0), npt, 0.0)
+                    for c in range(nout):
+                        vfill(rho_out.unsafe_offset((s * nout + c) * ngrid + p0), npt, 0.0)
                 continue
-            eval_block(basis, grid, blk, 1 if deriv else 0, sel[0], nrow, ws)
-            # orbitals when their GEMMs (one, or two for the gradient) are cheaper than D_sub phi
-            var use_orb = norb > 0 and (2 if deriv else 1) * norb * 10 < nrow * 9
+            eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            var cs = nrow * BLK
+            var use_orb = norb > 0 and ngemm_orb * norb * 10 < ngemm_d * nrow * 9
             for s in range(nset):
+                var out = rho_out.unsafe_offset((s * nout) * ngrid + p0)
                 var c0 = 0
                 if use_orb:
-                    var psi = ws.y2(nrow)
                     var nk = occs.unsafe_offset(s * norb)
                     gather_rows(orbs.unsafe_offset(s * nao * norb), norb, ws)
+                    if kind == 2:
+                        var pb = norb * BLK
+                        for c in range(4):
+                            try:
+                                blas.gemm(True, False, norb, BLK, nrow, 1.0, ws.dsub(), ws.ao().unsafe_offset(c * cs), 0.0,
+                                          pbuf.unsafe_offset(c * pb))
+                            except:
+                                pass
+                        for v in range(NV):
+                            var r = F64V(0.0)
+                            var gx = F64V(0.0)
+                            var gy = F64V(0.0)
+                            var gz = F64V(0.0)
+                            var t = F64V(0.0)
+                            for k in range(norb):
+                                var o = k * BLK + v * W
+                                var n = nk[unsafe_offset=k]
+                                var q = pbuf.unsafe_load[width=W](o)
+                                var qx = pbuf.unsafe_load[width=W](pb + o)
+                                var qy = pbuf.unsafe_load[width=W](2 * pb + o)
+                                var qz = pbuf.unsafe_load[width=W](3 * pb + o)
+                                var nq = q * n
+                                r += nq * q
+                                gx += nq * qx
+                                gy += nq * qy
+                                gz += nq * qz
+                                t += (qx * qx + qy * qy + qz * qz) * n
+                            _store_pts(out, v, npt, r)
+                            _store_pts(out.unsafe_offset(ngrid), v, npt, gx * 2.0)
+                            _store_pts(out.unsafe_offset(2 * ngrid), v, npt, gy * 2.0)
+                            _store_pts(out.unsafe_offset(3 * ngrid), v, npt, gz * 2.0)
+                            _store_pts(out.unsafe_offset(4 * ngrid), v, npt, t * 0.5)
+                        continue
+                    var psi = ws.y2(nrow)
                     try:
                         blas.gemm(True, False, norb, BLK, nrow, 1.0, ws.dsub(), ws.ao(), 0.0, psi)
                     except:
                         pass
-                    var dst = rho_out.unsafe_offset((s * ncomp) * ngrid + p0)
                     for v in range(NV):
                         var acc = F64V(0.0)
                         for k in range(norb):
                             var t = psi.unsafe_load[width=W](k * BLK + v * W)
                             acc += t * t * nk[unsafe_offset=k]
-                        if v * W + W <= npt:
-                            dst.unsafe_store(v * W, acc)
-                        else:
-                            for lane in range(W):
-                                if v * W + lane < npt:
-                                    dst[unsafe_offset=v * W + lane] = acc[lane]
-                    if not deriv:
+                        _store_pts(out, v, npt, acc)
+                    if kind == 0:
                         continue
                     for k in range(norb):
                         var f = nk[unsafe_offset=k]
@@ -561,28 +617,39 @@ def xc_rho_core(
                         pass
                     c0 = 1
                 else:
-                    var dm = dms.unsafe_offset(s * n2)
-                    gather_block(dm, nao, nrow, ws)
+                    gather_block(dms.unsafe_offset(s * n2), nao, nrow, ws)
                     try:
                         blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ws.ao(), 0.0, ws.y())
                     except:
                         pass
                 for c in range(c0, ncomp):
                     var fac = 1.0 if c == 0 else 2.0
-                    var ac = ws.ao().unsafe_offset(c * nrow * BLK)
-                    var dst = rho_out.unsafe_offset((s * ncomp + c) * ngrid + p0)
+                    var ac = ws.ao().unsafe_offset(c * cs)
                     for v in range(NV):
                         var acc = F64V(0.0)
                         for i in range(nrow):
                             acc += ac.unsafe_load[width=W](i * BLK + v * W) * ws.y().unsafe_load[width=W](i * BLK + v * W)
-                        acc *= fac
-                        if v * W + W <= npt:
-                            dst.unsafe_store(v * W, acc)
-                        else:
-                            for lane in range(W):
-                                if v * W + lane < npt:
-                                    dst[unsafe_offset=v * W + lane] = acc[lane]
+                        _store_pts(out.unsafe_offset(c * ngrid), v, npt, acc * fac)
+                if kind == 2:
+                    # tau = 1/2 sum_c sum_i d_c phi_i (D_sub d_c phi)_i (D_sub still in ws.dsub)
+                    vfill(tau, BLK, 0.0)
+                    var yc = ws.y2(nrow)
+                    for c in range(1, 4):
+                        var ac = ws.ao().unsafe_offset(c * cs)
+                        try:
+                            blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ac, 0.0, yc)
+                        except:
+                            pass
+                        for v in range(NV):
+                            var acc = tau.unsafe_load[width=W](v * W)
+                            for i in range(nrow):
+                                acc += ac.unsafe_load[width=W](i * BLK + v * W) * yc.unsafe_load[width=W](i * BLK + v * W)
+                            tau.unsafe_store(v * W, acc)
+                    for v in range(NV):
+                        _store_pts(out.unsafe_offset(4 * ngrid), v, npt, tau.unsafe_load[width=W](v * W) * 0.5)
         _ = ws^
+        _ = pl^
+        _ = tl^
 
     var nthr = blas.serial_begin()
     if nworkers == 1:
@@ -607,14 +674,17 @@ def _load_w(wv: F64Ptr, off: Int, v: Int, npt: Int) -> F64V:
 
 
 def xc_vmat_core(
-    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, deriv: Bool, nset: Int, wv: F64Ptr, vmat_out: F64Ptr
+    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, kind: Int, nset: Int, wv: F64Ptr, vmat_out: F64Ptr
 ) raises:
-    """vmat_out[s] = sum_p phi(p) [sum_c wv[s][c][p] phi_c(p)]^T (nao x nao, not symmetrised), overwritten."""
+    """vmat_out[s] = sum_p phi(p) [sum_c wv[s][c][p] phi_c(p)]^T (c = 0 for LDA, 0..3 for GGA), plus for
+    meta-GGA (``kind`` 2) sum_c d_c phi (wv[s][4] d_c phi)^T; nao x nao, not symmetrised, overwritten."""
+    var nderiv = 0 if kind == 0 else 1
+    var nw = _nrho(kind)
     var grid = Grid(ngrid, coords)
-    var rcut = _rcuts(basis, 1 if deriv else 0)
+    var rcut = _rcuts(basis, nderiv)
     var nao = basis.nao
     var n2 = nao * nao
-    var ncomp = 4 if deriv else 1
+    var ncomp = _ncomp(nderiv)
     var nblk = grid.nblk
     var nworkers = max(1, min(parallelism_level(), nblk))
     var accl = List[Float64](length=nworkers * nset * n2 + 1, fill=0.0)
@@ -622,7 +692,7 @@ def xc_vmat_core(
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm deriv, imm nset, imm wv, imm pacc, imm ngrid}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm kind, imm nset, imm wv, imm pacc, imm ngrid}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nset * n2)
         while True:
@@ -635,21 +705,23 @@ def xc_vmat_core(
                 continue
             var p0 = blk * BLK
             var npt = min(BLK, ngrid - p0)
-            eval_block(basis, grid, blk, 1 if deriv else 0, sel[0], nrow, ws)
+            eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            var cs = nrow * BLK
             for s in range(nset):
+                var off = (s * nw) * ngrid + p0
                 # Z[i][p] = sum_c wv_c(p) phi_c,i(p) into ws.y (padding points weigh zero)
                 for v in range(NV):
-                    var w0 = _load_w(wv, (s * ncomp) * ngrid + p0, v, npt)
+                    var w0 = _load_w(wv, off, v, npt)
                     if ncomp == 1:
                         for i in range(nrow):
                             ws.y().unsafe_store(i * BLK + v * W, ws.ao().unsafe_load[width=W](i * BLK + v * W) * w0)
                     else:
-                        var w1 = _load_w(wv, (s * ncomp + 1) * ngrid + p0, v, npt)
-                        var w2 = _load_w(wv, (s * ncomp + 2) * ngrid + p0, v, npt)
-                        var w3 = _load_w(wv, (s * ncomp + 3) * ngrid + p0, v, npt)
-                        var ax = ws.ao().unsafe_offset(nrow * BLK)
-                        var ay = ws.ao().unsafe_offset(2 * nrow * BLK)
-                        var az = ws.ao().unsafe_offset(3 * nrow * BLK)
+                        var w1 = _load_w(wv, off + ngrid, v, npt)
+                        var w2 = _load_w(wv, off + 2 * ngrid, v, npt)
+                        var w3 = _load_w(wv, off + 3 * ngrid, v, npt)
+                        var ax = ws.ao().unsafe_offset(cs)
+                        var ay = ws.ao().unsafe_offset(2 * cs)
+                        var az = ws.ao().unsafe_offset(3 * cs)
                         for i in range(nrow):
                             var o = i * BLK + v * W
                             var z = ws.ao().unsafe_load[width=W](o) * w0 + ax.unsafe_load[width=W](o) * w1
@@ -659,6 +731,19 @@ def xc_vmat_core(
                     blas.gemm(False, True, nrow, nrow, BLK, 1.0, ws.ao(), ws.y(), 0.0, ws.dsub())
                 except:
                     pass
+                if kind == 2:
+                    # + sum_c d_c phi (w_tau d_c phi)^T
+                    for c in range(1, 4):
+                        var ac = ws.ao().unsafe_offset(c * cs)
+                        for v in range(NV):
+                            var w4 = _load_w(wv, off + 4 * ngrid, v, npt)
+                            for i in range(nrow):
+                                var o = i * BLK + v * W
+                                ws.y().unsafe_store(o, ac.unsafe_load[width=W](o) * w4)
+                        try:
+                            blas.gemm(False, True, nrow, nrow, BLK, 1.0, ac, ws.y(), 1.0, ws.dsub())
+                        except:
+                            pass
                 scatter_add_block(acc.unsafe_offset(s * n2), nao, nrow, ws)
         _ = ws^
 
@@ -802,7 +887,7 @@ def _orb_apply(blas: Blas, nrow: Int, norb: Int, nk: F64Ptr, src: F64Ptr, tmp: F
 
 
 def xc_grad_dm_core(
-    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, gga: Bool, nset: Int, wv: F64Ptr, dms: F64Ptr,
+    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, kind: Int, nset: Int, wv: F64Ptr, dms: F64Ptr,
     norb: Int, orbs: F64Ptr, occs: F64Ptr, de_out: F64Ptr,
 ) raises:
     """XC term of the nuclear gradient, de_out[A][x] = -2 sum_s sum_{mu on A, nu} D_s,mu nu V_s,x,mu nu
@@ -814,7 +899,10 @@ def xc_grad_dm_core(
     for GGA; for LDA (w0 not halved) sum_p d_x phi_mu w0 G0_mu.  With ``norb`` > 0
     the densities are also given by orbitals (as in ``xc_rho_core``) and
     blocks where it is cheaper form G0 = C (n C^T phi) and G1 = C (n C^T Z).
+    Meta-GGA (``kind`` 2, wv[4] the tau weight halved as in pyscf) adds
+    sum_c sum_p d_x d_c phi_mu w_4 (D d_c phi)_mu (pyscf's ``_tau_grad_dot_``).
     """
+    var gga = kind >= 1
     var grid = Grid(ngrid, coords)
     var nderiv = 2 if gga else 1
     var rcut = _rcuts(basis, nderiv)
@@ -822,7 +910,7 @@ def xc_grad_dm_core(
     var n2 = nao * nao
     var natm = basis.natm
     var ncomp = _ncomp(nderiv)
-    var nw = 4 if gga else 1
+    var nw = _nrho(kind)
     var nblk = grid.nblk
     var nworkers = max(1, min(parallelism_level(), nblk))
     var accl = List[Float64](length=nworkers * natm * 3 + 1, fill=0.0)
@@ -830,12 +918,12 @@ def xc_grad_dm_core(
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm nset, imm wv, imm dms, imm norb, imm orbs, imm occs, imm pacc, imm ngrid}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm kind, imm nset, imm wv, imm dms, imm norb, imm orbs, imm occs, imm pacc, imm ngrid}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * basis.natm * 3)
         var tl = List[Float64](length=max(norb, 1) * BLK + W, fill=0.0)
         var tmp = F64Ptr(unsafe_from_address=aligned_addr(tl))
-        var wl = List[Float64](length=4 * BLK + W, fill=0.0)    # the block's weights, zero-padded
+        var wl = List[Float64](length=5 * BLK + W, fill=0.0)    # the block's weights, zero-padded
         var wb = list_ptr(wl)
         var rowatm = List[Int](length=max(nao, 1), fill=0)
         while True:
@@ -938,6 +1026,34 @@ def xc_grad_dm_core(
                     acc[unsafe_offset=3 * a] -= 2.0 * tx.reduce_add()
                     acc[unsafe_offset=3 * a + 1] -= 2.0 * ty.reduce_add()
                     acc[unsafe_offset=3 * a + 2] -= 2.0 * tz.reduce_add()
+                if kind == 2:
+                    # tau: G_c = D d_c phi into g1; d_x d_c phi components (xx 4, xy 5, xz 6, yy 7, yz 8, zz 9)
+                    for c in range(1, 4):
+                        var ac = ao.unsafe_offset(c * cs)
+                        if use_orb:
+                            _orb_apply(blas, nrow, norb, nk, ac, tmp, g1, ws)
+                        else:
+                            try:
+                                blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ac, 0.0, g1)
+                            except:
+                                pass
+                        var kx = 3 + c
+                        var ky = 5 if c == 1 else (7 if c == 2 else 8)
+                        var kz = 6 if c == 1 else (8 if c == 2 else 9)
+                        for i in range(nrow):
+                            var tx = F64V(0.0)
+                            var ty = F64V(0.0)
+                            var tz = F64V(0.0)
+                            for v in range(NV):
+                                var o = i * BLK + v * W
+                                var h = g1.unsafe_load[width=W](o) * wb.unsafe_load[width=W](4 * BLK + v * W)
+                                tx += ao.unsafe_load[width=W](kx * cs + o) * h
+                                ty += ao.unsafe_load[width=W](ky * cs + o) * h
+                                tz += ao.unsafe_load[width=W](kz * cs + o) * h
+                            var a = rowatm[i]
+                            acc[unsafe_offset=3 * a] -= 2.0 * tx.reduce_add()
+                            acc[unsafe_offset=3 * a + 1] -= 2.0 * ty.reduce_add()
+                            acc[unsafe_offset=3 * a + 2] -= 2.0 * tz.reduce_add()
         _ = ws^
         _ = wl^
         _ = tl^

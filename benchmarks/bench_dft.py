@@ -29,6 +29,8 @@ CASES = {
     "fc-pbe-tz-df": ("ferrocene / def2-TZVP PBE (DF)", "ferrocene_atoms()", "def2-tzvp", 0, 0, "pbe", "df"),
     "fe6-pbe0-df": ("[Fe(H2O)6]2+ quintet / def2-TZVP PBE0 (DF, UKS)", FE6, "def2-tzvp", 2, 4, "pbe0", "df"),
     "cu-b3lyp-df": ("[Cu(NH3)4]2+ doublet / def2-TZVP B3LYP (DF, UKS)", CU4, "def2-tzvp", 2, 1, "b3lyp", "df"),
+    "fc-r2scan-df": ("ferrocene / def2-SVP r2SCAN (DF)", "ferrocene_atoms()", "def2-svp", 0, 0, "r2scan", "df"),
+    "cu-r2scan-df": ("[Cu(NH3)4]2+ doublet / def2-TZVP r2SCAN (DF, UKS)", CU4, "def2-tzvp", 2, 1, "r2scan", "df"),
     "w5-pbe-ic": ("(H2O)5 / def2-TZVP PBE (in-core)", "water_cluster_atoms(5)", "def2-tzvp", 0, 0, "pbe", "incore"),
     "c8-b3lyp-d": ("C8H18 / 6-31G* B3LYP (direct)", "alkane_atoms(8)", "6-31g*", 0, 0, "b3lyp", "direct"),
 }

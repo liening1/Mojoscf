@@ -73,10 +73,10 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix): three-centre term of the DF gradient.")
         m.def_function[py_grad2c]("grad2c", docstring="grad2c(auxbasis, table, w, de): d/dR of -1/2 sum (P|Q) W_PQ.")
         m.def_function[py_eval_ao]("eval_ao", docstring="eval_ao(basis, coords, deriv, out): AO values and derivatives (deriv <= 2) on the points, out (ncomp, ngrid, nao).")
-        m.def_function[py_xc_rho]("xc_rho", docstring="xc_rho(basis, coords, deriv, dms, orbs, occs, rho, seq_path, seq_prefix): densities (and gradients) of symmetric dms (nset, nao, nao), optionally also given as orbitals orbs (nset, nao, norb) with occupations occs (nset, norb; norb may be 0), into rho (nset, ncomp, ngrid).")
-        m.def_function[py_xc_vmat]("xc_vmat", docstring="xc_vmat(basis, coords, deriv, wv, vmat, seq_path, seq_prefix): sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T into vmat (nset, nao, nao).")
+        m.def_function[py_xc_rho]("xc_rho", docstring="xc_rho(basis, coords, kind, dms, orbs, occs, rho, seq_path, seq_prefix): densities (kind 0), with gradients (1), and tau (2: meta-GGA) of symmetric dms (nset, nao, nao), optionally also given as orbitals orbs (nset, nao, norb) with occupations occs (nset, norb; norb may be 0), into rho (nset, ncomp, ngrid).")
+        m.def_function[py_xc_vmat]("xc_vmat", docstring="xc_vmat(basis, coords, kind, wv, vmat, seq_path, seq_prefix): sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T (+ the tau term for kind 2) into vmat (nset, nao, nao).")
         m.def_function[py_xc_grad]("xc_grad", docstring="xc_grad(basis, coords, gga, wv, vmat, seq_path, seq_prefix): XC gradient matrices (nset, 3, nao, nao) of pyscf's grad.rks.get_vxc, before its sign flip.")
-        m.def_function[py_xc_grad_dm]("xc_grad_dm", docstring="xc_grad_dm(basis, coords, gga, wv, dms, orbs, occs, de, seq_path, seq_prefix): XC term of the nuclear gradient (natm, 3), the XC gradient matrices contracted with the densities (optionally also given as orbitals, norb may be 0).")
+        m.def_function[py_xc_grad_dm]("xc_grad_dm", docstring="xc_grad_dm(basis, coords, kind, wv, dms, orbs, occs, de, seq_path, seq_prefix): XC term of the nuclear gradient (natm, 3), the XC gradient matrices contracted with the densities (optionally also given as orbitals, norb may be 0).")
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
         m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces, atoms): sum_k w_k (nabla i j|k) (3, nao, nao), sum_ij D_ij w_k (ij|nabla k) (nch, 3), 2 sum_{i on A} D_ij sum_k w_k (nabla i j|k) (natm, 3); an empty output is skipped.")
         m.def_function[py_int1e_iprinv_dm]("int1e_iprinv_dm", docstring="int1e_iprinv_dm(basis, table, centers, dm, out): sum_ij D_ij <nabla i|1/|r-R_c||j> per centre (ncenter, 3).")
@@ -603,7 +603,7 @@ def py_xc_rho(
 ) raises -> PythonObject:
     var bs = _basis(basis)
     xc_rho_core(
-        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv) > 0,
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv),
         Int(py=dms.shape[0]), f64ptr(dms), Int(py=orbs.shape[2]), f64ptr(orbs), f64ptr(occs), f64ptr(rho),
     )
     _ = bs^
@@ -616,7 +616,7 @@ def py_xc_vmat(
 ) raises -> PythonObject:
     var bs = _basis(basis)
     xc_vmat_core(
-        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv) > 0,
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv),
         Int(py=wv.shape[0]), f64ptr(wv), f64ptr(vmat),
     )
     _ = bs^
@@ -642,7 +642,7 @@ def py_xc_grad_dm(
 ) raises -> PythonObject:
     var bs = _basis(basis)
     xc_grad_dm_core(
-        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=gga) > 0,
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=gga),
         Int(py=wv.shape[0]), f64ptr(wv), f64ptr(dms), Int(py=orbs.shape[2]), f64ptr(orbs), f64ptr(occs), f64ptr(de),
     )
     _ = bs^

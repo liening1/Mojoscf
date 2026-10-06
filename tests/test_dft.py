@@ -28,7 +28,7 @@ def test_eval_ao_matches_pyscf(basis, cart):
         assert abs(mdft.eval_ao(mol, coords, deriv) - ref).max() < 1e-12 * max(1.0, abs(ref).max())
 
 
-@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "b3lyp", "blyp"])
+@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "b3lyp", "blyp", "tpss", "r2scan", "m06l"])
 def test_nr_rks_matches_pyscf(water_grid, xc):
     mol, grids = water_grid
     dm = scf.hf.init_guess_by_minao(mol)
@@ -43,7 +43,7 @@ def test_nr_rks_matches_pyscf(water_grid, xc):
     assert abs(e2[1] - e3) < 1e-10 and abs(v2[1] - v3).max() < 1e-10
 
 
-@pytest.mark.parametrize("xc", ["lda,vwn", "pbe"])
+@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "r2scan"])
 def test_nr_uks_matches_pyscf(water_grid, xc):
     mol, grids = water_grid
     dm = scf.hf.init_guess_by_minao(mol)
@@ -54,7 +54,7 @@ def test_nr_uks_matches_pyscf(water_grid, xc):
     assert abs(v0 - v1).max() < 1e-10
 
 
-@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "b3lyp", "tpss"])
+@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "b3lyp", "tpss", "r2scan"])
 def test_xc_gradient_matches_pyscf(water_grid, xc):
     from pyscf.grad import rks as rks_grad
     from pyscf.grad import uks as uks_grad
@@ -81,10 +81,15 @@ def test_cartesian_and_fallbacks():
     grids = dft.gen_grid.Grids(mol)
     grids.build()
     dm = scf.hf.init_guess_by_minao(mol)
-    for xc in ("pbe", "tpss"):          # meta-GGA keeps pyscf's code
+    for xc in ("pbe", "tpss"):
         n0, e0, v0 = numint.NumInt().nr_rks(mol, grids, xc, dm)
         n1, e1, v1 = mdft.NumInt().nr_rks(mol, grids, xc, dm)
         assert abs(e0 - e1) < 1e-10 and abs(v0 - v1).max() < 1e-10
+    ni = mdft.NumInt()
+    assert mdft._kind(ni, "tpss") == 2 and mdft._kind(ni, "pbe") == 1 and mdft._kind(ni, "lda,vwn") == 0
+    assert mdft._kind(ni, "mgga_x_br89") is None
+    with pytest.raises(NotImplementedError):          # laplacian meta-GGA: pyscf's code, which rejects it
+        ni.nr_rks(mol, grids, "mgga_x_br89", dm)
     a = np.random.default_rng(1).normal(size=dm.shape)        # non-symmetric density: pyscf's path
     n0, e0, v0 = numint.NumInt().nr_rks(mol, grids, "lda,vwn", dm + 1e-3 * a, hermi=0)
     n1, e1, v1 = mdft.NumInt().nr_rks(mol, grids, "lda,vwn", dm + 1e-3 * a, hermi=0)
@@ -137,7 +142,7 @@ def test_exact_jk_matches_pyscf():
 
 
 @pytest.mark.parametrize("df", [False, True])
-@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "tpss", "camb3lyp"])
+@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "tpss", "r2scan", "camb3lyp"])
 def test_ks_gradients(df, xc):
     """Pure, meta-GGA and range-separated functionals; grid response and pyscf's NumInt."""
     mol = gto.M(atom=WATER, basis="def2-svp", verbose=0)
@@ -162,6 +167,16 @@ def test_ks_gradients(df, xc):
         mf._numint = numint.NumInt()                     # pyscf's XC code inside the Mojo gradient
         g = mf.nuc_grad_method()
         assert g._direct_2e() and abs(g.kernel() - g0).max() < 1e-7
+
+
+def test_meta_gga_uks_scf_and_gradient():
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=1, spin=1, verbose=0)
+    ref = dft.UKS(mol, xc="r2scan").density_fit().run(conv_tol=1e-11)
+    mf = mdft.accelerate(dft.UKS(mol, xc="r2scan").density_fit()).run(conv_tol=1e-11)
+    assert abs(mf.e_tot - ref.e_tot) < 1e-9
+    g = mf.nuc_grad_method()
+    assert type(g) is mojoscf.grad.DFUKSGradients and g._direct_2e()
+    assert abs(g.kernel() - ref.nuc_grad_method().kernel()).max() < 1e-7
 
 
 def test_ks_gradient_scanner():
