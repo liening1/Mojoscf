@@ -10,7 +10,7 @@ integral engine (``mojoscf.integrals.attach(mf)`` makes an SCF object use it);
 :mod:`mojoscf.qmmm` the QM/MM terms used for ``pyscf.qmmm`` objects.
 """
 from ._backend import BackendError, backend_info, blas_args, blas_config, build_extension, set_blas, use_native
-from . import grad, guess, integrals, kernels
+from . import grad, guess, integrals, kernels, qmmm
 from .diis import CDIIS
 from .scf import RHF, UHF, accelerate, is_supported, kernel, native_veff
 
@@ -28,6 +28,7 @@ __all__ = [
     "integrals",
     "grad",
     "guess",
+    "qmmm",
     "backend_info",
     "blas_args",
     "blas_config",

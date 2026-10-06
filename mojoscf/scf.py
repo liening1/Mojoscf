@@ -349,6 +349,19 @@ def _fallback_reason(mf):
     return None
 
 
+def _is_hf(mf) -> bool:
+    """True for (unrestricted or closed-shell restricted) Hartree-Fock, not ROHF, GHF or Kohn-Sham."""
+    from pyscf.scf import rohf
+
+    if not isinstance(mf, (pyscf_hf.RHF, pyscf_uhf.UHF)) or isinstance(mf, rohf.ROHF):
+        return False
+    try:
+        from pyscf.dft.rks import KohnShamDFT
+    except ImportError:  # pragma: no cover
+        return True
+    return not isinstance(mf, KohnShamDFT)
+
+
 def _mojo_grad_method(mf, after):
     """``nuc_grad_method`` for ``mf``, called from class ``after`` of its MRO.
 
@@ -370,10 +383,11 @@ def _mojo_grad_method(mf, after):
             nxt = cls.__dict__["nuc_grad_method"]
             break
     uhf = isinstance(mf, pyscf_uhf.UHF)
-    if nxt is (pyscf_uhf.UHF if uhf else pyscf_hf.RHF).nuc_grad_method:
-        return (grad.UGradients if uhf else grad.Gradients)(mf)
-    if nxt is df_jk._DFHF.nuc_grad_method and not mf.istype("_Solvation"):
-        return (grad.DFUGradients if uhf else grad.DFGradients)(mf)
+    if _is_hf(mf):          # mojoscf's gradients are Hartree-Fock ones (no ROHF or Kohn-Sham)
+        if nxt is (pyscf_uhf.UHF if uhf else pyscf_hf.RHF).nuc_grad_method:
+            return (grad.UGradients if uhf else grad.Gradients)(mf)
+        if nxt is df_jk._DFHF.nuc_grad_method and not mf.istype("_Solvation"):
+            return (grad.DFUGradients if uhf else grad.DFGradients)(mf)
     qmmm_itrf = sys.modules.get("pyscf.qmmm.itrf")
     if qmmm_itrf is not None and nxt is qmmm_itrf.QMMMSCF.nuc_grad_method:
         from . import qmmm

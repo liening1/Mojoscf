@@ -6,16 +6,19 @@ and, in the gradients, its derivative for the QM atoms and the forces on the
 MM charges.  pyscf evaluates these with one integral matrix per block of 200
 charges (``int1e_grids``, ``int1e_grids_ip``, ``int3c2e_ip2``).  When such an
 object runs on the Mojo driver (``mojoscf.accelerate``, or a mojoscf object
-decorated with ``qmmm.mm_charge``), the classes here take over:
+decorated with ``qmmm.mm_charge``), or for any other pyscf SCF method
+(Kohn-Sham DFT, ROHF, ...) through :func:`mm_charge` / :func:`attach` here,
+the classes below take over:
 
 * ``_MojoQMMMHook`` (in front of the SCF class): ``get_hcore`` = the
   Hamiltonian without the charges plus
   ``-sum_k q_k <i|1/|r - R_k||j>`` from :func:`mojoscf.integrals.int1e_grids_sum`.
-* ``_MojoQMMMGrad`` (a subclass of pyscf's ``QMMMGrad`` wrapped around
-  mojoscf's own gradient object): the MM part of ``get_hcore`` from
-  :func:`~mojoscf.integrals.int1e_grids_ip_sum` and ``grad_hcore_mm`` (the
-  electronic force on every MM charge) from
-  :func:`~mojoscf.integrals.mm_charge_forces`; the nucleus-charge terms
+* ``_MojoQMMMGrad`` (a subclass of pyscf's ``QMMMGrad`` wrapped around the
+  method's gradient object, mojoscf's own for RHF/UHF): ``grad_elec`` adds
+  the charge term of the QM-atom gradient and computes the forces on the
+  charges in one pass (:func:`~mojoscf.integrals.mm_grad_terms`), which
+  ``grad_hcore_mm`` then returns; ``get_hcore`` (the derivative matrix) uses
+  :func:`~mojoscf.integrals.int1e_grids_ip_sum`.  The nucleus-charge terms
   (``energy_nuc``, ``grad_nuc``, ``grad_nuc_mm``) stay pyscf's, they are
   O(natm x ncharge) NumPy.
 
@@ -148,6 +151,33 @@ class _MojoQMMMGrad(itrf.QMMMGrad):
         return integrals.mm_charge_forces(mol, dm, coords, charges, zetas)
 
     contract_hcore_mm = grad_hcore_mm
+
+
+def attach(mf):
+    """Make a QM/MM SCF object (``pyscf.qmmm``) take its MM-charge terms from the Mojo engine, in place.
+
+    Works for any pyscf SCF method, including Kohn-Sham DFT and ROHF, which
+    the native mojoscf loop does not run: their SCF and the QM part of their
+    gradients stay pyscf's; the potential of the charges, its derivative for
+    the QM atoms and the forces on the charges come from :mod:`mojoscf.integrals`.
+    (``mojoscf.accelerate`` does this as well for the RHF/UHF it supports.)
+    Returns ``mf``.
+    """
+    if not isinstance(mf, itrf.QMMMSCF):
+        raise TypeError(f"{type(mf).__name__} is not a pyscf.qmmm QM/MM SCF object")
+    if not isinstance(mf, _MojoQMMMHook):
+        lib.set_class(mf, (_MojoQMMMHook, type(mf)))
+    return mf
+
+
+def mm_charge(method, atoms_or_coords, charges, radii=None, unit=None):
+    """``pyscf.qmmm.mm_charge`` with the MM-charge terms from the Mojo engine (see :func:`attach`).
+
+    >>> mf = mojoscf.qmmm.mm_charge(dft.RKS(mol, xc="b3lyp"), coords, charges)
+    >>> mf.kernel(); g = mf.nuc_grad_method(); de = g.kernel()
+    >>> f_mm = g.grad_hcore_mm(mf.make_rdm1()) + g.grad_nuc_mm()
+    """
+    return attach(itrf.mm_charge(method, atoms_or_coords, charges, radii=radii, unit=unit))
 
 
 def qmmm_grad_for_scf(scf_grad):

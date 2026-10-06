@@ -8,7 +8,8 @@ mojoscf), then times the nuclear gradient of the QM atoms
 (``nuc_grad_method().kernel()``) followed by the forces on the MM charges
 (``grad_hcore_mm(dm) + grad_nuc_mm()``), the two together being one MD
 step's worth of forces (mojoscf obtains the MM forces in the gradient's
-pass over the charge integrals).  Usage:
+pass over the charge integrals).  The Kohn-Sham cases run pyscf's DFT with
+only the MM-charge terms from mojoscf (``mojoscf.qmmm.attach``).  Usage:
 
     python benchmarks/bench_qmmm.py [--cases a,b,...] [--list]
 """
@@ -28,13 +29,17 @@ CASES = {
     "c8-20": ("C8H18 / 6-31G*, 20 A (direct)", "alkane_atoms(8)", "6-31g*", 20.0, 0, 0, "rhf", "direct", None),
     "fc-25": ("ferrocene / def2-SVP, 25 A (DF)", "ferrocene_atoms()", "def2-svp", 25.0, 0, 0, "rhf", "df", None),
     "w10p-20": ("(H2O)10+ / cc-pVDZ, 20 A (DF, UHF)", "water_cluster_atoms(10)", "cc-pvdz", 20.0, 1, 1, "uhf", "df", None),
+    # Kohn-Sham: pyscf's SCF and QM gradient, MM-charge terms from mojoscf.qmmm.attach
+    "bz-25-ks": ("benzene / def2-SVP B3LYP, 25 A (DF)", "BENZENE_ATOMS", "def2-svp", 25.0, 0, 0, "b3lyp", "df", None),
+    "fc-25-ks": ("ferrocene / def2-SVP PBE, 25 A (DF)", "ferrocene_atoms()", "def2-svp", 25.0, 0, 0, "pbe", "df", None),
+    "bzp-25-ks": ("benzene+ / def2-SVP B3LYP, 25 A (DF, UKS)", "BENZENE_ATOMS", "def2-svp", 25.0, 1, 1, "ub3lyp", "df", None),
 }
 
 WORKER = r'''
 import json, sys, time
 import numpy as np
 sys.path.insert(0, %(bench_dir)r)
-from pyscf import gto, scf, qmmm
+from pyscf import dft, gto, scf, qmmm
 from systems import *
 from bench_scf import BENZENE
 BENZENE_ATOMS = [(a[0], tuple(a[1])) for a in gto.format_atom(BENZENE, unit=1.0)]
@@ -46,7 +51,11 @@ driver = %(driver)r
 if driver == "mojoscf":
     import mojoscf
     mojoscf.UHF(gto.M(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)).run()  # start the runtime
-mf = scf.RHF(mol) if %(kind)r == "rhf" else scf.UHF(mol)
+kind = %(kind)r
+if kind in ("rhf", "uhf"):
+    mf = scf.RHF(mol) if kind == "rhf" else scf.UHF(mol)
+else:
+    mf = dft.UKS(mol, xc=kind[1:]) if kind.startswith("u") else dft.RKS(mol, xc=kind)
 if %(mode)r == "df":
     mf = mf.density_fit()
 elif %(mode)r == "direct":
@@ -54,7 +63,10 @@ elif %(mode)r == "direct":
 mf = qmmm.mm_charge(mf, coords, charges, radii=radii)
 mf.verbose = 0; mf.conv_tol = 1e-9; mf.max_cycle = 100
 if driver == "mojoscf":
-    mojoscf.accelerate(mf)
+    if kind in ("rhf", "uhf"):
+        mojoscf.accelerate(mf)          # native SCF loop, J/K, gradients and MM terms
+    else:
+        mojoscf.qmmm.attach(mf)         # MM-charge terms only
 t0 = time.perf_counter(); mf.kernel(); tscf = time.perf_counter() - t0
 g = mf.nuc_grad_method()
 t0 = time.perf_counter(); de = g.kernel(); tgrad = time.perf_counter() - t0

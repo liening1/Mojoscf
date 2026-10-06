@@ -267,6 +267,24 @@ charge; `grad_hcore_mm(dm)` returns those forces when called for the
 gradient's density, geometry and charges.  For benzene with 6486 charges
 the potential takes 0.12 s and the gradient pass 0.25 s.
 
+**Kohn-Sham and other methods.**  QM/MM is mostly run with DFT, which the
+native loop does not cover.  `mojoscf.qmmm.mm_charge(method, coords,
+charges)` (or `mojoscf.qmmm.attach(mf)` on an existing `pyscf.qmmm` object)
+gives any pyscf SCF method (RKS/UKS/ROKS, ROHF, with or without density
+fitting) the Mojo MM-charge terms; its SCF and the QM part of its gradient
+stay pyscf's.  The gain is then in the gradient step, where pyscf's MM forces
+are a large share (same benchmark, `mojoscf.qmmm.attach`):
+
+| system                                         | nao | MM charges | SCF pyscf [s] | with attach [s] | grad + MM forces pyscf [s] | (MM forces) | with attach [s] | x |
+|------------------------------------------------|----:|-----:|-----:|-----:|------:|------:|-----:|-----:|
+| benzene / def2-SVP B3LYP, 25 Å (DF)            | 114 | 6486 | 10.1 |  9.8 |  7.32 |  3.01 | 3.25 | 2.3x |
+| benzene+ / def2-SVP B3LYP, 25 Å (DF, UKS)      | 114 | 6486 | 36.5 | 37.6 |  8.02 |  2.77 | 4.13 | 1.9x |
+| ferrocene / def2-SVP PBE, 25 Å (DF)            | 221 | 6456 | 67.6 | 65.1 | 24.10 | 10.70 | 9.64 | 2.5x |
+
+Energies agree to 1e-12 Eh, gradients to 4e-10 and MM forces to 7e-12
+Eh/Bohr (independently converged SCFs).  The DFT SCF itself (exchange-
+correlation on the grid, J/K) is pyscf's and unchanged.
+
 ## Mojo integral engine
 
 `mojoscf.integrals` evaluates the integrals of a pyscf `Mole` in Mojo and
@@ -585,7 +603,9 @@ mf = mojoscf.accelerate(qmmm.mm_charge(scf.RHF(mol).density_fit(), mm_coords, mm
 mf.kernel()                                     # (also: qmmm.mm_charge(mojoscf.RHF(mol), ...))
 g = mf.nuc_grad_method()
 de_qm = g.kernel()                              # forces on the QM atoms
-de_mm = g.grad_hcore_mm(mf.make_rdm1()) + g.grad_nuc_mm()   # forces on the MM charges
+de_mm = g.grad_hcore_mm(mf.make_rdm1()) + g.grad_nuc_mm()   # forces on the MM charges (from the same pass)
+from pyscf import dft                           # any other method (DFT, ROHF): only the MM-charge terms
+mf = mojoscf.qmmm.mm_charge(dft.RKS(mol, xc="b3lyp"), mm_coords, mm_charges)
 
 # Use the individual kernels
 from mojoscf import kernels
@@ -712,7 +732,9 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
 * QM/MM (`pyscf.qmmm.mm_charge`, point or Gaussian MM charges) runs on the
   native loop with the MM-charge terms of the Hamiltonian and of the
   gradients (QM atoms and MM charges) from the engine, for QM shells up to
-  g; the periodic interface (`qmmm.pbc`) is not covered.  The charge sums are not screened (all charges interact with all
+  g; other methods (Kohn-Sham DFT, ROHF) get only the MM-charge terms
+  (`mojoscf.qmmm.mm_charge` / `attach`); the periodic interface (`qmmm.pbc`)
+  is not covered.  The charge sums are not screened (all charges interact with all
   shell pairs), as in pyscf.
 * The first call in a process starts the Mojo runtime and loads BLAS
   (about 50 ms); time a second run when benchmarking tiny systems.

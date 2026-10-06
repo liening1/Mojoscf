@@ -189,3 +189,56 @@ def test_qmmm_gradient_scanner():
         f0 = ref.grad_hcore_mm(ref.base.make_rdm1()) + ref.grad_nuc_mm()
         f1 = moj.grad_hcore_mm(moj.base.make_rdm1()) + moj.grad_nuc_mm()
         assert abs(f0 - f1).max() < 1e-9
+
+
+@pytest.mark.parametrize("kind", ["rks", "uks", "dfrks", "rohf"])
+def test_qmmm_terms_for_other_methods(kind):
+    """Kohn-Sham and ROHF QM/MM: pyscf's SCF and QM gradient, the MM-charge terms from mojoscf.qmmm."""
+    from pyscf import dft
+
+    coords, q = _charges(300)
+    spin = 1 if kind in ("uks", "rohf") else 0
+
+    def method():
+        mol = gto.M(atom=WATER, basis="cc-pvdz", charge=spin, spin=spin, verbose=0)
+        mf = {"rks": lambda: dft.RKS(mol, xc="b3lyp"), "uks": lambda: dft.UKS(mol, xc="pbe"),
+              "dfrks": lambda: dft.RKS(mol, xc="pbe").density_fit(), "rohf": lambda: scf.ROHF(mol)}[kind]()
+        mf.conv_tol = 1e-11
+        return mf
+
+    ref = qmmm.mm_charge(method(), coords, q)
+    ref.kernel()
+    gref = ref.nuc_grad_method()
+    de_ref = gref.kernel()
+    dm = ref.make_rdm1()
+    f_ref = gref.grad_hcore_mm(dm[0] + dm[1] if dm.ndim == 3 else dm) + gref.grad_nuc_mm()
+
+    mf = mojo_qmmm.mm_charge(method(), coords, q)
+    assert isinstance(mf, mojo_qmmm._MojoQMMMHook)
+    mf.kernel()
+    assert abs(mf.e_tot - ref.e_tot) < 1e-10
+    g = mf.nuc_grad_method()
+    assert isinstance(g, mojo_qmmm._MojoQMMMGrad)
+    # the QM part stays the method's own gradients (mojoscf's are Hartree-Fock only)
+    assert not isinstance(g, (mojoscf.grad.Gradients, mojoscf.grad.UGradients,
+                              mojoscf.grad.DFGradients, mojoscf.grad.DFUGradients))
+    assert abs(g.kernel() - de_ref).max() < 1e-9
+    f = g.grad_hcore_mm(mf.make_rdm1()) + g.grad_nuc_mm()
+    assert abs(f - f_ref).max() < 1e-9
+
+
+def test_attach_rejects_non_qmmm():
+    with pytest.raises(TypeError):
+        mojo_qmmm.attach(scf.RHF(gto.M(atom=WATER, basis="sto-3g", verbose=0)))
+
+
+def test_grad_dispatch_is_hf_only():
+    """Density-fitted Kohn-Sham and ROHF objects must not get mojoscf's HF gradients."""
+    from pyscf import dft
+
+    from mojoscf.scf import _is_hf
+
+    mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
+    assert _is_hf(scf.RHF(mol)) and _is_hf(scf.UHF(mol).density_fit())
+    assert not _is_hf(dft.RKS(mol)) and not _is_hf(dft.UKS(mol).density_fit())
+    assert not _is_hf(scf.ROHF(mol)) and not _is_hf(scf.ROHF(mol).density_fit())
