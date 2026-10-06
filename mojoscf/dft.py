@@ -61,11 +61,43 @@ def eval_ao(mol, coords, deriv=0):
     return out if deriv else out[0]
 
 
-def _rho(mol, coords, deriv, dms):
-    """(nset, ncomp, ngrid) densities (and gradients) of the symmetric ``dms`` (nset, nao, nao)."""
-    rho = np.empty((dms.shape[0], 4 if deriv else 1, coords.shape[0]))
+def _orbitals(dm, nset, nao):
+    """Occupied orbitals of the density from pyscf's ``mo_coeff``/``mo_occ`` tags, as
+    ((nset, nao, norb), (nset, norb)) zero-padded arrays, or None without (consistent) tags."""
+    mo_coeff = getattr(dm, "mo_coeff", None)
+    mo_occ = getattr(dm, "mo_occ", None)
+    if mo_coeff is None or mo_occ is None:
+        return None
+    c = np.asarray(mo_coeff)
+    n = np.asarray(mo_occ)
+    if not (np.isrealobj(c) and np.isrealobj(n)):
+        return None
+    c = c.reshape(-1, *c.shape[-2:])
+    n = n.reshape(-1, n.shape[-1])
+    if c.shape[0] != nset or n.shape[0] != nset or c.shape[1] != nao or c.shape[2] != n.shape[1]:
+        return None
+    keep = [np.flatnonzero(n[i]) for i in range(nset)]
+    norb = max(len(k) for k in keep)
+    orbs = np.zeros((nset, nao, norb))
+    occs = np.zeros((nset, norb))
+    for i, k in enumerate(keep):
+        orbs[i, :, : len(k)] = c[i][:, k]
+        occs[i, : len(k)] = n[i][k]
+    return orbs, occs
+
+
+def _rho(mol, coords, deriv, dms, orbitals=None):
+    """(nset, ncomp, ngrid) densities (and gradients) of the symmetric ``dms`` (nset, nao, nao).
+
+    ``orbitals`` (from :func:`_orbitals`) describe the same densities; the
+    kernel uses them where that is cheaper.
+    """
+    nset, nao = dms.shape[0], dms.shape[-1]
+    rho = np.empty((nset, 4 if deriv else 1, coords.shape[0]))
+    orbs, occs = orbitals if orbitals is not None else (np.zeros((nset, nao, 0)), np.zeros((nset, 0)))
     path, prefix = worker_blas()
-    get_extension().xc_rho(integrals.basis_tables(mol), coords, int(deriv), dms, rho, path, prefix)
+    get_extension().xc_rho(integrals.basis_tables(mol), coords, int(deriv), dms, np.ascontiguousarray(orbs),
+                           np.ascontiguousarray(occs), rho, path, prefix)
     return rho
 
 
@@ -115,7 +147,7 @@ class NumInt(pyscf_numint.NumInt):
         dm = np.ascontiguousarray(dm.reshape(-1, nao, nao))
         nset = dm.shape[0]
         coords, weights = _grid(grids)
-        rho = _rho(mol, coords, deriv, dm)
+        rho = _rho(mol, coords, deriv, dm, _orbitals(dms, nset, nao))
         nelec = np.zeros(nset)
         excsum = np.zeros(nset)
         wv = np.empty_like(rho)
@@ -144,7 +176,8 @@ class NumInt(pyscf_numint.NumInt):
         dmb = np.asarray(dmb, dtype=np.float64).reshape(-1, nao, nao)
         nset = dma.shape[0]
         coords, weights = _grid(grids)
-        rho = _rho(mol, coords, deriv, np.ascontiguousarray(np.concatenate([dma, dmb])))
+        orbitals = _orbitals(dms, 2, nao) if nset == 1 else None
+        rho = _rho(mol, coords, deriv, np.ascontiguousarray(np.concatenate([dma, dmb])), orbitals)
         nelec = np.zeros((2, nset))
         excsum = np.zeros(nset)
         wv = np.empty_like(rho)
@@ -199,7 +232,7 @@ def grad_rks_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1, max_memory
     nao = mol.nao_nr()
     dm = np.ascontiguousarray(np.asarray(dms, dtype=np.float64).reshape(-1, nao, nao))
     coords, weights = _grid(grids)
-    rho = _rho(mol, coords, int(gga), dm)
+    rho = _rho(mol, coords, int(gga), dm, _orbitals(dms, dm.shape[0], nao))
     vmat = _xc_grad(mol, coords, gga, _grad_weights(ni, xc_code, rho, weights, 0))
     if vmat.shape[0] == 1:
         vmat = vmat[0]
@@ -213,7 +246,7 @@ def grad_uks_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1, max_memory
     nao = mol.nao_nr()
     dm = np.ascontiguousarray(np.asarray(dms, dtype=np.float64).reshape(2, nao, nao))
     coords, weights = _grid(grids)
-    rho = _rho(mol, coords, int(gga), dm)
+    rho = _rho(mol, coords, int(gga), dm, _orbitals(dms, 2, nao))
     vmat = _xc_grad(mol, coords, gga, _grad_weights(ni, xc_code, rho, weights, 1))
     return None, -vmat
 
@@ -238,11 +271,15 @@ def grad_xc(ni, mol, grids, xc_code, dms, spin=0):
         gga = ni._xc_type(xc_code) == "GGA"
         coords, weights = _grid(grids)
         dm = np.ascontiguousarray(dm)
-        rho = _rho(mol, coords, int(gga), dm)
+        orbitals = _orbitals(dms, dm.shape[0], nao)
+        rho = _rho(mol, coords, int(gga), dm, orbitals)
         wv = _grad_weights(ni, xc_code, rho, weights, spin)
         de = np.empty((mol.natm, 3))
+        if orbitals is None:
+            orbitals = (np.zeros((dm.shape[0], nao, 0)), np.zeros((dm.shape[0], 0)))
         path, prefix = worker_blas()
-        get_extension().xc_grad_dm(integrals.basis_tables(mol), coords, int(gga), np.ascontiguousarray(wv), dm, de,
+        get_extension().xc_grad_dm(integrals.basis_tables(mol), coords, int(gga), np.ascontiguousarray(wv), dm,
+                                   np.ascontiguousarray(orbitals[0]), np.ascontiguousarray(orbitals[1]), de,
                                    path, prefix)
         return de
     vxc = (uks_grad if spin else rks_grad).get_vxc(ni, mol, grids, xc_code, dms)[1]

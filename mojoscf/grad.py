@@ -378,7 +378,7 @@ class _MojoKSGradMixin:
         mf = self.base
         de = self._grad_jk(dm0, mol, self._hybrid()[1])
         grids = rks_grad._initialize_grids(self)[0]
-        return de + dft.grad_xc(mf._numint, mol, grids, mf.xc, np.asarray(dm0), spin=int(self._unrestricted))
+        return de + dft.grad_xc(mf._numint, mol, grids, mf.xc, dm0, spin=int(self._unrestricted))
 
 
 class Gradients(_MojoGradMixin, rhf_grad.Gradients):
