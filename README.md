@@ -37,11 +37,17 @@ iteration then runs without touching Python or pyscf's C code at all.
   and l > 8; `MOJOSCF_INTEGRALS=libcint` or
   `mojoscf.integrals.set_engine("libcint")` switches it off.
 * **Nuclear gradients** (`mojoscf.grad`): `nuc_grad_method()` of `mojoscf.RHF`
-  and `UHF`, with exact or density-fitted integrals, returns pyscf's gradient
-  classes with the derivative integrals from the Mojo engine; the
+  and `UHF` (and of accelerated Kohn-Sham objects), with exact or
+  density-fitted integrals, returns pyscf's gradient classes with the
+  derivative integrals from the Mojo engine; the
   two-electron term is evaluated directly from the derivative integrals,
   3.3 to 7.1x faster than `pyscf.grad` (exact) and 2.9 to 6.0x faster than
   `pyscf.df.grad` (DF) with the same gradients to about 1e-13.
+* **Kohn-Sham DFT** (`mojoscf.dft`): `mojoscf.dft.accelerate(mf)` gives a
+  pyscf RKS/UKS object the Mojo exchange-correlation integration (LDA and
+  GGA), J/K, eigensolver and nuclear gradients while pyscf's loop drives the
+  SCF: 3.4 to 5.1x faster SCF and 5 to 10x faster gradients than pyscf, with
+  energies agreeing to 1e-10 Eh or better.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -188,17 +194,17 @@ default def2 JK-fitting basis, "direct" `max_memory=1`.
 
 | system                                         | nao | cycles | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | \|dE\| [Eh] |
 |------------------------------------------------|----:|------:|------:|------:|-----:|------:|------:|-----:|--------:|
-| ferrocene / def2-SVP (DF)                      | 221 | 14/14 |   17.7 |    5.4 | 3.3x |    8.9 |   1.9 | 4.6x | 7.3e-12 |
-| ferrocene / def2-TZVP (DF)                     | 415 | 16/16 |   34.6 |   16.8 | 2.1x |   27.2 |   7.8 | 3.5x | 1.1e-11 |
-| [Fe(H2O)6]2+ quintet / def2-TZVP (DF, UHF)     | 303 | 45/45 |   68.6 |   29.9 | 2.3x |   16.3 |   3.3 | 5.0x | 4.5e-13 |
-| [Fe(H2O)6]2+ 12H2O quintet / def2-SVP (DF, UHF) | 463 | 56/56 |  547.6 |  348.2 | 1.6x |  178.7 |  23.3 | 7.7x | 5.0e-11 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP (DF, UHF)     | 241 | 15/15 |   19.8 |    5.9 | 3.3x |    7.3 |   1.9 | 3.7x | 5.7e-11 |
-| Ni(CO)4 / def2-TZVP (DF)                       | 293 | 15/15 |   16.1 |    6.0 | 2.7x |    8.9 |   2.3 | 3.9x | 3.2e-11 |
-| cisplatin / def2-TZVP (DF, Pt ECP)             | 212 | 12/12 |    7.6 |    2.9 | 2.6x |    5.4 |   2.2 | 2.5x | 1.8e-12 |
-| ferrocene / def2-SVP (direct)                  | 221 | 14/14 |   59.6 |   27.4 | 2.2x |   35.2 |   9.7 | 3.6x | 5.0e-12 |
-| [Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)  | 175 | 28/28 |   50.5 |   20.7 | 2.4x |   12.9 |   3.1 | 4.2x | 8.6e-12 |
-| cisplatin / def2-SVP (direct, Pt ECP)          | 126 | 12/12 |   11.9 |    2.7 | 4.3x |    5.1 |   1.8 | 2.9x | 1.4e-12 |
-| Ni(CO)4 / def2-SVP (in-core)                   | 143 | 14/14 |    6.2 |    1.3 | 5.0x |    6.2 |   1.6 | 3.8x | 1.2e-11 |
+| ferrocene / def2-SVP (DF)                      | 221 | 14/14 |   14.5 |    3.8 | 3.8x |    7.9 |   1.5 | 5.2x | 4.5e-12 |
+| ferrocene / def2-TZVP (DF)                     | 415 | 16/16 |   31.5 |    9.3 | 3.4x |   20.3 |   5.7 | 3.6x | 1.1e-11 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP (DF, UHF)     | 303 | 45/45 |   67.7 |   15.5 | 4.4x |   12.8 |   2.2 | 5.8x | 5.5e-12 |
+| [Fe(H2O)6]2+ 12H2O quintet / def2-SVP (DF, UHF) | 463 | 56/56 |  575.4 |  163.0 | 3.5x |  131.0 |  11.6 | 11.3x | 6.5e-11 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP (DF, UHF)     | 241 | 15/15 |   19.4 |    3.8 | 5.1x |    7.2 |   1.3 | 5.7x | 5.5e-11 |
+| Ni(CO)4 / def2-TZVP (DF)                       | 293 | 15/15 |   16.0 |    4.0 | 4.1x |    7.3 |   1.7 | 4.3x | 2.8e-11 |
+| cisplatin / def2-TZVP (DF, Pt ECP)             | 212 | 12/12 |    8.1 |    2.2 | 3.7x |    4.6 |   1.9 | 2.4x | 1.1e-12 |
+| ferrocene / def2-SVP (direct)                  | 221 | 14/14 |   64.4 |   22.7 | 2.8x |   36.5 |   8.6 | 4.3x | 4.5e-12 |
+| [Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)  | 175 | 28/28 |   55.7 |   18.4 | 3.0x |   13.9 |   3.2 | 4.3x | 2.4e-11 |
+| cisplatin / def2-SVP (direct, Pt ECP)          | 126 | 12/12 |   13.5 |    2.5 | 5.3x |    6.0 |   1.5 | 4.0x | 2.7e-12 |
+| Ni(CO)4 / def2-SVP (in-core)                   | 143 | 14/14 |    6.2 |    1.2 | 5.3x |    6.0 |   1.4 | 4.4x | 1.5e-11 |
 
 Gradients agree to 1e-11 or better except for the direct UHF Fe(II) case
 (3e-8), where the two independently converged SCF solutions differ at that
@@ -212,12 +218,12 @@ level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
   libcint and pyscf's code throughout.
 * **Large density-fitted SCF** (the 463-AO Fe(II) cluster, 56 UHF cycles) is
   dominated by the DF exchange build, `K = sum_Q (C^T E_Q)^T (C^T E_Q)`.
-  mojoscf and pyscf do the same GEMMs; with ~100 occupied orbitals as the
-  M dimension these reach ~35-40 GFLOPS per thread here (about 65% of this
-  machine's single-thread DGEMM peak), so per cycle the two codes are close
-  and the SCF gains come from the DF tensor build (Mojo integrals, in-place
-  triangular solve), J and the native loop.  The gradients of the same
-  systems are 3.5-8x faster.
+  mojoscf and pyscf do the same GEMMs, but pyscf's C transform calls the
+  OpenBLAS bundled with pyscf (0.3.3, no AVX-512 kernels: 13 GFLOPS per
+  thread for these shapes on this machine), while mojoscf's worker threads
+  call NumPy's newer OpenBLAS pinned to one thread each (45 GFLOPS); that
+  took this SCF from 1.6x to 3.5x faster than pyscf.  The gradients of the
+  same systems are 2.4-11x faster.
 * **Segmented basis sets** (def2) consist largely of single-primitive shells,
   where vectorising over the primitive quartets of one shell quartet leaves
   most SIMD lanes empty.  The drivers therefore batch kets as SIMD lanes
@@ -226,6 +232,70 @@ level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
   16.4 s (pyscf 36.6 s), and for [Fe(H2O)6]2+ / def2-SVP from 0.78 s to
   0.57 s.  The f shells of def2-TZVP give pairs beyond the lane kernels'
   Hermite degree, which keep the single-quartet path.
+
+### Kohn-Sham DFT
+
+`mojoscf.dft.accelerate(mf)` gives a pyscf RKS/UKS object (with or without
+density fitting, also QM/MM) the Mojo kernels while pyscf's SCF loop stays in
+charge: the exchange-correlation integration (`mojoscf.dft.NumInt`, LDA and
+GGA functionals), J/K (from the DF tensor, from in-core ERIs built by the
+engine, or integral-direct), the eigensolver and DIIS, and the nuclear
+gradients (`mojoscf.grad.KSGradients` and its UKS and DF variants).
+`benchmarks/bench_dft.py`: pyscf versus the same object accelerated, each in
+its own process, pyscf's default grids (level 3), conv_tol 1e-9, 4 cores of
+a 2.1 GHz Xeon.
+
+| system                                          | nao | grid points | cycles | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | \|dE\| [Eh] |
+|-------------------------------------------------|----:|-------:|------:|------:|------:|-----:|------:|-----:|-----:|--------:|
+| benzene / def2-SVP B3LYP (DF)                   | 114 | 143560 |   7/7 |   7.9 |   2.3 | 3.4x |   3.0 |  0.5 | 6.5x | 1.1e-12 |
+| benzene+ / def2-SVP B3LYP (DF, UKS)             | 114 | 143560 |   9/9 |  14.4 |   3.7 | 3.9x |   4.6 |  0.5 | 9.1x | 1.1e-13 |
+| C8H18 / def2-TZVP PBE (DF)                      | 356 | 289488 | 10/10 |  47.6 |  11.3 | 4.2x |  19.3 |  2.5 | 7.9x | 2.0e-12 |
+| ferrocene / def2-SVP PBE (DF)                   | 221 | 260168 | 20/20 |  57.6 |  12.6 | 4.6x |   9.4 |  1.5 | 6.3x | 1.4e-10 |
+| ferrocene / def2-SVP B3LYP (DF)                 | 221 | 260168 | 51/44 | 155.2 |  30.5 | 5.1x |  15.1 |  1.9 | 7.8x | 2.6e-10 |
+| ferrocene / def2-TZVP PBE (DF)                  | 415 | 260168 | 20/20 | 118.8 |  25.9 | 4.6x |  25.6 |  4.4 | 5.8x | 7.3e-12 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP PBE0 (DF, UKS) | 303 | 223096 | 41/43 | 230.8 |  52.2 | 4.4x |  28.0 |  2.9 | 9.5x | 3.9e-10 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP B3LYP (DF, UKS) | 241 | 193944 | 12/12 |  52.1 |  11.5 | 4.5x |  17.4 |  1.8 | 9.9x | 4.5e-13 |
+| (H2O)5 / def2-TZVP PBE (in-core)                | 215 | 168496 | 12/12 |  24.0 |   6.7 | 3.6x |  16.3 |  3.3 | 5.0x | 4.5e-13 |
+| C8H18 / 6-31G* B3LYP (direct)                   | 148 | 289488 |   9/9 |  30.4 |   7.9 | 3.9x |  15.7 |  2.2 | 7.0x | 9.1e-13 |
+
+Energies agree to 4e-10 Eh or better.  The gradients of the
+independently converged SCFs differ by up to 4e-6 Eh/Bohr for the slowly
+converging ferrocene/B3LYP and [Fe(H2O)6]2+/PBE0 runs (conv_tol 1e-9 leaves
+the density uncertain at about 3e-5, and the two runs take different DIIS
+paths: 51 and 44 cycles for ferrocene/B3LYP); on the same SCF solution
+pyscf's and mojoscf's gradients agree to 9e-12 and the energies to 4e-12 for
+ferrocene/PBE, ferrocene/B3LYP and [Fe(H2O)6]2+/PBE0.
+
+* **XC integration.**  pyscf's `NumInt` loops in Python over blocks of grid
+  points: basis functions (C), density and potential matrix (GEMMs with
+  sparsity masks), libxc on each block.  `mojoscf.dft.NumInt` makes two Mojo
+  passes over the whole grid around a single libxc call: for each block of
+  128 points it evaluates only the shells that reach the block's bounding
+  sphere (per-shell cutoff radius at 1e-16), values and gradients SIMD over
+  the points with an exponential accurate to one ulp, then (1) the density
+  and its gradient and (2) `V += phi Z^T` with `Z = sum_c w_c phi_c`, one
+  GEMM per block into per-thread matrices.  When the density carries
+  pyscf's `mo_coeff`/`mo_occ` tags (every SCF density does), blocks where it
+  is cheaper use the occupied orbitals, `psi = C^T phi`,
+  `rho = sum_k n_k psi_k^2`, `grad rho = 2 sum (grad phi)(C n psi)`, as
+  pyscf's `eval_rho2`: for ferrocene/def2-TZVP that halves the density pass.
+  Results agree with pyscf's to 1e-10 or better.
+* **Gradients.**  The XC term needs the second derivatives of the basis
+  functions; instead of pyscf's (3, nao, nao) matrices
+  (`grad.rks.get_vxc`), the kernel contracts them with the density inside
+  the pass (`-2 sum_{mu on A} D_mu nu V^x_mu nu` via `D phi` and `D Z`, two
+  GEMMs per block, again through the orbitals where cheaper).  The Coulomb
+  and exact-exchange part is `grad2e_df`/`grad2e` with the functional's
+  exchange fraction; a pure functional needs no orbital transformation at
+  all.  pyscf's own `grad.rks.get_vxc`/`grad.uks.get_vxc` also run on the
+  Mojo kernels when called for a `mojoscf.dft.NumInt`.
+* **Thread pools.**  With pyscf's loop around the kernels, NumPy calls
+  (DIIS, `make_rdm1`) alternate with Mojo passes, and every threaded OpenBLAS
+  call leaves its worker threads spinning for about 0.13 s.  mojoscf now uses
+  NumPy's own OpenBLAS (ILP64) as its threaded library, so both share one
+  pool, and avoids threaded NumPy BLAS between its passes (the energy sum;
+  `mojoscf.CDIIS` replaces pyscf's default CDIIS, same iterates): the
+  ferrocene/def2-SVP SCF went from 17.6 s to 13.5 s with that alone.
 
 ### QM/MM
 
@@ -267,23 +337,24 @@ charge; `grad_hcore_mm(dm)` returns those forces when called for the
 gradient's density, geometry and charges.  For benzene with 6486 charges
 the potential takes 0.12 s and the gradient pass 0.25 s.
 
-**Kohn-Sham and other methods.**  QM/MM is mostly run with DFT, which the
-native loop does not cover.  `mojoscf.qmmm.mm_charge(method, coords,
-charges)` (or `mojoscf.qmmm.attach(mf)` on an existing `pyscf.qmmm` object)
-gives any pyscf SCF method (RKS/UKS/ROKS, ROHF, with or without density
-fitting) the Mojo MM-charge terms; its SCF and the QM part of its gradient
-stay pyscf's.  The gain is then in the gradient step, where pyscf's MM forces
-are a large share (same benchmark, `mojoscf.qmmm.attach`):
+**Kohn-Sham and other methods.**  QM/MM is mostly run with DFT.
+`mojoscf.dft.accelerate(mf)` on a `pyscf.qmmm` Kohn-Sham object adds the
+Mojo MM-charge terms to the other Kohn-Sham kernels (see *Kohn-Sham DFT*
+above); for any other method (ROHF, ...) `mojoscf.qmmm.mm_charge(method,
+coords, charges)` (or `mojoscf.qmmm.attach(mf)` on an existing `pyscf.qmmm`
+object) gives only the MM-charge terms.  Same benchmark, Kohn-Sham with
+`mojoscf.dft.accelerate`:
 
-| system                                         | nao | MM charges | SCF pyscf [s] | with attach [s] | grad + MM forces pyscf [s] | (MM forces) | with attach [s] | x |
-|------------------------------------------------|----:|-----:|-----:|-----:|------:|------:|-----:|-----:|
-| benzene / def2-SVP B3LYP, 25 Å (DF)            | 114 | 6486 | 10.1 |  9.8 |  7.32 |  3.01 | 3.25 | 2.3x |
-| benzene+ / def2-SVP B3LYP, 25 Å (DF, UKS)      | 114 | 6486 | 36.5 | 37.6 |  8.02 |  2.77 | 4.13 | 1.9x |
-| ferrocene / def2-SVP PBE, 25 Å (DF)            | 221 | 6456 | 67.6 | 65.1 | 24.10 | 10.70 | 9.64 | 2.5x |
+| system                                         | nao | MM charges | SCF pyscf [s] | mojoscf [s] | x | grad + MM forces pyscf [s] | (MM forces) | mojoscf [s] | x |
+|------------------------------------------------|----:|-----:|-----:|-----:|-----:|------:|------:|-----:|------:|
+| benzene / def2-SVP B3LYP, 25 Å (DF)            | 114 | 6486 |  9.7 |  2.8 | 3.5x |  6.66 |  2.85 | 0.58 | 11.5x |
+| benzene+ / def2-SVP B3LYP, 25 Å (DF, UKS)      | 114 | 6486 | 37.4 |  9.4 | 4.0x |  8.42 |  3.08 | 0.63 | 13.3x |
+| ferrocene / def2-SVP PBE, 25 Å (DF)            | 221 | 6456 | 67.9 | 14.4 | 4.7x | 26.53 | 12.15 | 1.93 | 13.8x |
 
-Energies agree to 1e-12 Eh, gradients to 4e-10 and MM forces to 7e-12
-Eh/Bohr (independently converged SCFs).  The DFT SCF itself (exchange-
-correlation on the grid, J/K) is pyscf's and unchanged.
+Energies agree to 1e-12 Eh, gradients to 3e-10 and MM forces to 5e-12
+Eh/Bohr (independently converged SCFs).  With only the MM-charge terms
+(`attach`, the previous version of this table) the gradient step was 1.9 to
+2.5x faster and the SCF unchanged.
 
 ## Mojo integral engine
 
@@ -604,8 +675,14 @@ mf.kernel()                                     # (also: qmmm.mm_charge(mojoscf.
 g = mf.nuc_grad_method()
 de_qm = g.kernel()                              # forces on the QM atoms
 de_mm = g.grad_hcore_mm(mf.make_rdm1()) + g.grad_nuc_mm()   # forces on the MM charges (from the same pass)
-from pyscf import dft                           # any other method (DFT, ROHF): only the MM-charge terms
-mf = mojoscf.qmmm.mm_charge(dft.RKS(mol, xc="b3lyp"), mm_coords, mm_charges)
+from pyscf import dft                           # any other method (ROHF, ...): only the MM-charge terms
+mf = mojoscf.qmmm.mm_charge(scf.ROHF(mol), mm_coords, mm_charges)
+
+# Kohn-Sham DFT: XC integration, J/K, eigensolver, DIIS and gradients from mojoscf, pyscf's SCF loop
+mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="b3lyp").density_fit())   # also UKS, without DF, QM/MM
+mf.kernel()
+g = mf.nuc_grad_method().kernel()               # mojoscf.grad.DFKSGradients
+mf = dft.RKS(mol, xc="pbe"); mf._numint = mojoscf.dft.NumInt()   # only the XC integration
 
 # Use the individual kernels
 from mojoscf import kernels
@@ -629,15 +706,27 @@ GEMM and the symmetric eigensolvers (`dsygvd`/`dsyevd`) are called through
   OpenBLAS bundled with pyscf wheels, a *sequential* build.  Inside an SCF of a
   small molecule a threaded BLAS competes with pyscf's OpenMP integral code for
   the cores and costs up to 40% of the run time.
-* larger matrices: SciPy's bundled OpenBLAS (LP64, threaded, `scipy_` symbol
-  prefix).  Measured on 4 cores, the glue (diagonalisation, DIIS error vector,
+* larger matrices: NumPy's bundled OpenBLAS (`scipy_openblas64`: ILP64,
+  threaded, symbols `scipy_dgemm_64_`; SciPy's LP64 copy if NumPy has none).
+  Measured on 4 cores, the glue (diagonalisation, DIIS error vector,
   density) is 1.6x faster than pyscf's at 300 orbitals and 2.7x at 1000 with the
   threaded library, but 1.4 to 2.3x *slower* with the sequential one.
+  NumPy's copy rather than SciPy's because OpenBLAS worker threads keep
+  spinning for about 0.13 s (2^28 cycles) after every threaded call: pyscf's
+  own NumPy products run on NumPy's pool, and with a second pool for mojoscf
+  the two sets of spinning threads competed for the cores.  Inside a
+  Kohn-Sham SCF (pyscf's loop around mojoscf's kernels) `eigh` took 140 ms
+  instead of 5 ms that way, and the whole ferrocene/def2-SVP SCF ran 25%
+  longer.
 * the density-fitting exchange build uses both: Mojo worker threads each call
-  the *sequential* library for their per-auxiliary-function GEMM (as pyscf's C
-  transform does with OpenMP), and the threaded library closes every block
-  with one `dsyrk` rank-k update.
+  the threaded library pinned to one thread for their per-auxiliary-function
+  GEMM (as pyscf's C transform does with OpenMP), and the threaded library
+  closes every block with one `dsyrk` rank-k update.  The other Mojo kernels
+  that run GEMMs in worker threads (DF gradients, XC integration) do the same
+  (`MOJOSCF_SEQ_BLAS=1`: the sequential library instead).
 
+Both the LP64 (`dgemm_`) and the ILP64 interface with suffixed symbols
+(`dgemm_64_`) are recognised when a library is opened.
 `MOJOSCF_BLAS=/path/lib.so[:prefix]` forces one library for all sizes, and
 `mojoscf.set_blas(small, prefix, large, prefix)` selects them from Python.  A
 system `libopenblas`/`liblapack` is the last resort.  Without any library the
@@ -653,12 +742,14 @@ but slow for more than a few dozen orbitals.
 | `eig` (`x^T F x`, `dsyevd`, back-transform) | NumPy + LAPACK            | Mojo + LAPACK via `dlopen`           |
 | `get_occ`, `make_rdm1`, `energy_elec`, `get_grad`, norms | NumPy          | Mojo (+ BLAS `dgemm`)                |
 | convergence test, bookkeeping, logging       | Python                    | Mojo (log lines via one callback)    |
-| J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q sequential GEMM, threaded `dsyrk` |
+| J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q GEMMs in worker threads (one BLAS thread each), threaded `dsyrk` |
 | J/K, in-core 8-fold ERIs (`_vhf.incore`)    | C (`libcvhf`, OpenMP)     | Mojo (`_mojo/erijk.mojo`), 1.6-1.8x faster |
 | J/K, direct SCF (integrals every cycle)     | C (libcint + `libcvhf`)   | Mojo (`_mojo/directjk.mojo`): Mojo integrals, libcvhf's screening, incremental build |
 | two-electron integrals (3-index DF tensor, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
 | one-electron integrals (`get_hcore`, `get_ovlp`) | C (libcint)          | unchanged (`attach(mf)` uses the Mojo engine) |
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |
+| Kohn-Sham XC (`NumInt.nr_rks`/`nr_uks`, LDA/GGA), with `mojoscf.dft.accelerate` | Python loop over blocks: C AO values, NumPy/C GEMMs, libxc per block | Mojo (`_mojo/numint.mojo`): two passes over the grid (densities; potential matrix) around one libxc call; screened shells per block of 128 points, SIMD AO values, per-block GEMMs; pyscf's grids and libxc |
+| Kohn-Sham gradients (`grad.rks`/`uks`, DF or not) | pyscf `get_vxc` (C AO second derivatives, NumPy contractions) + J/K derivative matrices | Mojo: XC term contracted with the density inside one pass over AO second derivatives; Coulomb/exact-exchange term from `grad2e`/`grad2e_df` |
 | QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly (the gradient pass with density-contracted Hermite matrices gives the QM-atom term and all charge forces at once); nucleus-charge terms NumPy as in pyscf |
 
 Source layout:
@@ -675,17 +766,19 @@ mojoscf/
   _mojo/directjk.mojo  integral-direct J/K (screening, 8-fold digestion) for direct SCF; derivative J/K matrices
   _mojo/gradients.mojo two-electron gradient terms, exact and density-fitted
   _mojo/qmmm.mojo      potential of MM point/Gaussian charges, its derivative, forces on the charges
+  _mojo/numint.mojo    XC integration on pyscf's grids: AO values and derivatives, densities, XC matrices, XC gradient
   _mojo/__init__.mojo  Python bindings (module mojoscf._mojoscf)
   _backend.py          build/load the extension, discover BLAS/LAPACK
   kernels.py           NumPy-facing wrappers
   integrals.py         pyscf-compatible integral functions and attach()
   diis.py              CDIIS drop-in class
   scf.py               RHF/UHF classes, kernel(), accelerate()
-  grad.py              RHF/UHF nuclear gradient classes, exact and DF (nuc_grad_method)
+  grad.py              RHF/UHF and RKS/UKS nuclear gradient classes, exact and DF (nuc_grad_method)
+  dft.py               Kohn-Sham: NumInt (XC integration), XC gradient, accelerate() for pyscf RKS/UKS objects
   qmmm.py              QM/MM (pyscf.qmmm) hooks: MM-charge Hamiltonian and gradient terms from the engine
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
-benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py
+benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py, bench_dft.py
 tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quartet, batched kets) in _mojo/integrals.mojo
 ```
 
@@ -694,7 +787,15 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
 * Closed-shell **RHF** and **UHF** with real orbitals, with or without density
   fitting, X2C or other decorations that only change `get_jk`/`get_hcore`.
   ROHF, GHF, Kohn-Sham DFT, symmetry-adapted and second-order (Newton) SCF
-  objects are rejected by `accelerate` and are not provided as classes yet.
+  objects are rejected by `accelerate` (the native loop) and are not
+  provided as classes yet.
+* **Kohn-Sham** RKS/UKS objects get the Mojo kernels with
+  `mojoscf.dft.accelerate` but keep pyscf's SCF loop.  The XC integration
+  covers LDA and GGA functionals with symmetric real densities; meta-GGA,
+  non-local correlation (`nlc`), response kernels (`nr_rks_fxc`, TDDFT,
+  CPHF) and the grid response of the gradient (`grid_response = True`)
+  use pyscf's code, as do the J/K of range-separated functionals' long-range
+  part and DF objects other than plain in-core `pyscf.df.DF`.
 * The native J/K build covers plain `pyscf.df.DF` objects with the tensor in
   core, the in-core 8-fold ERI path (used when `mol.incore_anyway` or pyscf's
   own memory check allows it) and integral-direct J/K otherwise (pyscf's
@@ -726,19 +827,24 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   ECPs or finite nuclei use it for everything but the ECP / finite-nucleus
   terms.  `unsupported_reason(mol, two_electron=..., allow_ecp=...)` says why
   a molecule is rejected for a given use.
-* Nuclear gradients are native for RHF and UHF, with exact or
-  density-fitted (in-core `pyscf.df.DF`, auxiliary-basis response included)
-  two-electron integrals.
+* Nuclear gradients are native for RHF and UHF, and for RKS/UKS objects
+  accelerated with `mojoscf.dft.accelerate` (LDA, GGA and global hybrids;
+  meta-GGA XC terms from pyscf's `get_vxc`), with exact or density-fitted
+  (in-core `pyscf.df.DF`, auxiliary-basis response included) two-electron
+  integrals.
 * QM/MM (`pyscf.qmmm.mm_charge`, point or Gaussian MM charges) runs on the
   native loop with the MM-charge terms of the Hamiltonian and of the
   gradients (QM atoms and MM charges) from the engine, for QM shells up to
-  g; other methods (Kohn-Sham DFT, ROHF) get only the MM-charge terms
-  (`mojoscf.qmmm.mm_charge` / `attach`); the periodic interface (`qmmm.pbc`)
+  g; Kohn-Sham objects get them with the other Kohn-Sham kernels from
+  `mojoscf.dft.accelerate`, other methods (ROHF, ...) only the MM-charge
+  terms (`mojoscf.qmmm.mm_charge` / `attach`); the periodic interface (`qmmm.pbc`)
   is not covered.  The charge sums are not screened (all charges interact with all
   shell pairs), as in pyscf.
 * The first call in a process starts the Mojo runtime and loads BLAS
   (about 50 ms); time a second run when benchmarking tiny systems.
-* Only the LP64 (32-bit integer) BLAS/LAPACK interface is supported.
+* BLAS/LAPACK: the LP64 interface and the ILP64 one with `_64_`-suffixed
+  symbols (OpenBLAS `INTERFACE64` builds such as NumPy's); integer arguments
+  are passed in 64-bit slots, which assumes a little-endian machine.
 
 ### Reproducibility caveat: partially filled degenerate shells
 
