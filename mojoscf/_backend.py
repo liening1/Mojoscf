@@ -252,6 +252,46 @@ def blas_config() -> tuple[tuple[str, str], tuple[str, str]]:
     return _blas
 
 
+_thread_ctl: dict = {}
+
+
+def _openblas_thread_control(path: str, prefix: str):
+    """(get_num_threads, set_num_threads) of an OpenBLAS library, or None."""
+    key = (path, prefix)
+    if key not in _thread_ctl:
+        ctl = None
+        if path:
+            try:
+                import ctypes
+
+                lib = ctypes.CDLL(path)
+                get = getattr(lib, prefix + "openblas_get_num_threads")
+                set_ = getattr(lib, prefix + "openblas_set_num_threads")
+                get.restype = ctypes.c_int
+                set_.argtypes = [ctypes.c_int]
+                ctl = (get, set_)
+            except (OSError, AttributeError):
+                ctl = None
+        _thread_ctl[key] = ctl
+    return _thread_ctl[key]
+
+
+def worker_blas() -> tuple[str, str]:
+    """``(path, prefix)`` of the BLAS for GEMMs issued concurrently from Mojo worker threads.
+
+    The bundled sequential library is old (pyscf's OpenBLAS 0.3.3, no AVX-512
+    kernels: 13 GFlop/s per thread for a 200 x 128 x 200 GEMM here, against
+    45 for scipy's).  When the large-matrix library is an OpenBLAS whose
+    thread count can be set, the Mojo kernels use it, pinned to one thread
+    around their parallel regions (``Blas.serial_begin``); otherwise the
+    sequential library.
+    """
+    small, large = blas_config()
+    if large != small and _openblas_thread_control(*large) is not None and not _env_flag("MOJOSCF_SEQ_BLAS"):
+        return large
+    return small
+
+
 def blas_args(n: int = 0) -> tuple[str, str]:
     """``(library_path, symbol_prefix)`` to use for matrices of dimension ``n``.
 

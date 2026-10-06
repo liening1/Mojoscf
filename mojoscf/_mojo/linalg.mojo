@@ -442,6 +442,44 @@ struct Blas(Movable):
     def available(self) -> Bool:
         return Bool(self.handle)
 
+    def get_threads(self) -> Int:
+        """OpenBLAS's thread count, or 0 for a library without ``openblas_get_num_threads``."""
+        if not self.handle:
+            return 0
+        var name = self.prefix + "openblas_get_num_threads"
+        if not self.handle.value().check_symbol(name):
+            return 0
+        try:
+            var f = self.handle.value().get_function[c_int](name)
+            return Int(f())
+        except:
+            return 0
+
+    def set_threads(self, n: Int):
+        """Set OpenBLAS's thread count (no-op for other libraries or n <= 0)."""
+        if not self.handle or n <= 0:
+            return
+        var name = self.prefix + "openblas_set_num_threads"
+        if not self.handle.value().check_symbol(name):
+            return
+        try:
+            var f = self.handle.value().get_function[NoneType](name)
+            f(c_int(n))
+        except:
+            pass
+
+    def serial_begin(self) -> Int:
+        """Before worker threads call this library concurrently: one OpenBLAS thread; returns the old count."""
+        var old = self.get_threads()
+        if old > 1:
+            self.set_threads(1)
+        return old
+
+    def serial_end(self, old: Int):
+        """Restore the thread count saved by ``serial_begin``."""
+        if old > 1:
+            self.set_threads(old)
+
     def gemm(
         self,
         transa: Bool,

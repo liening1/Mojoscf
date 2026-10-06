@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._backend import blas_args, blas_config, df_block_mb, get_extension
+from ._backend import blas_args, df_block_mb, get_extension, worker_blas
 
 __all__ = [
     "gemm",
@@ -273,7 +273,7 @@ def df_jk(cderi, dm, mo_coeff=None, mo_occ=None, with_j=True, with_k=True, block
     if block_mb is None:
         block_mb = df_block_mb()
     path, prefix = blas_args(nao)
-    (seq_path, seq_prefix), _ = blas_config()
+    seq_path, seq_prefix = worker_blas()
     get_extension().df_jk(
         cderi, dms, orbs, ms, signs, vj, vk, bool(with_j), bool(with_k), int(block_mb), float(fact_tol),
         path, prefix, seq_path, seq_prefix,

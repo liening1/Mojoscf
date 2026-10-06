@@ -546,7 +546,7 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
     """
     from pyscf.df.grad.rhf import _gen_metric_solver
 
-    from ._backend import blas_config
+    from ._backend import worker_blas
 
     _check(mol, two_electron=True)
     _check(auxmol, two_electron=True)
@@ -554,7 +554,7 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
     table = _boys_table()
     tables = basis_tables(mol)
     aux_tables = basis_tables(auxmol)
-    (seq_path, seq_prefix), _ = blas_config()
+    seq_path, seq_prefix = worker_blas()
     nao = mol.nao_nr()
     naux = auxmol.nao_nr()
     npair = nao * (nao + 1) // 2

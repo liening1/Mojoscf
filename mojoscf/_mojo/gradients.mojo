@@ -291,7 +291,9 @@ def df_grad_rhs(
                             k += i + 1
                 pp += nwork
 
+        var nthr = blas_seq.serial_begin()
         parallelize(work, nwork)
+        blas_seq.serial_end(nthr)
         _ = b^
         s0 = s1
     _ = ebuf^
@@ -465,7 +467,9 @@ def grad_df3c_core(
                         k += i + 1
                 pp += nwork
 
+        var nthr = blas_seq.serial_begin()
         parallelize(build, nwork)
+        blas_seq.serial_end(nthr)
         counter.store(0)
         var ntask = s1 - s0
 

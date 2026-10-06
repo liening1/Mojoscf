@@ -265,7 +265,9 @@ def df_jk_core(
                             pass
                 q += nwork
 
+        var nthr = blas_seq.serial_begin()      # the per-Q GEMMs run concurrently, one BLAS thread each
         parallelize(work, nwork)
+        blas_seq.serial_end(nthr)               # before the threaded update below (it may be the same library)
 
         for s in range(nk):
             var m = Int(ms[unsafe_offset=s])

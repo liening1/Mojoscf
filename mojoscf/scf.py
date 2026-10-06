@@ -38,7 +38,7 @@ from pyscf.scf import hf as pyscf_hf
 from pyscf.scf import uhf as pyscf_uhf
 
 from . import kernels
-from ._backend import blas_args, blas_config, df_block_mb, get_extension
+from ._backend import blas_args, df_block_mb, get_extension, worker_blas
 from .diis import CDIIS
 
 __all__ = ["RHF", "UHF", "kernel", "accelerate", "is_supported", "native_veff"]
@@ -295,7 +295,7 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None, dump_chk=True, dm0=None, call
 
     cput1 = log.timer("initialize scf", *cput0)
     path, prefix = blas_args(s1e.shape[0])
-    (seq_path, seq_prefix), _ = blas_config()
+    seq_path, seq_prefix = worker_blas()
     res = get_extension().scf_kernel(
         h1e, s1e, dm, nspin, nocc_a, nocc_b, e_nuc, get_veff, x_orth, opts, log_cb, cb, path, prefix,
         seq_path, seq_prefix, veff_mode, veff_data, veff_opts, dm0_coeff, dm0_occ,
