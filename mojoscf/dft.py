@@ -354,18 +354,24 @@ def _incore_cderi(mf, mol, dm, hermi, omega):
     """pyscf's in-core DF tensor of ``mf`` for :func:`mojoscf.kernels.df_jk`, or None to use pyscf's get_jk.
 
     A missing tensor is built with the Mojo integrals when pyscf would keep
-    it in core (``integrals.build_df``).
+    it in core (``integrals.build_df``).  ``omega`` > 0 (the long-range
+    exchange of range-separated functionals) uses the tensor of pyscf's
+    ``with_df.range_coulomb(omega)``, built with the attenuated integrals.
     """
     from pyscf.df import df as pyscf_df
     from pyscf.df import df_jk
 
     if not isinstance(mf, df_jk._DFHF) or (mol is not None and mol is not mf.mol):
         return None
-    if omega or hermi != 1 or not np.isrealobj(dm) or getattr(mf, "only_dfj", False):
+    if (omega is not None and omega < 0) or hermi != 1 or not np.isrealobj(dm) or getattr(mf, "only_dfj", False):
         return None
     with_df = mf.with_df
     if type(with_df) is not pyscf_df.DF:
         return None
+    if omega:
+        with_df = with_df.range_coulomb(omega)
+        if type(with_df) is not pyscf_df.DF:
+            return None
     if with_df._cderi is None and not integrals.build_df(with_df):
         with_df.build()
     cderi = with_df._cderi

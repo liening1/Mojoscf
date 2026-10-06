@@ -94,7 +94,7 @@ def available(mol, two_electron: bool = False, allow_ecp: bool = False) -> bool:
     return _ENGINE == "mojo" and unsupported_reason(mol, two_electron, allow_ecp) is None
 
 
-def unsupported_reason(mol, two_electron: bool = False, allow_ecp: bool = False) -> str | None:
+def unsupported_reason(mol, two_electron: bool = False, allow_ecp: bool = False, allow_omega: bool = False) -> str | None:
     """Why the Mojo engine cannot handle ``mol`` (None if it can).
 
     With ``two_electron`` only the two-electron integrals are considered
@@ -105,7 +105,9 @@ def unsupported_reason(mol, two_electron: bool = False, allow_ecp: bool = False)
     for the one-electron integrals too: overlap, kinetic and point-charge
     nuclear attraction (``int1e``, ``int1e_ip``, ...) are the same Gaussian
     integrals as ``mol.intor`` returns, the ECP terms being separate
-    (``ECPscalar*``) integrals.
+    (``ECPscalar*``) integrals.  ``allow_omega`` accepts a long-range
+    operator (``mol.omega > 0``, erf(omega r) / r), which the three- and
+    two-centre integrals (``int3c2e``, ``int2c2e``, ``cholesky_eri``) support.
     """
     if mol.nbas == 0:
         return "the molecule has no basis functions"
@@ -116,13 +118,14 @@ def unsupported_reason(mol, two_electron: bool = False, allow_ecp: bool = False)
     # pyscf marks atoms carrying an ECP with NUC_ECP; they are point charges (Z - core electrons)
     if not two_electron and (~np.isin(mol._atm[:, gto.NUC_MOD_OF], (NUC_POINT, gto.NUC_ECP))).any():
         return "only point nuclei are supported"
-    if getattr(mol, "omega", 0.0):
+    omega = getattr(mol, "omega", 0.0)
+    if omega and not (allow_omega and omega > 0):
         return "range-separated Coulomb operator (mol.omega) is not supported"
     return None
 
 
-def _check(mol, two_electron: bool = False, allow_ecp: bool = False):
-    reason = unsupported_reason(mol, two_electron, allow_ecp)
+def _check(mol, two_electron: bool = False, allow_ecp: bool = False, allow_omega: bool = False):
+    reason = unsupported_reason(mol, two_electron, allow_ecp, allow_omega)
     if reason is not None:
         raise NotImplementedError(f"mojoscf.integrals: {reason}")
 
@@ -140,15 +143,18 @@ def _boys_table():
     return _BOYS_TABLE
 
 
-def basis_tables(mol):
+def basis_tables(mol, allow_omega: bool = False):
     """``(atm, bas, env, nf, c2s)``: the basis in the form the Mojo engine reads.
+
+    The tables carry no operator: ``allow_omega`` is for the callers that
+    pass ``mol.omega`` to the kernels themselves (``int3c2e``, ``int2c2e``).
 
     ``atm``/``bas``/``env`` are pyscf's ``_atm``/``_bas``/``_env`` (as int64 /
     float64), ``nf[l]`` the number of functions per shell of angular momentum
     ``l`` and ``c2s`` the concatenated ``(ncart, nf)`` Cartesian-to-final
     transformation matrices for l = 0..lmax.
     """
-    _check(mol, two_electron=True)
+    _check(mol, two_electron=True, allow_omega=allow_omega)
     atm = np.ascontiguousarray(mol._atm, dtype=np.int64)
     bas = np.ascontiguousarray(mol._bas, dtype=np.int64)
     env = np.ascontiguousarray(mol._env, dtype=np.float64)
@@ -217,44 +223,65 @@ def int2e(mol, schwarz_tol: float = 1e-14):
     return ao2mo.restore(1, int2e_s8(mol, schwarz_tol), mol.nao_nr())
 
 
-def int3c2e(mol, auxmol):
-    """``(ab|P)`` as a ``(naux, npair)`` array with the AO pair packed in ``pack_tril`` order."""
-    tables = basis_tables(mol)
-    aux_tables = basis_tables(auxmol)
+def _omega(mol, omega):
+    omega = float(getattr(mol, "omega", 0.0) if omega is None else omega)
+    if omega < 0:
+        raise NotImplementedError("mojoscf.integrals: short-range (omega < 0) operators are not supported")
+    return omega
+
+
+def int3c2e(mol, auxmol, omega=None):
+    """``(ab|P)`` as a ``(naux, npair)`` array with the AO pair packed in ``pack_tril`` order.
+
+    ``omega`` (default ``mol.omega``) > 0 gives the integrals of the
+    long-range operator erf(omega r) / r, as libcint with ``mol.omega``.
+    """
+    omega = _omega(mol, omega)
+    tables = basis_tables(mol, allow_omega=True)
+    aux_tables = basis_tables(auxmol, allow_omega=True)
     nao = mol.nao_nr()
     npair = nao * (nao + 1) // 2
     out = np.empty((auxmol.nao_nr(), npair))
-    get_extension().int3c2e(tables, aux_tables, out, _boys_table())
+    get_extension().int3c2e(tables, aux_tables, out, _boys_table(), omega)
     return out
 
 
-def int2c2e(auxmol):
-    """``(P|Q)`` as a dense ``(naux, naux)`` matrix."""
-    aux_tables = basis_tables(auxmol)
+def int2c2e(auxmol, omega=None):
+    """``(P|Q)`` as a dense ``(naux, naux)`` matrix (``omega`` as in :func:`int3c2e`)."""
+    omega = _omega(auxmol, omega)
+    aux_tables = basis_tables(auxmol, allow_omega=True)
     naux = auxmol.nao_nr()
     out = np.empty((naux, naux))
-    get_extension().int2c2e(aux_tables, out, _boys_table())
+    get_extension().int2c2e(aux_tables, out, _boys_table(), omega)
     return out
 
 
-def cholesky_eri(mol, auxbasis="weigend+etb", auxmol=None, lindep=1e-12):
+def cholesky_eri(mol, auxbasis="weigend+etb", auxmol=None, lindep=None, omega=None):
     """pyscf's in-core DF tensor ``L^{-1} (P|ab)`` with the integrals from the Mojo engine.
 
     Mirrors ``pyscf.df.incore.cholesky_eri`` (Cholesky factorisation of
-    ``(P|Q)``, falling back to an eigen-decomposition with ``lindep`` when the
-    metric is not positive definite); the factorisation and triangular solve
+    ``(P|Q)``, falling back to an eigen-decomposition that drops eigenvalues
+    below ``lindep`` (default pyscf's ``LINEAR_DEP_THR``) when the metric is
+    not positive definite); the factorisation and triangular solve
     are LAPACK/BLAS calls through SciPy, as in pyscf.  The solve runs in place
     on the transposed (Fortran-ordered) view of the C-ordered integrals
     (``dtrsm`` from the right with L^T), so the result is C-ordered, as the
     J/K kernels need, without any copy of the (naux, npair) tensor.
+    ``omega`` (default ``mol.omega``) > 0: the tensor of the long-range
+    operator, as pyscf builds it for ``DF.range_coulomb(omega)``.
     """
     import scipy.linalg
     from scipy.linalg import blas as sblas
 
     if auxmol is None:
         auxmol = df_addons.make_auxmol(mol, auxbasis)
-    j2c = int2c2e(auxmol)
-    j3c = int3c2e(mol, auxmol)
+    from pyscf.df.incore import LINEAR_DEP_THR
+
+    if lindep is None:
+        lindep = LINEAR_DEP_THR
+    omega = _omega(mol, omega)
+    j2c = int2c2e(auxmol, omega)
+    j3c = int3c2e(mol, auxmol, omega)
     try:
         low = scipy.linalg.cholesky(j2c, lower=True)
         # X L^T = j3c^T  <=>  X^T = L^-1 j3c
@@ -277,7 +304,10 @@ def build_df(with_df) -> bool:
     from pyscf import lib as pyscf_lib
 
     mol = with_df.mol
-    if with_df._cderi is not None or not available(mol, two_electron=True):
+    omega = getattr(with_df, "omega", None) or 0.0
+    if with_df._cderi is not None or omega < 0:
+        return False
+    if unsupported_reason(mol, two_electron=True) is not None or engine() != "mojo":
         return False
     if isinstance(getattr(with_df, "_cderi_to_save", None), str):
         return False
@@ -291,7 +321,7 @@ def build_df(with_df) -> bool:
     if nao * (nao + 1) // 2 * auxmol.nao_nr() * 8 / 1e6 >= 0.9 * max_memory:
         return False
     with_df.auxmol = auxmol
-    with_df._cderi = cholesky_eri(mol, auxmol=auxmol)
+    with_df._cderi = cholesky_eri(mol, auxmol=auxmol, omega=omega)
     return True
 
 
@@ -519,7 +549,7 @@ def _syrk_full(a_t):
     return lib.hermi_triu(c)  # Fortran-ordered result: mirrors the upper triangle in place
 
 
-def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_memory=4000, tol=1e-14):
+def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_memory=4000, tol=1e-14, omega=0.0):
     """Two-electron part of the nuclear gradient with density fitting, shape (natm, 3).
 
     The derivative, at fixed densities, of the density-fitted energy
@@ -542,7 +572,10 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
     contracted as they are produced (the transforms with the orbitals use the
     sequential BLAS in the worker threads); the metric solves and W are
     SciPy/NumPy BLAS calls.  The metric is factorised as in pyscf's gradient
-    code (Cholesky, eigen-decomposition fallback).
+    code (Cholesky, eigen-decomposition fallback).  ``omega`` > 0: the same
+    for the long-range operator erf(omega r) / r (integrals and metric), the
+    exchange of range-separated functionals with pyscf's
+    ``with_df.range_coulomb(omega)``.
     """
     from pyscf.df.grad.rhf import _gen_metric_solver
 
@@ -580,11 +613,12 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
     mp = m * (m + 1) // 2
     rhoj = np.empty(naux)
     xs = np.empty((max(nset, 1), naux, mp))
-    ext.df_grad_rhs(tables, aux_tables, table, dm_tril, c, blk, rhoj, xs, seq_path, seq_prefix)
+    omega = _omega(mol, omega)
+    ext.df_grad_rhs(tables, aux_tables, table, dm_tril, c, blk, rhoj, xs, seq_path, seq_prefix, omega)
 
     # X = V^-1 (P|ij) in place, and W on the packed columns:
     # sum_ij n_i n_j X_Pij X_Qij = sum_{i>=j} w_ij X_Pij X_Qij, w_ij = n_i n_j (2 for i > j)
-    solve = _gen_metric_solver(int2c2e(auxmol))
+    solve = _gen_metric_solver(int2c2e(auxmol, omega))
     coef = solve(rhoj)
     w = j_factor * np.outer(coef, coef)
     tri = np.tril_indices(m)
@@ -597,11 +631,11 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
             w -= k_factor * lib.dot(xs[st] * wij, xs[st].T)
 
     de = np.zeros((auxmol.natm, 3))
-    ext.grad2c(aux_tables, table, np.ascontiguousarray(w), de)
+    ext.grad2c(aux_tables, table, np.ascontiguousarray(w), de, omega)
     w = None
     d3 = np.zeros((mol.natm, 3))
     ext.grad_df3c(
         tables, aux_tables, table, np.ascontiguousarray(coef), dpack, float(j_factor), float(k_factor),
-        xs, cn, blk, float(tol), d3, seq_path, seq_prefix,
+        xs, cn, blk, float(tol), d3, seq_path, seq_prefix, omega,
     )
     return de + d3

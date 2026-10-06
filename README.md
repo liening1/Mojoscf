@@ -34,7 +34,8 @@ iteration then runs without touching Python or pyscf's C code at all.
   integrals, also for molecules with effective core potentials or finite
   nuclei (those only change the one-electron Hamiltonian, which stays
   pyscf's), and falls back to libcint only for range-separated `mol.omega`
-  and l > 8; `MOJOSCF_INTEGRALS=libcint` or
+  (except the long-range three- and two-centre integrals of range-separated
+  DFT) and l > 8; `MOJOSCF_INTEGRALS=libcint` or
   `mojoscf.integrals.set_engine("libcint")` switches it off.
 * **Nuclear gradients** (`mojoscf.grad`): `nuc_grad_method()` of `mojoscf.RHF`
   and `UHF` (and of accelerated Kohn-Sham objects), with exact or
@@ -45,8 +46,9 @@ iteration then runs without touching Python or pyscf's C code at all.
   `pyscf.df.grad` (DF) with the same gradients to about 1e-13.
 * **Kohn-Sham DFT** (`mojoscf.dft`): `mojoscf.dft.accelerate(mf)` gives a
   pyscf RKS/UKS object the Mojo exchange-correlation integration (LDA, GGA
-  and meta-GGA such as r2SCAN), J/K, eigensolver and nuclear gradients
-  while pyscf's loop drives the SCF: 3.4 to 5.1x faster SCF and 5 to 10x
+  and meta-GGA such as r2SCAN), J/K (including the long-range exchange of
+  range-separated hybrids such as ωB97X), eigensolver and nuclear gradients
+  while pyscf's loop drives the SCF: 3.3 to 5.6x faster SCF and 5 to 13x
   faster gradients than pyscf, with energies agreeing to 1e-10 Eh or better.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
@@ -257,6 +259,8 @@ a 2.1 GHz Xeon.
 | [Cu(NH3)4]2+ doublet / def2-TZVP B3LYP (DF, UKS) | 241 | 193944 | 12/12 |  52.1 |  11.5 | 4.5x |  17.4 |  1.8 | 9.9x | 4.5e-13 |
 | ferrocene / def2-SVP r2SCAN (DF)                | 221 | 260168 | 76/99 | 377.1 |  90.9 | 4.1x |  16.6 |  1.8 | 9.4x | 4.0e-09 |
 | [Cu(NH3)4]2+ doublet / def2-TZVP r2SCAN (DF, UKS) | 241 | 193944 | 12/12 |  97.4 |  17.4 | 5.6x |  21.1 |  1.6 | 12.9x | 6.8e-12 |
+| ferrocene / def2-SVP ωB97X (DF)                 | 221 | 260168 | 38/38 | 146.0 |  44.5 | 3.3x |  24.6 |  4.9 | 5.1x | 1.5e-11 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP CAM-B3LYP (DF, UKS) | 241 | 193944 | 12/12 |  71.6 |  19.4 | 3.7x |  28.5 |  3.7 | 7.6x | 4.5e-12 |
 | (H2O)5 / def2-TZVP PBE (in-core)                | 215 | 168496 | 12/12 |  24.0 |   6.7 | 3.6x |  16.3 |  3.3 | 5.0x | 4.5e-13 |
 | C8H18 / 6-31G* B3LYP (direct)                   | 148 | 289488 |   9/9 |  30.4 |   7.9 | 3.9x |  15.7 |  2.2 | 7.0x | 9.1e-13 |
 
@@ -293,6 +297,19 @@ ferrocene/PBE, ferrocene/B3LYP and [Fe(H2O)6]2+/PBE0.
   exchange fraction; a pure functional needs no orbital transformation at
   all.  pyscf's own `grad.rks.get_vxc`/`grad.uks.get_vxc` also run on the
   Mojo kernels when called for a `mojoscf.dft.NumInt`.
+* **Range-separated hybrids** (CAM-B3LYP, ωB97X, HSE06, ...) need the
+  exchange of the long-range operator erf(ωr)/r.  Its integrals differ from
+  the Coulomb ones only in the Hermite R integrals (α' with
+  1/α' = 1/p + 1/q + 1/ω² instead of α) and a factor sqrt(α'/α); the engine
+  gets both by replacing one side's primitive-pair exponent p by
+  pω²/(p + ω²) and scaling its prefactor (`integrals.attenuate`), so every
+  kernel computes them unchanged.  The long-range DF tensor of pyscf's
+  `with_df.range_coulomb(ω)` is built that way (agreeing with libcint to
+  1e-13) and its exchange runs in the Mojo DF kernel; the gradient adds the
+  long-range term from the attenuated derivative integrals.  Same-SCF
+  gradients agree with pyscf to about 1e-9, the noise level of the nearly
+  singular long-range metric (reciprocal condition number ~1e-22 for water
+  with ωB97X), confirmed against finite differences.
 * **Meta-GGA** functionals add the kinetic-energy density
   `tau = 1/2 sum_k n_k |grad psi_k|^2` to the density pass (through the
   orbitals: `C^T grad phi`, three more GEMMs), `sum_c d_c phi (w_tau d_c phi)^T`
@@ -524,7 +541,9 @@ task of its pair with more primitive pairs, whose kets are batched as above;
 with the batched integrals the J/K fold (scalar code over the quartet's
 functions) is about a quarter of the time for ferrocene/def2-SVP.  Molecules with effective core potentials or finite
 nuclei use the engine too (only their one-electron Hamiltonian differs, and
-it comes from pyscf); range-separated `mol.omega` uses libcint, and
+it comes from pyscf); range-separated `mol.omega` uses libcint (the
+three- and two-centre integrals of the long-range operator excepted, see
+*Kohn-Sham DFT*), and
 `MOJOSCF_INTEGRALS=libcint` switches the engine off.  One-electron matrices
 still come from pyscf unless `attach(mf)` is used.  The DF tensor
 `L^-1 (P|mu nu)` is solved in place (`dtrsm` on the transposed view of the
@@ -574,7 +593,8 @@ engine.  The classes also take plain pyscf objects,
   densities of TDHF, which go to pyscf) keep working.  With effective core
   potentials only the ECP derivative integrals (`ECPscalar_ipnuc`,
   `ECPscalar_iprinv`) come from pyscf; X2C objects take all one-electron
-  pieces from pyscf, and range-separated operators use pyscf's gradient code.
+  pieces from pyscf, and range-separated operators use pyscf's gradient code
+  (except the density-fitted long-range exchange of Kohn-Sham functionals).
 * **Density fitting.**  For DF objects (`mojoscf.RHF(mol).density_fit()`,
   or `accelerate`d DF objects) `nuc_grad_method()` returns
   `DFGradients`/`DFUGradients`, pyscf's `df.grad` classes with the same
@@ -806,8 +826,8 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   of the density) with symmetric real densities; non-local correlation
   (`nlc`), response kernels (`nr_rks_fxc`, TDDFT, CPHF) and the grid
   response of the gradient (`grid_response = True`) use pyscf's code, as do
-  the J/K of range-separated functionals' long-range part and DF objects
-  other than plain in-core `pyscf.df.DF`.
+  short-range-only (`omega < 0`) and non-density-fitted range-separated
+  exchange and DF objects other than plain in-core `pyscf.df.DF`.
 * The native J/K build covers plain `pyscf.df.DF` objects with the tensor in
   core, the in-core 8-fold ERI path (used when `mol.incore_anyway` or pyscf's
   own memory check allows it) and integral-direct J/K otherwise (pyscf's
@@ -835,9 +855,11 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   Cartesian); it provides the overlap, kinetic, point-charge
   nuclear-attraction, four-index and 3-/2-centre Coulomb integrals and the
   first derivatives needed for HF gradients (no ECP integrals, second
-  derivatives, multipoles or range-separated operators).  Molecules with
+  derivatives or multipoles; of the range-separated operators only the
+  long-range erf(ωr)/r three- and two-centre integrals and their first
+  derivatives).  Molecules with
   ECPs or finite nuclei use it for everything but the ECP / finite-nucleus
-  terms.  `unsupported_reason(mol, two_electron=..., allow_ecp=...)` says why
+  terms.  `unsupported_reason(mol, two_electron=..., allow_ecp=..., allow_omega=...)` says why
   a molecule is rejected for a given use.
 * Nuclear gradients are native for RHF and UHF, and for RKS/UKS objects
   accelerated with `mojoscf.dft.accelerate` (LDA, GGA, meta-GGA and global

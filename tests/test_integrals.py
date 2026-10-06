@@ -80,6 +80,27 @@ def test_density_fitting_tensors():
     assert abs(eri_df - eri).max() < 0.05
 
 
+@pytest.mark.parametrize("omega", [0.11, 0.33, 1.5])
+def test_long_range_density_fitting_tensors(omega):
+    """erf(omega r) / r three- and two-centre integrals and the DF tensor of DF.range_coulomb, against libcint."""
+    mol = gto.M(atom="Fe 0 0 0; C 1.9 0 0; O 3.05 0 0", basis="def2-svp", verbose=0)
+    auxmol = df.addons.make_auxmol(mol, "def2-universal-jkfit")
+    with mol.with_range_coulomb(omega), auxmol.with_range_coulomb(omega):
+        ref3 = df.incore.aux_e2(mol, auxmol, "int3c2e", aosym="s2ij").T
+        ref2 = auxmol.intor("int2c2e")
+        refc = df.incore.cholesky_eri(mol, auxmol=auxmol)
+        assert abs(mi.int3c2e(mol, auxmol) - ref3).max() < 1e-12            # omega taken from mol
+        assert mi.unsupported_reason(mol, two_electron=True, allow_omega=True) is None
+    assert abs(mi.int3c2e(mol, auxmol, omega) - ref3).max() < 1e-12
+    assert abs(mi.int2c2e(auxmol, omega) - ref2).max() < 1e-11
+    # the long-range metric is nearly singular: Cholesky or the eigen-decomposition fallback may be
+    # taken by either code (noise-level differences), so compare the fitted integrals
+    cderi = mi.cholesky_eri(mol, auxmol=auxmol, omega=omega)
+    assert abs(cderi.T @ cderi - refc.T @ refc).max() < 1e-6
+    with pytest.raises(NotImplementedError):
+        mi.int2c2e(auxmol, -omega)                  # short-range operator: not supported
+
+
 def test_cholesky_eri_default_auxbasis():
     mol = _mol("sto-3g")
     cderi = mi.cholesky_eri(mol)

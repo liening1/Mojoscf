@@ -330,10 +330,11 @@ class _MojoDFGradMixin(_MojoGrad1eMixin):
         """
         return self._grad_jk(dm0, mol, 1.0)
 
-    def _grad_jk(self, dm0, mol, k_scale):
-        """Coulomb and (``k_scale`` times) exchange part of ``grad_2e``; no orbitals are needed without exchange."""
+    def _grad_jk(self, dm0, mol, k_scale, lr_scale=0.0, omega=0.0):
+        """Coulomb and (``k_scale`` times) exchange part of ``grad_2e``, plus ``lr_scale`` times the exchange
+        of the long-range operator erf(omega r) / r; no orbitals are needed without exchange."""
         mol = self.mol if mol is None else mol
-        if k_scale != 0:
+        if k_scale != 0 or lr_scale != 0:
             orbol, orbor = df_rhf_grad._decompose_rdm1(self, mol, dm0)
             occs = [np.einsum("pi,pi->i", r, o) / np.einsum("pi,pi->i", o, o) for o, r in zip(orbol, orbor)]
         else:
@@ -345,9 +346,16 @@ class _MojoDFGradMixin(_MojoGrad1eMixin):
             dm_j, k_factor = dm0[0] + dm0[1], 1.0
         else:
             dm_j, k_factor = dm0, 0.5
-        return integrals.grad2e_df(
-            mol, auxmol, dm_j, orbol, occs, 1.0, k_factor * k_scale, max_memory=max_memory, tol=grad_tol
+        kfull = (orbol, occs) if k_scale != 0 else ([], [])
+        de = integrals.grad2e_df(
+            mol, auxmol, dm_j, kfull[0], kfull[1], 1.0, k_factor * k_scale, max_memory=max_memory, tol=grad_tol
         )
+        if lr_scale != 0:
+            de += integrals.grad2e_df(
+                mol, auxmol, dm_j, orbol, occs, 0.0, k_factor * lr_scale, max_memory=max_memory, tol=grad_tol,
+                omega=omega,
+            )
+        return de
 
 
 class _MojoKSGradMixin:
@@ -355,17 +363,27 @@ class _MojoKSGradMixin:
 
     The XC term (at fixed grids) is :func:`mojoscf.dft.grad_xc`: the Mojo
     kernels for ``mojoscf.dft.NumInt`` with LDA, GGA and meta-GGA
-    functionals, pyscf's ``get_vxc`` otherwise.  Range-separated functionals, non-local
-    correlation (``nlc``) and ``grid_response`` keep pyscf's ``get_veff``.
+    functionals, pyscf's ``get_vxc`` otherwise.  Range-separated functionals
+    with density fitting add the long-range exchange term from the
+    attenuated integrals (``grad2e_df(omega=...)``); without density fitting
+    they, non-local correlation (``nlc``) and ``grid_response`` keep pyscf's
+    ``get_veff``.
     """
 
     def _hybrid(self):
-        """(supported, exact-exchange fraction) of the functional."""
+        """(supported, exact-exchange fraction, long-range fraction, omega) of the functional.
+
+        pyscf's exchange of a range-separated functional is hyb K + (alpha -
+        hyb) K_LR(omega); the long-range part needs density fitting here.
+        """
         mf = self.base
         if self.grid_response or mf.do_nlc():
-            return False, 0.0
-        omega, _, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=self.mol.spin)
-        return omega == 0, hyb
+            return False, 0.0, 0.0, 0.0
+        omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=self.mol.spin)
+        if omega == 0:
+            return True, hyb, 0.0, 0.0
+        ok = omega > 0 and isinstance(self, _MojoDFGradMixin)
+        return ok, hyb, alpha - hyb, omega
 
     def _direct_2e(self):
         return self._hybrid()[0] and super()._direct_2e()
@@ -376,7 +394,8 @@ class _MojoKSGradMixin:
 
         mol = self.mol if mol is None else mol
         mf = self.base
-        de = self._grad_jk(dm0, mol, self._hybrid()[1])
+        _, hyb, lr, omega = self._hybrid()
+        de = self._grad_jk(dm0, mol, hyb, lr, omega) if lr else self._grad_jk(dm0, mol, hyb)
         grids = rks_grad._initialize_grids(self)[0]
         return de + dft.grad_xc(mf._numint, mol, grids, mf.xc, dm0, spin=int(self._unrestricted))
 

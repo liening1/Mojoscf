@@ -2452,6 +2452,32 @@ def aux_table(aux: Basis, ht: HermTable) -> PairTable:
     return t^
 
 
+def attenuate(mut t: PairTable, omega: Float64):
+    """Turn the table's integrals into those of the long-range operator erf(omega r) / r.
+
+    For erf(omega r12) / r12 the Hermite integrals use alpha' with
+    1 / alpha' = 1 / p + 1 / q + 1 / omega^2 instead of alpha = p q / (p + q),
+    and the prefactor gains sqrt(alpha' / alpha).  Both follow from replacing
+    one side's primitive-pair exponent p by p' = p omega^2 / (p + omega^2) and
+    its 1/p field by (1/p) sqrt(p' / p): the kernels use the two only there,
+    the Hermite expansions keep the true exponents.  Apply it to one side of
+    each integral only.
+    """
+    var w2 = omega * omega
+    var pp = F64Ptr(unsafe_from_address=t.pbase)
+    for i in range(t.npairs):
+        var np = t.get(i, I_NP)
+        if np == 0:
+            continue
+        var off = t.get(i, I_POFF)
+        var npad = padded(np)
+        for k in range(np):
+            var p = pp[unsafe_offset=off + k]
+            var p2 = p * w2 / (p + w2)
+            pp[unsafe_offset=off + k] = p2
+            pp[unsafe_offset=off + npad + k] = pp[unsafe_offset=off + npad + k] * sqrt(p2 / p)
+
+
 # AO shell pairs per block of the three-centre driver (bounds the memory of
 # the pair table, which is used only once per pair there).
 comptime PAIR_BLOCK = 8192
@@ -2486,8 +2512,12 @@ def store_aux_batch(
                     drow[unsafe_offset=col0 + fb] = src[unsafe_offset=fa * nb + fb]
 
 
-def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0: Int = 0, pshell1: Int = -1):
+def int3c2e_core(
+    basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0: Int = 0, pshell1: Int = -1, omega: Float64 = 0.0
+):
     """(ab|P) into ``dst[P * npair + pair(a, b)]`` (naux x npair, pyscf's cderi layout before the Cholesky step).
+
+    ``omega`` > 0: the long-range operator erf(omega r) / r (``attenuate``).
 
     With a shell range [pshell0, pshell1) only those auxiliary shells are
     computed, into rows counted from the first function of ``pshell0``.
@@ -2505,6 +2535,8 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0
     var npair_ao = nao * (nao + 1) // 2
     var ht = HermTable(max(2 * basis.lmax, aux.lmax))
     var atab = aux_table(aux, ht)
+    if omega > 0.0:
+        attenuate(atab, omega)
     var ps0 = pshell0
     var ps1 = aux.nbas if pshell1 < 0 else pshell1
     var plo = aux.ao_loc[ps0]
@@ -2614,16 +2646,19 @@ def int3c2e_core(basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0
     _ = ht^
 
 
-def int2c2e_core(aux: Basis, boys: BoysTable, dst: F64Ptr):
-    """(P|Q) into the dense ``(naux, naux)`` matrix ``dst``."""
+def int2c2e_core(aux: Basis, boys: BoysTable, dst: F64Ptr, omega: Float64 = 0.0):
+    """(P|Q) into the dense ``(naux, naux)`` matrix ``dst``; ``omega`` > 0: erf(omega r) / r."""
     var naux = aux.nao
     var ht = HermTable(aux.lmax)
     var atab = aux_table(aux, ht)
+    var btab = aux_table(aux, ht)       # the bra side (attenuated for omega > 0)
+    if omega > 0.0:
+        attenuate(btab, omega)
     var nworkers = min(parallelism_level(), aux.nbas) if aux.nbas >= 8 else 1
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm aux, imm boys, imm atab, imm ht, imm dst, imm naux, imm pcount}:
+    def work(w: Int) {imm aux, imm boys, imm atab, imm btab, imm ht, imm dst, imm naux, imm pcount}:
         var ws = EriWork(atab.maxcomp, atab.maxlab, atab.maxcomp, atab.maxlab)
         while True:
             var task = Int(pcount[].fetch_add(1))
@@ -2633,7 +2668,7 @@ def int2c2e_core(aux: Basis, boys: BoysTable, dst: F64Ptr):
             var p0 = aux.ao_loc[pshell]
             var npf = aux.ao_loc[pshell + 1] - p0
             for qshell in range(pshell + 1):
-                if not eri_quartet(atab, pshell, atab, qshell, ht, boys, ws):
+                if not eri_quartet(btab, pshell, atab, qshell, ht, boys, ws):
                     continue
                 var q0 = aux.ao_loc[qshell]
                 var nqf = aux.ao_loc[qshell + 1] - q0
@@ -2650,6 +2685,7 @@ def int2c2e_core(aux: Basis, boys: BoysTable, dst: F64Ptr):
         parallelize(work, nworkers)
     _ = counter^
     _ = atab^
+    _ = btab^
     _ = ht^
 
 

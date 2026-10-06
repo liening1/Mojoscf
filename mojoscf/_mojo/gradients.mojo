@@ -24,7 +24,7 @@ from max.algorithm import parallelize
 from _mojo.linalg import F64Ptr, Blas, list_ptr, vfill, vdot_serial
 from _mojo.dfjk import unpack_row
 from _mojo.integrals import (
-    Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, KetQueue, IntPtr, aux_table, eri_quartet, eri_batch,
+    Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, KetQueue, IntPtr, aux_table, attenuate, eri_quartet, eri_batch,
     int3c2e_core, schwarz_bounds, shell_nfunc, batch_classes, batch_supported, lanes_preferred, int_ptr,
     I_A, I_B, I_LAB, I_NP,
 )
@@ -232,7 +232,7 @@ def grad2e_core(
 
 def df_grad_rhs(
     blas_seq: Blas, var basis: Basis, var aux: Basis, var boys: BoysTable, dm_tril: F64Ptr, nset: Int, m: Int,
-    orbs: F64Ptr, blk: Int, rho: F64Ptr, q: F64Ptr,
+    orbs: F64Ptr, blk: Int, rho: F64Ptr, q: F64Ptr, omega: Float64 = 0.0,
 ) raises:
     """rho_P = sum (P|mu nu) D_mu nu and Q_s,P = C_s^T (P|..) C_s for the fit of the DF gradient.
 
@@ -243,6 +243,7 @@ def df_grad_rhs(
     evaluated for blocks of about ``blk`` auxiliary functions; within a block
     worker threads unpack one (P|mu nu) at a time and transform it with the
     sequential BLAS (two small GEMMs per set), as the DF exchange build does.
+    ``omega`` > 0: the long-range operator erf(omega r) / r.
     """
     var nao = basis.nao
     var naux = aux.nao
@@ -263,7 +264,7 @@ def df_grad_rhs(
         # every element is written by int3c2e_core: no serial zero fill (first touch by the workers)
         var b = List[Float64](unsafe_uninit_length=max((p1 - p0) * npair, 1))
         var pb = list_ptr(b)
-        int3c2e_core(basis, aux, boys, pb, s0, s1)
+        int3c2e_core(basis, aux, boys, pb, s0, s1, omega)
 
         def work(c: Int) {imm blas_seq, imm pb, imm pe, imm dm_tril, imm orbs, imm rho, imm q, imm nao, imm naux, imm npair, imm n2, imm nset, imm m, imm mp, imm wsz, imm p0, imm p1, imm nwork}:
             var e = pe.unsafe_offset(c * wsz)
@@ -371,6 +372,7 @@ def df3c_batch(
 def grad_df3c_core(
     blas_seq: Blas, var basis: Basis, var aux: Basis, var boys: BoysTable, coef: F64Ptr, dpack: F64Ptr,
     jfac: Float64, kfac: Float64, nset: Int, m: Int, xs: F64Ptr, cns: F64Ptr, blk: Int, tol: Float64, de: F64Ptr,
+    omega: Float64 = 0.0,
 ) raises:
     """de[A][x] = d/dR_Ax sum_{P, mu nu} (mu nu|P) Gamma_P,mu nu, overwritten (natm x 3).
 
@@ -384,7 +386,9 @@ def grad_df3c_core(
     table (nabla a, nabla b) (weight 2 for a != b), the auxiliary centre
     taking minus their sum.  A triple is skipped when
     q'_ab q_P max|Gamma_P,ab| < tol.  The pair table and the Schwarz bounds
-    are built once for all blocks.
+    are built once for all blocks.  ``omega`` > 0: the long-range operator
+    erf(omega r) / r (the auxiliary table attenuated after its Schwarz bounds,
+    which bound the attenuated integrals too).
     """
     var nbas = basis.nbas
     var natm = basis.natm
@@ -403,6 +407,8 @@ def grad_df3c_core(
     var q2 = schwarz_bounds(boys, tab2, ht)
     var atab = aux_table(aux, ht)
     var qa = schwarz_bounds(boys, atab, ht)
+    if omega > 0.0:
+        attenuate(atab, omega)
     var kcls = List[Int](length=max(npairs, 1), fill=-1)
     var nclass = batch_classes(tab2, kcls)
     var pkcls = int_ptr(kcls)
@@ -559,17 +565,20 @@ def grad_df3c_core(
     _ = boys^
 
 
-def grad2c_core(var aux: Basis, var boys: BoysTable, wmat: F64Ptr, natm: Int, de: F64Ptr):
+def grad2c_core(var aux: Basis, var boys: BoysTable, wmat: F64Ptr, natm: Int, de: F64Ptr, omega: Float64 = 0.0):
     """de[A][x] = d/dR_Ax of -1/2 sum_PQ (P|Q) W_PQ for the symmetric (naux, naux) matrix ``wmat``.
 
     Shell pairs P > Q are evaluated once with the derivative table of P
     against the plain one (weight 2); Q gets minus the derivative of P.
-    ``de`` (natm x 3; the atoms of ``aux``) is overwritten.
+    ``de`` (natm x 3; the atoms of ``aux``) is overwritten.  ``omega`` > 0:
+    erf(omega r) / r (the plain table attenuated).
     """
     var naux = aux.nao
     var nsh = aux.nbas
     var ht = HermTable(aux.lmax + 1)
     var atab = aux_table(aux, ht)
+    if omega > 0.0:
+        attenuate(atab, omega)
     var sa = List[Int](capacity=nsh)
     var sb = List[Int](capacity=nsh)
     for p in range(nsh):

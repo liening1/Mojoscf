@@ -64,14 +64,14 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_boys_table]("boys_table", docstring="boys_table(out): fill out (721 * 40 float64) with the Boys-function table.")
         m.def_function[py_int1e]("int1e", docstring="int1e(basis, s_out, t_out, v_out, table): overlap, kinetic and nuclear attraction matrices.")
         m.def_function[py_int2e_s8]("int2e_s8", docstring="int2e_s8(basis, eri_out, schwarz_tol, table): 8-fold packed electron repulsion integrals.")
-        m.def_function[py_int3c2e]("int3c2e", docstring="int3c2e(basis, auxbasis, out, table): (ab|P) as a (naux, npair) array.")
-        m.def_function[py_int2c2e]("int2c2e", docstring="int2c2e(auxbasis, out, table): (P|Q) as a dense (naux, naux) array.")
+        m.def_function[py_int3c2e]("int3c2e", docstring="int3c2e(basis, auxbasis, out, table, omega): (ab|P) as a (naux, npair) array; omega > 0: erf(omega r)/r.")
+        m.def_function[py_int2c2e]("int2c2e", docstring="int2c2e(auxbasis, out, table, omega): (P|Q) as a dense (naux, naux) array; omega > 0: erf(omega r)/r.")
         m.def_function[py_int1e_ip]("int1e_ip", docstring="int1e_ip(basis, table, centers, charges, want_st, s_out, t_out, v_out): <nabla i|j>, <nabla i|T|j>, <nabla i|sum q/r|j>.")
         m.def_function[py_grad2e]("grad2e", docstring="grad2e(basis, table, dmj, dmk, jfac, kfac, tol, de): two-electron energy gradient (natm, 3).")
         m.def_function[py_int3c2e_block]("int3c2e_block", docstring="int3c2e_block(basis, auxbasis, table, s0, s1, out): (ab|P) for the auxiliary shells [s0, s1), (np, npair).")
-        m.def_function[py_df_grad_rhs]("df_grad_rhs", docstring="df_grad_rhs(basis, auxbasis, table, dm_tril, orbs, blk, rho, q, seq_path, seq_prefix): fit right-hand sides of the DF gradient.")
-        m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix): three-centre term of the DF gradient.")
-        m.def_function[py_grad2c]("grad2c", docstring="grad2c(auxbasis, table, w, de): d/dR of -1/2 sum (P|Q) W_PQ.")
+        m.def_function[py_df_grad_rhs]("df_grad_rhs", docstring="df_grad_rhs(basis, auxbasis, table, dm_tril, orbs, blk, rho, q, seq_path, seq_prefix, omega): fit right-hand sides of the DF gradient.")
+        m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix, omega): three-centre term of the DF gradient.")
+        m.def_function[py_grad2c]("grad2c", docstring="grad2c(auxbasis, table, w, de, omega): d/dR of -1/2 sum (P|Q) W_PQ.")
         m.def_function[py_eval_ao]("eval_ao", docstring="eval_ao(basis, coords, deriv, out): AO values and derivatives (deriv <= 2) on the points, out (ncomp, ngrid, nao).")
         m.def_function[py_xc_rho]("xc_rho", docstring="xc_rho(basis, coords, kind, dms, orbs, occs, rho, seq_path, seq_prefix): densities (kind 0), with gradients (1), and tau (2: meta-GGA) of symmetric dms (nset, nao, nao), optionally also given as orbitals orbs (nset, nao, norb) with occupations occs (nset, norb; norb may be 0), into rho (nset, ncomp, ngrid).")
         m.def_function[py_xc_vmat]("xc_vmat", docstring="xc_vmat(basis, coords, kind, wv, vmat, seq_path, seq_prefix): sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T (+ the tau term for kind 2) into vmat (nset, nao, nao).")
@@ -425,21 +425,23 @@ def py_int2e_s8(basis: PythonObject, eri: PythonObject, schwarz_tol: PythonObjec
     return PythonObject(None)
 
 
-def py_int3c2e(basis: PythonObject, auxbasis: PythonObject, dst: PythonObject, table: PythonObject) raises -> PythonObject:
+def py_int3c2e(
+    basis: PythonObject, auxbasis: PythonObject, dst: PythonObject, table: PythonObject, omega: PythonObject
+) raises -> PythonObject:
     var bs = _basis(basis)
     var aux = _basis(auxbasis)
     var boys = _boys(table)
-    int3c2e_core(bs, aux, boys, f64ptr(dst))
+    int3c2e_core(bs, aux, boys, f64ptr(dst), 0, -1, Float64(py=omega))
     _ = bs^
     _ = aux^
     _ = boys^
     return PythonObject(None)
 
 
-def py_int2c2e(auxbasis: PythonObject, dst: PythonObject, table: PythonObject) raises -> PythonObject:
+def py_int2c2e(auxbasis: PythonObject, dst: PythonObject, table: PythonObject, omega: PythonObject) raises -> PythonObject:
     var aux = _basis(auxbasis)
     var boys = _boys(table)
-    int2c2e_core(aux, boys, f64ptr(dst))
+    int2c2e_core(aux, boys, f64ptr(dst), Float64(py=omega))
     _ = aux^
     _ = boys^
     return PythonObject(None)
@@ -523,10 +525,12 @@ def py_int3c2e_block(
 def py_df_grad_rhs(
     basis: PythonObject, auxbasis: PythonObject, table: PythonObject, dm_tril: PythonObject, orbs: PythonObject,
     blk: PythonObject, rho: PythonObject, q: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+    omega: PythonObject,
 ) raises -> PythonObject:
     df_grad_rhs(
         _blas(seq_path, seq_prefix), _basis(basis), _basis(auxbasis), _boys(table), f64ptr(dm_tril),
         Int(py=orbs.shape[0]), Int(py=orbs.shape[2]), f64ptr(orbs), Int(py=blk), f64ptr(rho), f64ptr(q),
+        Float64(py=omega),
     )
     return PythonObject(None)
 
@@ -534,18 +538,20 @@ def py_df_grad_rhs(
 def py_grad_df3c(
     basis: PythonObject, auxbasis: PythonObject, table: PythonObject, coef: PythonObject, dpack: PythonObject,
     jfac: PythonObject, kfac: PythonObject, xs: PythonObject, cns: PythonObject, blk: PythonObject,
-    tol: PythonObject, de: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+    tol: PythonObject, de: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject, omega: PythonObject,
 ) raises -> PythonObject:
     grad_df3c_core(
         _blas(seq_path, seq_prefix), _basis(basis), _basis(auxbasis), _boys(table), f64ptr(coef), f64ptr(dpack),
         Float64(py=jfac), Float64(py=kfac), Int(py=cns.shape[0]), Int(py=cns.shape[2]), f64ptr(xs), f64ptr(cns),
-        Int(py=blk), Float64(py=tol), f64ptr(de),
+        Int(py=blk), Float64(py=tol), f64ptr(de), Float64(py=omega),
     )
     return PythonObject(None)
 
 
-def py_grad2c(auxbasis: PythonObject, table: PythonObject, w: PythonObject, de: PythonObject) raises -> PythonObject:
-    grad2c_core(_basis(auxbasis), _boys(table), f64ptr(w), Int(py=de.shape[0]), f64ptr(de))
+def py_grad2c(
+    auxbasis: PythonObject, table: PythonObject, w: PythonObject, de: PythonObject, omega: PythonObject
+) raises -> PythonObject:
+    grad2c_core(_basis(auxbasis), _boys(table), f64ptr(w), Int(py=de.shape[0]), f64ptr(de), Float64(py=omega))
     return PythonObject(None)
 
 

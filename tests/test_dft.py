@@ -155,7 +155,7 @@ def test_ks_gradients(df, xc):
     g0 = ref.nuc_grad_method().kernel()
     mf = mdft.accelerate(make()).run(conv_tol=1e-11)
     g = mf.nuc_grad_method()
-    assert g._direct_2e() == (xc != "camb3lyp")         # range separation: pyscf's get_veff
+    assert g._direct_2e() == (df or xc != "camb3lyp")   # range separation without DF: pyscf's get_veff
     assert abs(g.kernel() - g0).max() < 1e-7
     if xc == "pbe":
         g = mf.nuc_grad_method()
@@ -167,6 +167,29 @@ def test_ks_gradients(df, xc):
         mf._numint = numint.NumInt()                     # pyscf's XC code inside the Mojo gradient
         g = mf.nuc_grad_method()
         assert g._direct_2e() and abs(g.kernel() - g0).max() < 1e-7
+
+
+@pytest.mark.parametrize("xc, spin", [("camb3lyp", 0), ("wb97x", 0), ("hse06", 0), ("wb97x", 1)])
+def test_range_separated_df(xc, spin):
+    """Long-range exchange from the attenuated DF tensor (SCF) and integrals (gradient); same-SCF gradients."""
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+
+    def make():
+        return (dft.UKS if spin else dft.RKS)(mol, xc=xc).density_fit()
+
+    ref = make().run(conv_tol=1e-11)
+    mf = mdft.accelerate(make())
+    dm = ref.make_rdm1()
+    omega = mf._numint.rsh_and_hybrid_coeff(xc)[0]
+    assert abs(mf.get_k(mol, dm, omega=omega) - ref.get_k(mol, dm, omega=omega)).max() < 1e-10
+    mf.run(conv_tol=1e-11)
+    assert abs(mf.e_tot - ref.e_tot) < 1e-9
+    for k in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(ref, k, getattr(mf, k))
+    g = mf.nuc_grad_method()
+    assert g._direct_2e()
+    # the long-range metric is ill-conditioned (rcond ~ 1e-22): agreement to ~1e-9
+    assert abs(g.kernel() - ref.nuc_grad_method().kernel()).max() < 1e-8
 
 
 def test_meta_gga_uks_scf_and_gradient():
