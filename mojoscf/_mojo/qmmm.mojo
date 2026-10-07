@@ -12,6 +12,9 @@ charges) with per-thread accumulators, so a small QM region with many MM
 charges still spreads over all threads.
 
     mm_potential_core  V_ij = sum_k w_k (ij|k)                         (nao x nao)
+    mm_esp_core        phi_s,k = sum_ij D_s,ij (ij|k)                  (nset x nch: the potential
+                       of the densities at the charges; the pair's Hermite matrices are
+                       contracted with the densities first)
     mm_grad_core       with the six-component pair table (nabla a, nabla b):
                        M_x,ij = sum_k w_k (nabla_x i j|k)              (3 x nao x nao, all i, j)
                        F_k,x = sum_ij D_ij w_k (ij|nabla_x k)
@@ -175,6 +178,114 @@ def mm_potential_core(
     _ = accl^
     _ = counter^
     _ = lanes^
+    _ = tab^
+    _ = ht^
+    _ = sa^
+    _ = sb^
+
+
+def mm_esp_core(
+    basis: Basis, boys: BoysTable, nch: Int, coords: F64Ptr, zetas: F64Ptr, point: Bool, nset: Int, dms: F64Ptr,
+    esp_out: F64Ptr,
+):
+    """phi_s,k = sum_ij D_s,ij (ij|k) into ``esp_out`` (nset x nch, overwritten) for symmetric ``dms``.
+
+    Per shell pair the Hermite matrices are contracted with the densities,
+    E~[ko][h][s] = w_ab sum_ij D_s,ij E[ko][h][ij] (w_ab = 2 for a != b), so the
+    kernel transforms ``nset`` components and its U[s][lane] is the pair's
+    share of phi_s at the lane's charge.
+    """
+    var nbas = basis.nbas
+    var nao = basis.nao
+    var npairs = nbas * (nbas + 1) // 2
+    var ht = HermTable(2 * basis.lmax)
+    var sa = List[Int](capacity=npairs)
+    var sb = List[Int](capacity=npairs)
+    _all_pairs(nbas, sa, sb)
+    var tab = PairTable(basis, basis, sa, sb, ht)
+    var ones = List[Float64](length=max(nch, 1), fill=1.0)
+    var lanes = ChargeLanes(nch, coords, list_ptr(ones), zetas, point)
+    var ngroup = max(1, (lanes.nchunk + GROUP - 1) // GROUP)
+    var ntask = npairs * ngroup
+    var nworkers = max(1, min(parallelism_level(), ntask))
+    var per = nset * nch
+    var maxnp = 1
+    for sp in range(npairs):
+        maxnp = max(maxnp, tab.get(sp, I_NP))
+    var st = padded(nset)
+    var esize = maxnp * nherm(tab.maxlab) * st
+    var accl = List[Float64](length=nworkers * per + 1, fill=0.0)
+    var pacc = list_ptr(accl)
+    var btab = list_ptr(boys.table)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+
+    def work(w: Int) {imm basis, imm tab, imm lanes, imm btab, imm pacc, imm pcount, imm ntask, imm ngroup, imm npairs, imm nao, imm per, imm nset, imm nch, imm dms, imm st, imm esize}:
+        var ub = List[Float64](length=max(nset, 1) * CHUNK + 2 * W, fill=0.0)
+        var rbl = List[Float64](length=RBUF + 2 * W, fill=0.0)
+        var econ = List[Float64](length=esize + 2 * W, fill=0.0)
+        var pe = F64Ptr(unsafe_from_address=aligned_addr(econ))
+        var pu = F64Ptr(unsafe_from_address=aligned_addr(ub))
+        var prb = F64Ptr(unsafe_from_address=aligned_addr(rbl))
+        var acc = pacc.unsafe_offset(w * per)
+        var n2 = nao * nao
+        while True:
+            var task = Int(pcount[].fetch_add(1))
+            if task >= ntask:
+                break
+            var sp = npairs - 1 - task // ngroup
+            var g = task % ngroup
+            var np = tab.get(sp, I_NP)
+            if np == 0:
+                continue
+            var lo = tab.get(sp, I_LAB)
+            var so = tab.get(sp, I_STRIDE)
+            var a = tab.get(sp, I_A)
+            var b = tab.get(sp, I_B)
+            var i0 = basis.ao_loc[a]
+            var na = basis.ao_loc[a + 1] - i0
+            var j0 = basis.ao_loc[b]
+            var nb = basis.ao_loc[b + 1] - j0
+            var wpair = 2.0 if a != b else 1.0
+            # E~[ko][h][s] = w_ab sum_ij D_s,ij E[ko][h][ij]
+            var nh = nherm(lo)
+            var e = tab.e_ptr(sp)
+            for r in range(np * nh):
+                var row = e.unsafe_offset(r * so)
+                var dst = pe.unsafe_offset(r * st)
+                for s in range(nset):
+                    var dmat = dms.unsafe_offset(s * n2)
+                    var acc_s = 0.0
+                    for i in range(na):
+                        var drow = dmat.unsafe_offset((i0 + i) * nao + j0)
+                        var erow = row.unsafe_offset(i * nb)
+                        for j in range(nb):
+                            acc_s += drow[unsafe_offset=j] * erow[unsafe_offset=j]
+                    dst[unsafe_offset=s] = acc_s * wpair
+            for c in range(g * GROUP, min((g + 1) * GROUP, lanes.nchunk)):
+                var nv = lanes.nvec(c)
+                var ipad = nv * W
+                lanes_dispatch(lo, 0, np, tab.prim_ptr(sp), pe, st, nset, lanes.chunk(c), nv, btab, pu, prb)
+                var k0 = c * CHUNK
+                var nk = min(CHUNK, nch - k0)
+                for s in range(nset):
+                    var dst = acc.unsafe_offset(s * nch + k0)
+                    var src = pu.unsafe_offset(s * ipad)
+                    for k in range(nk):
+                        dst[unsafe_offset=k] += src[unsafe_offset=k]
+        _ = ub^
+        _ = rbl^
+        _ = econ^
+
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    _reduce_threads(pacc, nworkers, per, esp_out)
+    _ = accl^
+    _ = counter^
+    _ = lanes^
+    _ = ones^
     _ = tab^
     _ = ht^
     _ = sa^

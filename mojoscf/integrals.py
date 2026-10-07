@@ -464,6 +464,25 @@ def int1e_grids_ip_sum(mol, coords, weights, zetas=None):
     return mat
 
 
+def int1e_grids_dm(mol, dms, coords, zetas=None):
+    """``sum_ij D_ij <i| 1/|r - R_k| |j>`` for every point k: the potential of the symmetric densities
+    ``dms`` ((nao, nao) or (nset, nao, nao)) at ``coords`` (Bohr), shape (nk,) or (nset, nk).
+
+    pyscf: ``einsum('kij,ij->k', mol.intor('int1e_grids', grids=coords), dm)``; with ``zetas`` the
+    points are unit Gaussians (``int3c2e`` with ``gto.fakemol_for_charges(coords, zetas)``, as in
+    pyscf's PCM).  No integral is stored: each shell pair's Hermite matrices are contracted with the
+    densities first.
+    """
+    coords, _, zetas, point = _mm_args(mol, coords, np.ones(len(np.reshape(coords, (-1, 3)))), zetas)
+    dms = np.asarray(dms, dtype=np.float64)
+    single = dms.ndim == 2
+    nao = mol.nao_nr()
+    dms = np.ascontiguousarray(dms.reshape(-1, nao, nao))
+    out = np.empty((dms.shape[0], coords.shape[0]))
+    get_extension().mm_esp(basis_tables(mol), _boys_table(), coords, zetas, point, dms, out)
+    return out[0] if single else out
+
+
 def mm_charge_forces(mol, dm, coords, weights, zetas=None):
     """``sum_ij D_ij w_k (ij|nabla_k)`` for every charge k, shape (ncharge, 3).
 

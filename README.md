@@ -325,6 +325,48 @@ ferrocene/PBE, ferrocene/B3LYP and [Fe(H2O)6]2+/PBE0.
   `mojoscf.CDIIS` replaces pyscf's default CDIIS, same iterates): the
   ferrocene/def2-SVP SCF went from 17.6 s to 13.5 s with that alone.
 
+### Implicit solvation (PCM, SMD)
+
+pyscf's PCM family (C-PCM, COSMO, IEF-PCM, SS(V)PE) and SMD represent the
+solvent by Gaussian charges on the molecular surface.  Each SCF cycle needs
+the potential of the electron density at the surface points and the matrix
+of the induced charges, which pyscf builds from three-centre integrals over
+the surface (`int3c2e` with a "fakemol", contracted with `einsum`), plus two
+dense solves of the PCM equations; the gradient forms the (3, n, n)
+geometry derivatives of the surface matrices.  `mojoscf.solvent.attach(mf)`
+(done by `mojoscf.dft.accelerate`) gives the solvent object
+
+* the potential at the points from one density-contracted pass (each shell
+  pair's Hermite matrices contracted with the density first, the points as
+  SIMD lanes of the ERI kernel) and the charge matrix from the QM/MM
+  potential kernel;
+* an LU factorisation of the PCM matrix K, kept with pyscf's intermediates;
+* the surface matrices S and D, and in the gradient their geometry
+  derivatives already contracted with the PCM vectors (no n x n x 3
+  arrays), with erf from the engine's Boys function (std's vector erf is
+  accurate to only ~1e-8);
+* the integral term of the gradient (QM atoms and surface charges) from one
+  density-contracted pass of the QM/MM gradient kernel.
+
+`benchmarks/bench_solvent.py` (water, conv_tol 1e-9, density fitting; the
+Hartree-Fock case uses `attach` alone, as the native loop does not take
+solvent objects):
+
+| system                                             | nao | surface points | cycles | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | \|dE\| [Eh] |
+|----------------------------------------------------|----:|-----:|------:|------:|-----:|-----:|-----:|-----:|------:|--------:|
+| benzene / def2-SVP B3LYP, C-PCM (DF)               | 114 | 1538 |   7/7 |  14.8 |  3.8 | 3.9x |  4.8 |  0.7 |  7.0x | 1.7e-12 |
+| ferrocene / def2-SVP PBE, IEF-PCM (DF)             | 221 | 2404 | 23/23 | 159.2 | 28.3 | 5.6x | 21.9 |  3.3 |  6.7x | 1.1e-09 |
+| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP, SMD (DF, UKS) | 147 | 4182 | 12/12 |  92.6 | 15.4 | 6.0x | 33.4 |  2.7 | 12.5x | 7.3e-12 |
+| (H2O)5 / def2-TZVP HF, IEF-PCM (DF; `attach` only) | 215 | 2191 | 10/10 |  43.4 |  8.8 | 4.9x | 14.1 |  2.9 |  4.9x | 4.5e-13 |
+
+On the same SCF solution energies and gradients agree with pyscf to about
+1e-13 for all five models (`tests/test_solvent.py`; the ferrocene runs above
+converge independently to energies 1e-9 Eh apart).  In pyscf the solvent
+terms dominate these runs (ferrocene: 98 s of the SCF in `int3c2e`, 18 s in
+`einsum`, 5 s for the derivative arrays of the gradient); with the kernels
+the potential at the points and the charge matrix cost 0.14 s and 0.25 s
+per cycle for ferrocene's 2404 points.
+
 ### QM/MM
 
 `benchmarks/bench_qmmm.py` embeds a QM solute in a sphere of TIP3P
@@ -709,6 +751,10 @@ de_mm = g.grad_hcore_mm(mf.make_rdm1()) + g.grad_nuc_mm()   # forces on the MM c
 from pyscf import dft                           # any other method (ROHF, ...): only the MM-charge terms
 mf = mojoscf.qmmm.mm_charge(scf.ROHF(mol), mm_coords, mm_charges)
 
+# Implicit solvation (pyscf.solvent PCM family, SMD): the surface-charge terms from the Mojo kernels
+mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="pbe").density_fit().PCM())   # Kohn-Sham: everything
+mf = mojoscf.solvent.attach(scf.RHF(mol).PCM())          # any SCF object: the solvent terms
+
 # Kohn-Sham DFT: XC integration, J/K, eigensolver, DIIS and gradients from mojoscf, pyscf's SCF loop
 mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="b3lyp").density_fit())   # also UKS, without DF, QM/MM
 mf.kernel()
@@ -781,6 +827,7 @@ but slow for more than a few dozen orbitals.
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |
 | Kohn-Sham XC (`NumInt.nr_rks`/`nr_uks`, LDA/GGA/meta-GGA), with `mojoscf.dft.accelerate` | Python loop over blocks: C AO values, NumPy/C GEMMs, libxc per block | Mojo (`_mojo/numint.mojo`): two passes over the grid (densities; potential matrix) around one libxc call; screened shells per block of 128 points, SIMD AO values, per-block GEMMs; pyscf's grids and libxc |
 | Kohn-Sham gradients (`grad.rks`/`uks`, DF or not) | pyscf `get_vxc` (C AO second derivatives, NumPy contractions) + J/K derivative matrices | Mojo: XC term contracted with the density inside one pass over AO second derivatives; Coulomb/exact-exchange term from `grad2e`/`grad2e_df` |
+| PCM/SMD solvation (`pyscf.solvent`): potential at the surface points, surface-charge matrix, S/D matrices, gradient | C (libcint `int3c2e`, `int3c2e_ip1/ip2` with the surface fakemol) + NumPy (einsum, (3, n, n) derivative arrays, two dense solves per cycle) | Mojo (`_mojo/qmmm.mojo`, `_mojo/pcm.mojo`): density-contracted potential pass, charge-lane potential matrix, S/D and their contracted derivatives (Boys-function erf); LU factorisation of K kept per build |
 | QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly (the gradient pass with density-contracted Hermite matrices gives the QM-atom term and all charge forces at once); nucleus-charge terms NumPy as in pyscf |
 
 Source layout:
@@ -798,6 +845,7 @@ mojoscf/
   _mojo/gradients.mojo two-electron gradient terms, exact and density-fitted
   _mojo/qmmm.mojo      potential of MM point/Gaussian charges, its derivative, forces on the charges
   _mojo/numint.mojo    XC integration on pyscf's grids: AO values and derivatives, densities, XC matrices, XC gradient
+  _mojo/pcm.mojo       PCM surface matrices S, D and their contracted geometry derivatives
   _mojo/__init__.mojo  Python bindings (module mojoscf._mojoscf)
   _backend.py          build/load the extension, discover BLAS/LAPACK
   kernels.py           NumPy-facing wrappers
@@ -806,10 +854,11 @@ mojoscf/
   scf.py               RHF/UHF classes, kernel(), accelerate()
   grad.py              RHF/UHF and RKS/UKS nuclear gradient classes, exact and DF (nuc_grad_method)
   dft.py               Kohn-Sham: NumInt (XC integration), XC gradient, accelerate() for pyscf RKS/UKS objects
+  solvent.py           PCM/SMD (pyscf.solvent) with the Mojo kernels: attach()
   qmmm.py              QM/MM (pyscf.qmmm) hooks: MM-charge Hamiltonian and gradient terms from the engine
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
-benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py, bench_dft.py
+benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py, bench_dft.py, bench_solvent.py
 tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quartet, batched kets) in _mojo/integrals.mojo
 ```
 
@@ -874,6 +923,12 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   terms (`mojoscf.qmmm.mm_charge` / `attach`); the periodic interface (`qmmm.pbc`)
   is not covered.  The charge sums are not screened (all charges interact with all
   shell pairs), as in pyscf.
+* Implicit solvation: pyscf's PCM family (C-PCM, COSMO, IEF-PCM, SS(V)PE)
+  and SMD get the Mojo kernels with `mojoscf.solvent.attach` (done by
+  `mojoscf.dft.accelerate`); the native Hartree-Fock loop does not take
+  solvent objects (they override `get_fock`), so HF in solvent runs pyscf's
+  loop with the Mojo solvent terms.  ddCOSMO/ddPCM and the solvent
+  Hessians keep pyscf's code.
 * The first call in a process starts the Mojo runtime and loads BLAS
   (about 50 ms); time a second run when benchmarking tiny systems.
 * BLAS/LAPACK: the LP64 interface and the ILP64 one with `_64_`-suffixed

@@ -651,6 +651,8 @@ def unsupported_reason(mf):
         pass
     if getattr(mf.mol, "symmetry", False):
         return "point-group symmetry is not supported"
+    if mf.istype("_Solvation"):
+        return "solvent models are not supported by the native loop (mojoscf.solvent.attach gives their terms the Mojo kernels)"
     name = _overridden_glue(mf)
     if name is not None:
         return f"{kind} object overrides {name}, which the native loop re-implements"

@@ -29,10 +29,11 @@ from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
 from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
 from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core
-from _mojo.qmmm import mm_potential_core, mm_grad_core
+from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
+from _mojo.pcm import pcm_ds_core, pcm_pair_core
 from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core
 
-comptime VERSION = "0.10.0"
+comptime VERSION = "0.11.0"
 
 
 @export
@@ -78,6 +79,9 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_xc_grad]("xc_grad", docstring="xc_grad(basis, coords, gga, wv, vmat, seq_path, seq_prefix): XC gradient matrices (nset, 3, nao, nao) of pyscf's grad.rks.get_vxc, before its sign flip.")
         m.def_function[py_xc_grad_dm]("xc_grad_dm", docstring="xc_grad_dm(basis, coords, kind, wv, dms, orbs, occs, de, seq_path, seq_prefix): XC term of the nuclear gradient (natm, 3), the XC gradient matrices contracted with the densities (optionally also given as orbitals, norb may be 0).")
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
+        m.def_function[py_pcm_ds]("pcm_ds", docstring="pcm_ds(table, coords, zeta, switch, norm, rvdw, with_d, s, d): pyscf's PCM S (and D) matrices (n, n).")
+        m.def_function[py_pcm_pair]("pcm_pair", docstring="pcm_pair(table, coords, zeta, norm, kind, a, b, g): G_p = a_p sum_j dX_pj b_j - b_p sum_i a_i dX_ip for X = S (kind 0) or D (1), g (n, 3).")
+        m.def_function[py_mm_esp]("mm_esp", docstring="mm_esp(basis, table, coords, zetas, point, dms, out): sum_ij D_s,ij (ij|k) for symmetric dms (nset, nao, nao) at point or unit Gaussian charges, out (nset, nch).")
         m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces, atoms): sum_k w_k (nabla i j|k) (3, nao, nao), sum_ij D_ij w_k (ij|nabla k) (nch, 3), 2 sum_{i on A} D_ij sum_k w_k (nabla i j|k) (natm, 3); an empty output is skipped.")
         m.def_function[py_int1e_iprinv_dm]("int1e_iprinv_dm", docstring="int1e_iprinv_dm(basis, table, centers, dm, out): sum_ij D_ij <nabla i|1/|r-R_c||j> per centre (ncenter, 3).")
         m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk.")
@@ -580,6 +584,21 @@ def py_mm_potential(
     return PythonObject(None)
 
 
+def py_mm_esp(
+    basis: PythonObject, table: PythonObject, coords: PythonObject, zetas: PythonObject, point: PythonObject,
+    dms: PythonObject, esp: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var boys = _boys(table)
+    mm_esp_core(
+        bs, boys, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(zetas), Bool(py=point), Int(py=dms.shape[0]),
+        f64ptr(dms), f64ptr(esp),
+    )
+    _ = bs^
+    _ = boys^
+    return PythonObject(None)
+
+
 def py_mm_grad(
     basis: PythonObject, table: PythonObject, coords: PythonObject, weights: PythonObject, zetas: PythonObject,
     point: PythonObject, dm: PythonObject, mat: PythonObject, forces: PythonObject, atoms: PythonObject,
@@ -652,4 +671,31 @@ def py_xc_grad_dm(
         Int(py=wv.shape[0]), f64ptr(wv), f64ptr(dms), Int(py=orbs.shape[2]), f64ptr(orbs), f64ptr(occs), f64ptr(de),
     )
     _ = bs^
+    return PythonObject(None)
+
+
+
+def py_pcm_ds(
+    table: PythonObject, coords: PythonObject, zeta: PythonObject, switch: PythonObject, norm: PythonObject,
+    rvdw: PythonObject, with_d: PythonObject, s: PythonObject, d: PythonObject,
+) raises -> PythonObject:
+    var boys = _boys(table)
+    pcm_ds_core(
+        boys, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(zeta), f64ptr(switch), f64ptr(norm), f64ptr(rvdw),
+        Bool(py=with_d), f64ptr(s), f64ptr(d),
+    )
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_pcm_pair(
+    table: PythonObject, coords: PythonObject, zeta: PythonObject, norm: PythonObject, kind: PythonObject,
+    a: PythonObject, b: PythonObject, g: PythonObject,
+) raises -> PythonObject:
+    var boys = _boys(table)
+    pcm_pair_core(
+        boys, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(zeta), f64ptr(norm), Int(py=kind), f64ptr(a), f64ptr(b),
+        f64ptr(g),
+    )
+    _ = boys^
     return PythonObject(None)

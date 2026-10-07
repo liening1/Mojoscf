@@ -503,7 +503,8 @@ def accelerate(mf):
       density-fitted variants (Mojo derivative integrals and XC kernels);
     * the eigensolver: :func:`mojoscf.kernels.eigh`; DIIS: :class:`mojoscf.CDIIS`
       (when pyscf's default CDIIS would be used);
-    * QM/MM objects: the Mojo MM-charge terms (:func:`mojoscf.qmmm.attach`).
+    * QM/MM objects: the Mojo MM-charge terms (:func:`mojoscf.qmmm.attach`);
+    * PCM/SMD solvents: the Mojo surface-charge kernels (:func:`mojoscf.solvent.attach`).
 
     The SCF loop itself stays pyscf's.
     """
@@ -526,4 +527,7 @@ def accelerate(mf):
         from . import qmmm
 
         qmmm.attach(mf)
+    from . import solvent
+
+    solvent.attach(mf)
     return mf
