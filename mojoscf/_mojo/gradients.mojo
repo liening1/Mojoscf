@@ -639,3 +639,305 @@ def grad2c_core(var aux: Basis, var boys: BoysTable, wmat: F64Ptr, natm: Int, de
     _ = ht^
     _ = aux^
     _ = boys^
+
+
+def int3c2e_ip1_core(var basis: Basis, var aux: Basis, var boys: BoysTable, ps0: Int, ps1: Int, tol: Float64, dst: F64Ptr):
+    """dst[x][P - p0][mu][nu] = (nabla_x mu nu|P) for the auxiliary shells [ps0, ps1) (3 x np x nao x nao).
+
+    pyscf's ``int3c2e_ip1`` as full matrices (nabla on the first function, the
+    electron coordinate): the derivative pair table (nabla a, nabla b) of each
+    shell pair a >= b gives both (nabla mu nu|P) and (mu nabla nu|P) =
+    (nabla nu mu|P).  Triples with q'_ab q_P < tol are left at zero (``dst``
+    must be zeroed by the caller).  Parallel over the auxiliary shells.
+    """
+    var nbas = basis.nbas
+    var nao = basis.nao
+    var n2 = nao * nao
+    var npairs = nbas * (nbas + 1) // 2
+    var ht = HermTable(max(2 * basis.lmax + 1, aux.lmax))
+    var sa = List[Int](capacity=npairs)
+    var sb = List[Int](capacity=npairs)
+    for a in range(nbas):
+        for b in range(a + 1):
+            sa.append(a)
+            sb.append(b)
+    var tab2 = PairTable(basis, basis, sa, sb, ht, 2)
+    var q2 = schwarz_bounds(boys, tab2, ht)
+    var atab = aux_table(aux, ht)
+    var qa = schwarz_bounds(boys, atab, ht)
+    var pq2 = list_ptr(q2)
+    var pqa = list_ptr(qa)
+    var p0 = aux.ao_loc[ps0]
+    var np = aux.ao_loc[ps1] - p0
+    var ntask = ps1 - ps0
+    var nthreads = max(1, min(parallelism_level(), ntask))
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+
+    def work(w: Int) {imm basis, imm aux, imm boys, imm ht, imm tab2, imm atab, imm pq2, imm pqa, imm pcount, imm npairs, imm ps0, imm ntask, imm p0, imm np, imm n2, imm nao, imm tol, imm dst}:
+        var ws = EriWork(tab2.maxcomp, tab2.maxlab, atab.maxcomp, atab.maxlab)
+        while True:
+            var task = Int(pcount[].fetch_add(1))
+            if task >= ntask:
+                break
+            var pshell = ps0 + task
+            var qp = pqa[unsafe_offset=pshell]
+            if qp == 0.0:
+                continue
+            var f0 = aux.ao_loc[pshell] - p0
+            var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
+            for sp in range(npairs):
+                if pq2[unsafe_offset=sp] * qp < tol:
+                    continue
+                if not eri_quartet(tab2, sp, atab, pshell, ht, boys, ws):
+                    continue
+                var a = tab2.get(sp, I_A)
+                var b = tab2.get(sp, I_B)
+                var i0 = basis.ao_loc[a]
+                var na = basis.ao_loc[a + 1] - i0
+                var j0 = basis.ao_loc[b]
+                var nb = basis.ao_loc[b + 1] - j0
+                var nab = na * nb
+                for x in range(3):
+                    for i in range(na):
+                        for j in range(nb):
+                            var ij = i * nb + j
+                            for fp in range(npf):
+                                var base = (x * np + f0 + fp) * n2
+                                dst[unsafe_offset=base + (i0 + i) * nao + j0 + j] = ws.out[(x * nab + ij) * npf + fp]
+                                dst[unsafe_offset=base + (j0 + j) * nao + i0 + i] = ws.out[((3 + x) * nab + ij) * npf + fp]
+        _ = ws^
+
+    if nthreads <= 1:
+        work(0)
+    else:
+        parallelize(work, nthreads)
+    _ = counter^
+    _ = tab2^
+    _ = atab^
+    _ = q2^
+    _ = qa^
+    _ = sa^
+    _ = sb^
+    _ = ht^
+    _ = basis^
+    _ = aux^
+    _ = boys^
+
+
+def _hess_add(acc: F64Ptr, natm: Int, a1: Int, a2: Int, x: Int, y: Int, v: Float64):
+    acc[unsafe_offset=((a1 * natm + a2) * 3 + x) * 3 + y] += v
+
+
+def df3c_hess_contract(
+    basis: Basis, aux: Basis, pshell: Int, tab3: PairTable, sp: Int, npf: Int, grows: F64Ptr, npair: Int, blk3: F64Ptr,
+    natm: Int, acc: F64Ptr,
+):
+    """Fold the 21 second-derivative components of (ab|P) (element (c, ij, fp) at blk3[(c nab + ij) npf + fp])
+    with Gamma_P and add d^2/dR dR to the atom pairs of a, b and P (P's centre by translational invariance)."""
+    var a = tab3.get(sp, I_A)
+    var b = tab3.get(sp, I_B)
+    var i0 = basis.ao_loc[a]
+    var na = basis.ao_loc[a + 1] - i0
+    var j0 = basis.ao_loc[b]
+    var nb = basis.ao_loc[b + 1] - j0
+    var nab = na * nb
+    var g = SIMD[DType.float64, 32](0.0)
+    for fp in range(npf):
+        var grow = grows.unsafe_offset(fp * npair)
+        for i in range(na):
+            for j in range(nb):
+                var ii = max(i0 + i, j0 + j)
+                var jj = min(i0 + i, j0 + j)
+                var gv = grow[unsafe_offset=ii * (ii + 1) // 2 + jj]
+                if gv == 0.0:
+                    continue
+                var e = blk3.unsafe_offset((i * nb + j) * npf + fp)
+                for c in range(21):
+                    g[c] += e[unsafe_offset=c * nab * npf] * gv
+    var wgt = 2.0 if a != b else 1.0
+    var aa = basis.atom[a]
+    var ab = basis.atom[b]
+    var ap = aux.atom[pshell]
+    # Haa, Hbb (symmetric, packed xx xy xz yy yz zz), Hab (x on a, y on b)
+    for x in range(3):
+        for y in range(3):
+            var lo = min(x, y)
+            var hi = max(x, y)
+            var k = (0 if lo == 0 else (3 if lo == 1 else 5)) + hi - lo
+            var haa = g[k] * wgt
+            var hbb = g[15 + k] * wgt
+            var hab = g[6 + x * 3 + y] * wgt
+            var hba = g[6 + y * 3 + x] * wgt
+            _hess_add(acc, natm, aa, aa, x, y, haa)
+            _hess_add(acc, natm, ab, ab, x, y, hbb)
+            _hess_add(acc, natm, aa, ab, x, y, hab)
+            _hess_add(acc, natm, ab, aa, x, y, hba)
+            # P = -(a + b): d_a d_P = -(Haa + Hab), d_b d_P = -(Hba + Hbb), d_P d_P = Haa + Hab + Hba + Hbb
+            _hess_add(acc, natm, aa, ap, x, y, -(haa + hab))
+            _hess_add(acc, natm, ap, aa, x, y, -(haa + hba))
+            _hess_add(acc, natm, ab, ap, x, y, -(hba + hbb))
+            _hess_add(acc, natm, ap, ab, x, y, -(hab + hbb))
+            _hess_add(acc, natm, ap, ap, x, y, haa + hab + hba + hbb)
+
+
+def hess_df3c_core(
+    blas_seq: Blas, var basis: Basis, var aux: Basis, var boys: BoysTable, coef: F64Ptr, dpack: F64Ptr,
+    jfac: Float64, kfac: Float64, nset: Int, m: Int, xs: F64Ptr, cns: F64Ptr, blk: Int, tol: Float64, hess: F64Ptr,
+) raises:
+    """hess[A][B][x][y] = d^2/dR_Ax dR_By sum_{P, mu nu} (mu nu|P) Gamma_P,mu nu at fixed Gamma (natm x natm x 3 x 3,
+    overwritten): the second-derivative integral term of the DF Hessian.
+
+    Gamma_P as in ``grad_df3c_core`` (jfac coef_P D - kfac sum_s Cn_s X_s,P Cn_s^T, built
+    per block of auxiliary functions by worker threads); each auxiliary shell is a
+    task over all AO shell pairs a >= b with the 21-component second-derivative
+    pair table (``fill_pair`` nderiv 3), the auxiliary centre's derivatives from
+    translational invariance (weight 2 for a != b).
+    """
+    var nbas = basis.nbas
+    var natm = basis.natm
+    var nao = basis.nao
+    var n2 = nao * nao
+    var npair = nao * (nao + 1) // 2
+    var npairs = nbas * (nbas + 1) // 2
+    var ht = HermTable(max(2 * basis.lmax + 2, aux.lmax))
+    var sa = List[Int](capacity=npairs)
+    var sb = List[Int](capacity=npairs)
+    for a in range(nbas):
+        for b in range(a + 1):
+            sa.append(a)
+            sb.append(b)
+    var tab3 = PairTable(basis, basis, sa, sb, ht, 3)
+    var tab2 = PairTable(basis, basis, sa, sb, HermTable(max(2 * basis.lmax + 1, aux.lmax)), 2)
+    var q2 = schwarz_bounds(boys, tab2, ht)
+    var atab = aux_table(aux, ht)
+    var qa = schwarz_bounds(boys, atab, ht)
+    var nthreads = max(1, parallelism_level())
+    var nwork = 2 * nthreads
+    var per = natm * natm * 9
+    var accl = List[Float64](length=nthreads * per + 1, fill=0.0)
+    var pacc = list_ptr(accl)
+    var mp = m * (m + 1) // 2
+    var wsz = n2 + m * nao + m * m
+    var fbuf = List[Float64](length=nwork * wsz + 8, fill=0.0)
+    var pf = list_ptr(fbuf)
+    var pq2 = list_ptr(q2)
+    var pqa = list_ptr(qa)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+    var s0 = 0
+    while s0 < aux.nbas:
+        var s1 = s0 + 1
+        while s1 < aux.nbas and aux.ao_loc[s1 + 1] - aux.ao_loc[s0] <= blk:
+            s1 += 1
+        var p0 = aux.ao_loc[s0]
+        var p1 = aux.ao_loc[s1]
+        var gbuf = List[Float64](unsafe_uninit_length=(p1 - p0) * npair + 1)
+        var gam = list_ptr(gbuf)
+
+        def build(c: Int) {imm blas_seq, imm pf, imm gam, imm coef, imm dpack, imm jfac, imm kfac, imm xs, imm cns, imm nao, imm n2, imm npair, imm nset, imm m, imm mp, imm wsz, imm p0, imm p1, imm nwork, imm aux}:
+            var f = pf.unsafe_offset(c * wsz)
+            var t = f.unsafe_offset(n2)
+            var xm = t.unsafe_offset(m * nao)
+            var naux = aux.nao
+            var pp = p0 + c
+            while pp < p1:
+                var g = gam.unsafe_offset((pp - p0) * npair)
+                var cp = jfac * coef[unsafe_offset=pp]
+                for k in range(npair):
+                    g[unsafe_offset=k] = cp * dpack[unsafe_offset=k]
+                if m > 0:
+                    for st in range(nset):
+                        var cn = cns.unsafe_offset(st * nao * m)
+                        var xp = xs.unsafe_offset((st * naux + pp) * mp)
+                        var k = 0
+                        for i in range(m):
+                            for j in range(i + 1):
+                                var v = xp[unsafe_offset=k + j]
+                                xm[unsafe_offset=i * m + j] = v
+                                xm[unsafe_offset=j * m + i] = v
+                            k += i + 1
+                        try:
+                            blas_seq.gemm(False, False, nao, m, m, 1.0, cn, xm, 0.0, t)
+                            blas_seq.syr2k_lower(nao, m, -0.5 * kfac, t, cn, 0.0 if st == 0 else 1.0, f)
+                        except:
+                            pass
+                    var k = 0
+                    for i in range(nao):
+                        var frow = f.unsafe_offset(i * nao)
+                        for j in range(i + 1):
+                            g[unsafe_offset=k + j] += frow[unsafe_offset=j]
+                        k += i + 1
+                pp += nwork
+
+        var nthr = blas_seq.serial_begin()
+        parallelize(build, nwork)
+        blas_seq.serial_end(nthr)
+        counter.store(0)
+        var ntask = s1 - s0
+
+        def work(w: Int) {imm basis, imm aux, imm boys, imm ht, imm tab3, imm atab, imm pq2, imm pqa, imm pacc, imm pcount, imm npairs, imm per, imm s0, imm ntask, imm p0, imm npair, imm gam, imm tol, imm natm}:
+            var ws = EriWork(tab3.maxcomp, tab3.maxlab, atab.maxcomp, atab.maxlab)
+            var acc = pacc.unsafe_offset(w * per)
+            while True:
+                var task = Int(pcount[].fetch_add(1))
+                if task >= ntask:
+                    break
+                var pshell = s0 + task
+                var qp = pqa[unsafe_offset=pshell]
+                if qp == 0.0:
+                    continue
+                var f0 = aux.ao_loc[pshell] - p0
+                var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
+                var grows = gam.unsafe_offset(f0 * npair)
+                for sp in range(npairs):
+                    var qab = pq2[unsafe_offset=sp] * qp
+                    if qab < tol:
+                        continue
+                    var a = tab3.get(sp, I_A)
+                    var b = tab3.get(sp, I_B)
+                    var i0 = basis.ao_loc[a]
+                    var na = basis.ao_loc[a + 1] - i0
+                    var j0 = basis.ao_loc[b]
+                    var nb = basis.ao_loc[b + 1] - j0
+                    var gmax = 0.0
+                    for fp in range(npf):
+                        var grow = grows.unsafe_offset(fp * npair)
+                        for i in range(na):
+                            for j in range(nb):
+                                var ii = max(i0 + i, j0 + j)
+                                var jj = min(i0 + i, j0 + j)
+                                gmax = max(gmax, abs(grow[unsafe_offset=ii * (ii + 1) // 2 + jj]))
+                    if qab * gmax < tol:
+                        continue
+                    if not eri_quartet(tab3, sp, atab, pshell, ht, boys, ws):
+                        continue
+                    df3c_hess_contract(basis, aux, pshell, tab3, sp, npf, grows, npair, list_ptr(ws.out), natm, acc)
+            _ = ws^
+
+        var nw = min(nthreads, ntask)
+        if nw <= 1:
+            work(0)
+        else:
+            parallelize(work, nw)
+        _ = gbuf^
+        s0 = s1
+    for i in range(per):
+        var v = 0.0
+        for w2 in range(nthreads):
+            v += pacc[unsafe_offset=w2 * per + i]
+        hess[unsafe_offset=i] = v
+    _ = accl^
+    _ = fbuf^
+    _ = counter^
+    _ = tab3^
+    _ = tab2^
+    _ = atab^
+    _ = q2^
+    _ = qa^
+    _ = sa^
+    _ = sb^
+    _ = ht^
+    _ = basis^
+    _ = aux^
+    _ = boys^

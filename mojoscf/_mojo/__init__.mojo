@@ -29,7 +29,7 @@ from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
 from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
-from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core
+from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core, int3c2e_ip1_core, hess_df3c_core
 from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
 from _mojo.pcm import pcm_ds_core, pcm_pair_core
 from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core, xc_hess_core, xc_h1_core
@@ -77,6 +77,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_df_grad_rhs]("df_grad_rhs", docstring="df_grad_rhs(basis, auxbasis, table, dm_tril, orbs, blk, rho, q, seq_path, seq_prefix, omega): fit right-hand sides of the DF gradient.")
         m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix, omega): three-centre term of the DF gradient.")
         m.def_function[py_grad2c]("grad2c", docstring="grad2c(auxbasis, table, w, de, omega): d/dR of -1/2 sum (P|Q) W_PQ.")
+        m.def_function[py_int3c2e_ip1]("int3c2e_ip1", docstring="int3c2e_ip1(basis, auxbasis, table, ps0, ps1, tol, dst): (nabla mu nu|P) for auxiliary shells [ps0, ps1) as (3, np, nao, nao).")
+        m.def_function[py_hess_df3c]("hess_df3c", docstring="hess_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, hess, seq_path, seq_prefix): second-derivative three-centre term of the DF Hessian.")
         m.def_function[py_eval_ao]("eval_ao", docstring="eval_ao(basis, coords, deriv, out): AO values and derivatives (deriv <= 3) on the points, out (ncomp, ngrid, nao).")
         m.def_function[py_xc_rho]("xc_rho", docstring="xc_rho(basis, coords, kind, dms, orbs, occs, rho, seq_path, seq_prefix): densities (kind 0), with gradients (1), and tau (2: meta-GGA) of symmetric dms (nset, nao, nao), optionally also given as orbitals orbs (nset, nao, norb) with occupations occs (nset, norb; norb may be 0), into rho (nset, ncomp, ngrid).")
         m.def_function[py_xc_vmat]("xc_vmat", docstring="xc_vmat(basis, coords, kind, wv, vmat, seq_path, seq_prefix): sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T (+ the tau term for kind 2) into vmat (nset, nao, nao).")
@@ -592,6 +594,29 @@ def py_grad_df3c(
         _blas(seq_path, seq_prefix), _basis(basis), _basis(auxbasis), _boys(table), f64ptr(coef), f64ptr(dpack),
         Float64(py=jfac), Float64(py=kfac), Int(py=cns.shape[0]), Int(py=cns.shape[2]), f64ptr(xs), f64ptr(cns),
         Int(py=blk), Float64(py=tol), f64ptr(de), Float64(py=omega),
+    )
+    return PythonObject(None)
+
+
+def py_int3c2e_ip1(
+    basis: PythonObject, auxbasis: PythonObject, table: PythonObject, ps0: PythonObject, ps1: PythonObject,
+    tol: PythonObject, dst: PythonObject,
+) raises -> PythonObject:
+    int3c2e_ip1_core(
+        _basis(basis), _basis(auxbasis), _boys(table), Int(py=ps0), Int(py=ps1), Float64(py=tol), f64ptr(dst)
+    )
+    return PythonObject(None)
+
+
+def py_hess_df3c(
+    basis: PythonObject, auxbasis: PythonObject, table: PythonObject, coef: PythonObject, dpack: PythonObject,
+    jfac: PythonObject, kfac: PythonObject, xs: PythonObject, cns: PythonObject, blk: PythonObject,
+    tol: PythonObject, hess: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    hess_df3c_core(
+        _blas(seq_path, seq_prefix), _basis(basis), _basis(auxbasis), _boys(table), f64ptr(coef), f64ptr(dpack),
+        Float64(py=jfac), Float64(py=kfac), Int(py=cns.shape[0]), Int(py=cns.shape[2]), f64ptr(xs), f64ptr(cns),
+        Int(py=blk), Float64(py=tol), f64ptr(hess),
     )
     return PythonObject(None)
 

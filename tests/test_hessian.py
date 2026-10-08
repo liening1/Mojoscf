@@ -73,6 +73,9 @@ def test_accelerated_hessian_matches_pyscf(xc, spin, df):
         setattr(ref, key, getattr(mf, key))
     h = mf.Hessian()
     assert isinstance(h, mhess._MojoHessMixin)
+    # density fitting: the J/K terms run natively (range-separated functionals fall back to pyscf's)
+    native = mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
+    assert native == (df and xc != "camb3lyp")
     assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-9
 
 
@@ -123,3 +126,86 @@ def test_xc_h1mo_matches_pyscf(xc, spin):
     for r, o, c, occ in zip(ref, out, cs, os):
         proj = np.einsum("pm,axpq,qi->axmi", c, r, c[:, occ > 0])
         assert abs(o - proj).max() < 1e-10
+
+
+def _check_df_jk(mf, tol=1e-9):
+    """df_jk_terms against pyscf's DF _partial_hess_ejk (ej - hyb ek) and _gen_jk (vj1 - hyb vk1, projected)."""
+    from pyscf.df.hessian import rhf as df_rhf_hess
+    from pyscf.df.hessian import uhf as df_uhf_hess
+
+    unrestricted = np.asarray(mf.mo_coeff).ndim == 3
+    mod = df_uhf_hess if unrestricted else df_rhf_hess
+    h = mf.Hessian()
+    if hasattr(mf, "xc"):
+        ni = mf._numint
+        hybrid = ni.libxc.is_hybrid_xc(mf.xc)
+        hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mf.mol.spin)[2] if hybrid else 0.0
+    else:
+        hybrid, hyb = True, 1.0
+    e1, ej, ek = mod._partial_hess_ejk(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ, None, 4000, None, hybrid)
+    ref = ej - hyb * ek if hybrid else ej
+    de2, h1 = mhess.df_jk_terms(h)
+    assert abs(de2 - ref).max() < tol * abs(ref).max()
+    assert abs(mhess._hess_e1(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ) - e1).max() < 1e-10
+    cs = list(mf.mo_coeff) if unrestricted else [mf.mo_coeff]
+    os = list(mf.mo_occ) if unrestricted else [mf.mo_occ]
+    for ia, _, vj1, vk1 in mod._gen_jk(h, mf.mo_coeff, mf.mo_occ, None, None, None, hybrid):
+        for s, (c, o) in enumerate(zip(cs, os)):
+            f = vj1
+            if hybrid:
+                f = f - (hyb * vk1[s] if unrestricted else 0.5 * hyb * vk1)
+            proj = np.einsum("pm,xpq,qi->xmi", c, f, c[:, o > 0])
+            assert abs(h1[s][ia] - proj).max() < 1e-10 * max(1.0, abs(proj).max())
+
+
+@pytest.mark.parametrize("xc, spin", [("b3lyp", 0), ("pbe", 0), ("pbe0", 1), (None, 0), (None, 1)])
+def test_df_jk_terms_match_pyscf(xc, spin):
+    from pyscf import scf
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    if xc is None:
+        mf = (scf.UHF if spin else scf.RHF)(mol).density_fit()
+    else:
+        mf = mojoscf.dft.accelerate((dft.UKS if spin else dft.RKS)(mol, xc=xc).density_fit())
+    mf.conv_tol = 1e-10
+    _check_df_jk(mf.run())
+
+
+def test_df_jk_terms_open_shell_metal():
+    """Cu(II) (d functions, f/g auxiliary functions), UKS hybrid."""
+    mol = gto.M(atom="Cu 0 0 0; F 1.75 0 0; F -1.75 0 0", basis="def2-svp", spin=1, verbose=0)
+    mf = mojoscf.dft.accelerate(dft.UKS(mol, xc="pbe0").density_fit())
+    mf.conv_tol = 1e-9
+    # the metric of the auxiliary basis is less well conditioned: agreement at that level
+    _check_df_jk(mf.run(), tol=1e-8)
+
+
+def test_int3c2e_ip1_matches_libcint():
+    from pyscf import df
+
+    from mojoscf import integrals
+
+    mol = gto.M(atom="Fe 0 0 0; O 1.6 0 0; H 2.2 0.7 0; H -1 1 0", basis="def2-tzvp", verbose=0)
+    auxmol = df.addons.make_auxmol(mol, "def2-universal-jkfit")
+    nao, naux = mol.nao, auxmol.nao
+    ref = df.incore.aux_e2(mol, auxmol, "int3c2e_ip1", aosym="s1", comp=3).reshape(3, nao, nao, naux)
+    ps0, ps1 = 4, auxmol.nbas - 3
+    p0, p1 = auxmol.ao_loc[ps0], auxmol.ao_loc[ps1]
+    out = np.zeros((3, p1 - p0, nao, nao))
+    mojoscf._backend.get_extension().int3c2e_ip1(integrals.basis_tables(mol), integrals.basis_tables(auxmol),
+                                                 integrals._boys_table(), ps0, ps1, 1e-16, out)
+    assert abs(out - ref.transpose(0, 3, 1, 2)[:, p0:p1]).max() < 1e-11
+
+
+def test_df_jk_terms_fallbacks():
+    mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
+    # range-separated functional, auxbasis_response < 2, exact integrals: pyscf's terms
+    mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="camb3lyp").density_fit()).run()
+    assert mhess.df_jk_terms(mf.Hessian()) is None
+    mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="b3lyp").density_fit()).run()
+    h = mf.Hessian()
+    assert mhess.df_jk_terms(h) is not None
+    h.auxbasis_response = 1
+    assert mhess.df_jk_terms(h) is None
+    mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="b3lyp")).run()
+    assert mhess.df_jk_terms(mf.Hessian()) is None

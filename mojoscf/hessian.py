@@ -295,6 +295,475 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
     return fx
 
 
+class _Metric:
+    """The Coulomb metric V of the auxiliary basis, factorised as pyscf's ``_gen_metric_solver`` does:
+    Cholesky V = L L^T, or (not positive definite) the eigenvectors above ``lindep``, V^+ = U U^T.
+
+    ``whiten(r)`` gives L^-1 r (U^T r), so that r_a^T V^-1 r_b = whiten(r_a) . whiten(r_b);
+    ``solve(r)`` gives V^-1 r.  ``r`` is (naux, ...) and is overwritten.
+    """
+
+    def __init__(self, v, lindep):
+        import scipy.linalg
+
+        try:
+            self.low = scipy.linalg.cholesky(v, lower=True)
+            self.u = None
+        except scipy.linalg.LinAlgError:
+            w, u = scipy.linalg.eigh(v)
+            keep = w > lindep
+            self.low = None
+            self.u = u[:, keep] / np.sqrt(w[keep])
+
+    def whiten(self, r):
+        from scipy.linalg import blas
+
+        r2 = np.ascontiguousarray(r).reshape(r.shape[0], -1)
+        if self.low is None:
+            return (self.u.T @ r2).reshape((-1,) + r.shape[1:])
+        # X L^T = r^T on the Fortran-ordered view: X^T = L^-1 r, in place
+        out = blas.dtrsm(1.0, self.low, r2.T, side=1, lower=1, trans_a=1, overwrite_b=1)
+        return out.T.reshape(r.shape)
+
+    def solve(self, r):
+        from scipy.linalg import blas
+
+        r2 = np.ascontiguousarray(r).reshape(r.shape[0], -1)
+        if self.low is None:
+            return (self.u @ (self.u.T @ r2)).reshape(r.shape)
+        out = blas.dtrsm(1.0, self.low, r2.T, side=1, lower=1, trans_a=1, overwrite_b=1)
+        out = blas.dtrsm(1.0, self.low, out, side=1, lower=1, trans_a=0, overwrite_b=1)
+        return out.T.reshape(r.shape)
+
+
+def _df_jk_reason(hessobj, mo_coeff, mo_occ):
+    """Why :func:`df_jk_terms` cannot handle ``hessobj`` (None if it can)."""
+    from pyscf.df import df as pyscf_df
+    from pyscf.df import df_jk
+    from pyscf.scf import hf, rohf, uhf
+
+    mf = hessobj.base
+    mol = hessobj.mol
+    if integrals.engine() != "mojo":
+        return "the Mojo integral engine is not selected"
+    if not isinstance(mf, df_jk._DFHF) or getattr(mf, "only_dfj", False) or type(mf.with_df) is not pyscf_df.DF:
+        return "not a density-fitted SCF (pyscf's DF class)"
+    if getattr(hessobj, "auxbasis_response", 2) != 2:
+        return "auxbasis_response below 2"
+    if isinstance(mf, rohf.ROHF) or not isinstance(mf, (hf.RHF, uhf.UHF)):
+        return "only RHF/RKS and UHF/UKS references"
+    try:
+        from pyscf.solvent._attach_solvent import _Solvation
+
+        if isinstance(mf, _Solvation):
+            return "solvent models"
+    except ImportError:  # pragma: no cover
+        pass
+    if isinstance(mf, hf.KohnShamDFT):
+        if mf.do_nlc():
+            return "NLC functionals"
+        omega = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)[0]
+        if omega != 0:
+            return "range-separated functionals"
+    if getattr(mol, "omega", 0) or getattr(mf.with_df, "omega", None):
+        return "range-separated Coulomb operator"
+    reason = integrals.unsupported_reason(mol, two_electron=True)
+    if reason is not None:
+        return reason
+    if not np.isrealobj(mo_coeff):
+        return "complex orbitals"
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    full = 1.0 if unrestricted else 2.0
+    occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
+    if any(not np.all((o == 0) | (o == full)) for o in occs):
+        return "fractional occupations"
+    return None
+
+
+class _KChannel:
+    """Occupied orbitals of one spin and their exchange intermediates for :func:`df_jk_terms`."""
+
+    def __init__(self, c, occ):
+        self.c = c
+        self.occ = occ
+        self.co = np.ascontiguousarray(c[:, occ > 0])
+        self.nocc = self.co.shape[1]
+        self.lmo = None       # (naux, nmo, nocc): C^T (mu nu|P) C_o
+        self.ck = None        # (naux, nocc, nocc): V^-1 C_o^T (mu nu|P) C_o
+        self.ltil = None      # (naux, nmo, nocc): V^-1 lmo
+        self.g = None         # (nao, 3, naux, nocc): (nabla mu nu|P) C_o
+        self.hb = None        # (natm, 3, nao, nocc): sum_P N_P[A]^T C_o[A] ck_P
+        self.hd = None        # (natm, 3, nao, nocc): sum_{P on A} N_P^T C_o ck_P
+
+
+def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
+    """Coulomb and exchange terms of a density-fitted RKS/UKS (or RHF/UHF) Hessian, or None.
+
+    Returns ``(de2, h1)``: ``de2`` (natm, natm, 3, 3) the J/K part of pyscf's
+    ``partial_hess_elec`` (``ej - hyb ek`` with the full auxiliary-basis
+    response, ``auxbasis_response = 2``), and ``h1`` (``with_h1``) per spin the
+    J/K part of ``make_h1`` projected to the MO basis, C^T F^(A,x) C_o as
+    (natm, 3, nmo, nocc_s) (MOs in their original order, occupied ones as in
+    ``mo_occ > 0``).  None (pyscf's code runs) for the cases
+    :func:`_df_jk_reason` names and when the intermediates do not fit in
+    ``max_memory``.
+
+    With B_P = (mu nu|P), V = (P|Q), c = V^-1 (B . D) and, per spin, the
+    fitted occupied products c_P = V^-1 C_o^T B C_o, the DF energy
+    1/2 rho^T V^-1 rho - kappa/2 sum_s sum_ij b_ij V^-1 b_ij has the second
+    derivative (fixed orbitals)
+
+        sum d2B_P Gamma_P - 1/2 sum d2V_PQ W_PQ + r_a^T V^-1 r_b - kappa sum_s rK_a^T V^-1 rK_b
+
+    with Gamma_P = c_P D - kappa sum_s C_o c_P C_o^T, W = c c^T - kappa sum_s c_P . c_Q,
+    r_a = (dB_a . D) - V_a c and rK_a = C_o^T dB_a C_o - V_a c (per occupied pair).
+    The first term is the Mojo kernel ``hess_df3c`` (second-derivative
+    three-centre integrals contracted as they are produced), the second uses
+    pyscf's two-centre ``int2c2e_ipip1``.  The derivative integrals
+    N_P = (nabla mu nu|P) come from the Mojo kernel ``int3c2e_ip1`` in blocks
+    of auxiliary functions; from each block the J pieces (B-derivatives
+    contracted with D and with c), the half-transformed N_P C_o and the
+    exchange pieces of the Fock derivatives are formed with BLAS, the
+    derivatives of the auxiliary centres following from translational
+    invariance.  The exchange vectors rK are then built from N C_o in blocks
+    of occupied orbitals, whitened with the Cholesky factor of V and
+    contracted (the Hessian term) and contracted with V^-1 C^T B C_o (the
+    Fock derivative), never as nao x nao matrices per atom.
+    """
+    from pyscf import lib
+    from pyscf.df import addons as df_addons
+    from pyscf.df.grad.rhf import LINEAR_DEP_THRESHOLD
+    from pyscf.scf import hf
+
+    from . import kernels
+
+    mf = hessobj.base
+    mol = hessobj.mol
+    if mo_coeff is None:
+        mo_coeff = mf.mo_coeff
+    if mo_occ is None:
+        mo_occ = mf.mo_occ
+    if _df_jk_reason(hessobj, mo_coeff, mo_occ) is not None:
+        return None
+    with_df = mf.with_df
+    auxmol = with_df.auxmol
+    if auxmol is None:
+        auxmol = df_addons.make_auxmol(with_df.mol, with_df.auxbasis)
+    if integrals.unsupported_reason(auxmol, two_electron=True) is not None:
+        return None
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    cs = [np.asarray(c, dtype=np.float64) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff, np.float64)]
+    occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
+    hyb = 1.0
+    if isinstance(mf, hf.KohnShamDFT):
+        ni = mf._numint
+        hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)[2] if ni.libxc.is_hybrid_xc(mf.xc) else 0.0
+    kappa = hyb * (1.0 if unrestricted else 2.0)
+    chans = [_KChannel(c, o) for c, o in zip(cs, occs)]
+    kchans = [ch for ch in chans if ch.nocc > 0] if hyb != 0 else []
+    nao, natm, naux = mol.nao_nr(), mol.natm, auxmol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    nmo = cs[0].shape[1]
+    dm = sum((ch.co * ch.occ[ch.occ > 0]) @ ch.co.T for ch in chans)
+
+    # the intermediates kept in memory (words); pyscf's code goes out of core instead
+    words = naux * npair + 4 * naux * naux
+    for ch in chans:
+        words += 2 * naux * nmo * ch.nocc if with_h1 else 0
+    for ch in kchans:
+        words += 3 * nao * naux * ch.nocc + 4 * naux * ch.nocc * ch.nocc
+    free = hessobj.max_memory - lib.current_memory()[0]
+    if words * 8e-6 > 0.7 * free:
+        return None
+    budget = max(200.0, 0.7 * free - words * 8e-6) * 1e6 / 8      # words for the blocks
+
+    ext = get_extension()
+    boys = integrals._boys_table()
+    tables = integrals.basis_tables(mol)
+    aux_tables = integrals.basis_tables(auxmol)
+    seq_path, seq_prefix = worker_blas()
+    aoslices = [tuple(int(v) for v in s[2:]) for s in mol.aoslice_by_atom()]
+    auxslices = [tuple(int(v) for v in s[2:]) for s in auxmol.aoslice_by_atom()]
+
+    # fitted densities and the three-centre integrals in the MO basis
+    j3c = integrals.int3c2e(mol, auxmol)
+    metric = _Metric(integrals.int2c2e(auxmol), LINEAR_DEP_THRESHOLD)
+    dm_tril = lib.pack_tril(dm + dm.T)
+    diag = np.arange(nao)
+    dm_tril[diag * (diag + 1) // 2 + diag] *= 0.5
+    coef = metric.solve((j3c @ dm_tril)[:, None])[:, 0]
+    for ch in chans:
+        if (with_h1 or ch in kchans) and ch.nocc:
+            lmo = kernels.df_mo(j3c, ch.c, ch.co)
+            if ch in kchans:
+                ch.ck = metric.solve(np.ascontiguousarray(lmo[:, ch.occ > 0]))
+            if with_h1:
+                ch.lmo = lmo
+                if ch in kchans:
+                    ch.ltil = metric.solve(lmo.copy())
+    j3c = None
+
+    # second-derivative three-centre term
+    de2 = np.empty((natm, natm, 3, 3))
+    m = max((ch.nocc for ch in kchans), default=0)
+    cns = np.zeros((max(len(kchans), 1), nao, m))
+    xs = np.zeros((max(len(kchans), 1), naux, m * (m + 1) // 2))
+    for s, ch in enumerate(kchans):
+        cns[s, :, : ch.nocc] = ch.co
+        pad = np.zeros((naux, m, m))
+        pad[:, : ch.nocc, : ch.nocc] = ch.ck
+        xs[s] = lib.pack_tril(pad)
+    pad = None
+    blk = max(1, min(naux, int(budget / 2 / npair)))
+    ext.hess_df3c(tables, aux_tables, boys, np.ascontiguousarray(coef), np.ascontiguousarray(lib.pack_tril(dm)), 1.0,
+                  float(kappa), xs, cns, blk, float(tol), de2, seq_path, seq_prefix)
+    cns = xs = None
+
+    # second-derivative two-centre term: -1/2 sum d2V_PQ W_PQ = C_AB - delta_AB sum_B' C_AB'
+    w = np.outer(coef, coef)
+    for ch in kchans:
+        ck2 = ch.ck.reshape(naux, -1)
+        w -= kappa * (ck2 @ ck2.T)
+    onehot = np.zeros((naux, natm))
+    for ia, (q0, q1) in enumerate(auxslices):
+        onehot[q0:q1, ia] = 1.0
+    wv = auxmol.intor("int2c2e_ipip1", comp=9).reshape(9, naux, naux)
+    wv *= w
+    w = None
+    cab = (onehot.T @ wv @ onehot).reshape(3, 3, natm, natm).transpose(2, 3, 0, 1)
+    wv = None
+    de2 += cab
+    for ia in range(natm):
+        de2[ia, ia] -= cab[ia].sum(axis=0)
+
+    # first-derivative integrals, block by block of auxiliary shells
+    v1 = auxmol.intor("int2c2e_ip1", comp=3)                     # (nabla P|Q)
+    ndm = np.empty((3, naux, nao))                               # sum_nu N_P,mu nu D_mu nu
+    nt = np.zeros((natm, 3, nao, nao)) if with_h1 else None      # sum_{P on A} c_P N_P
+    for ch in kchans:
+        ch.g = np.empty((nao, 3, naux, ch.nocc))
+        if with_h1:
+            ch.hb = np.zeros((natm, 3, nao, ch.nocc))
+            ch.hd = np.zeros((natm, 3, nao, ch.nocc))
+    aux_loc = auxmol.ao_loc_nr()
+    maxp = max(1, int(budget / 2 / (3 * nao * nao + 3 * nao * (m + 1))))
+    sh0 = 0
+    while sh0 < auxmol.nbas:
+        sh1 = sh0 + 1
+        while sh1 < auxmol.nbas and aux_loc[sh1 + 1] - aux_loc[sh0] <= maxp:
+            sh1 += 1
+        p0, p1 = int(aux_loc[sh0]), int(aux_loc[sh1])
+        npf = p1 - p0
+        n3 = np.zeros((3, npf, nao, nao))
+        ext.int3c2e_ip1(tables, aux_tables, boys, sh0, sh1, float(tol), n3)
+        ndm[:, p0:p1] = np.einsum("xpmn,mn->xpm", n3, dm)
+        segs = [(ia, max(q0, p0) - p0, min(q1, p1) - p0) for ia, (q0, q1) in enumerate(auxslices)
+                if max(q0, p0) < min(q1, p1)]
+        if with_h1:
+            for ia, s0, s1 in segs:
+                nt[ia] += np.einsum("p,xpmn->xmn", coef[p0 + s0: p0 + s1], n3[:, s0:s1])
+        for ch in kchans:
+            nocc = ch.nocc
+            ch.g[:, :, p0:p1] = (n3.reshape(-1, nao) @ ch.co).reshape(3, npf, nao, nocc).transpose(2, 0, 1, 3)
+            if with_h1:
+                mk = np.matmul(ch.co, ch.ck[p0:p1])              # (npf, nao, nocc): C_o ck_P
+                for x in range(3):
+                    nx = n3[x]
+                    for ia, (a0, a1) in enumerate(aoslices):
+                        if a1 > a0:
+                            ch.hb[ia, x] += nx[:, a0:a1].reshape(-1, nao).T @ mk[:, a0:a1].reshape(-1, nocc)
+                    for ia, s0, s1 in segs:
+                        ch.hd[ia, x] += nx[s0:s1].reshape(-1, nao).T @ mk[s0:s1].reshape(-1, nocc)
+        n3 = None
+        sh0 = sh1
+
+    # Coulomb: r_a = y_a - V_a c,  y_(A,x),P = -2 sum_{mu on A} ndm_P,mu + delta(P on A) 2 sum_mu ndm_P,mu
+    tot = ndm.sum(axis=2)
+    v1c = v1 @ coef
+    rj = np.empty((natm, 3, naux))
+    for ia, (a0, a1) in enumerate(aoslices):
+        q0, q1 = auxslices[ia]
+        r = -2.0 * ndm[:, :, a0:a1].sum(axis=2)
+        r[:, q0:q1] += 2.0 * tot[:, q0:q1] + v1c[:, q0:q1]
+        r += np.einsum("xqp,q->xp", v1[:, q0:q1], coef[q0:q1])
+        rj[ia] = r
+    ndm = None
+    rj = np.ascontiguousarray(rj.reshape(3 * natm, naux).T)          # (naux, 3 natm)
+    vr = metric.solve(rj.copy()) if with_h1 else None
+    rt = metric.whiten(rj)
+    de2 += (rt.T @ rt).reshape(natm, 3, natm, 3).transpose(0, 2, 1, 3)
+    rj = rt = None
+
+    h1 = None
+    if with_h1:
+        h1 = []
+        ntot = nt.sum(axis=0)
+        for ch in chans:
+            h = np.zeros((natm, 3, nmo, ch.nocc))
+            if ch.nocc:
+                h += (ch.lmo.reshape(naux, -1).T @ vr).reshape(nmo, ch.nocc, natm, 3).transpose(2, 3, 0, 1)
+                for ia, (a0, a1) in enumerate(aoslices):
+                    for x in range(3):
+                        f = nt[ia, x] + nt[ia, x].T
+                        f[a0:a1] -= ntot[x, a0:a1]
+                        f[:, a0:a1] -= ntot[x, a0:a1].T
+                        h[ia, x] += ch.c.T @ (f @ ch.co)
+            h1.append(h)
+        nt = ntot = vr = None
+
+    # exchange
+    for ch in kchans:
+        nocc = ch.nocc
+        v1ck = (v1.reshape(3 * naux, naux) @ ch.ck.reshape(naux, -1)).reshape(3, naux, nocc, nocc)
+        if with_h1:
+            # sum_P (C^T dB_P C_o) ck_P = C^T [-E_A gam - hb_A + gam_A + hd_A],  gam_A = sum_{P on A} g_P ck_P
+            gam = np.zeros((natm, nao, 3, nocc))
+            for ia, (q0, q1) in enumerate(auxslices):
+                if q1 > q0:
+                    gam[ia] = (ch.g[:, :, q0:q1].reshape(3 * nao, -1) @ ch.ck[q0:q1].reshape(-1, nocc)).reshape(nao, 3, nocc)
+            gtot = gam.sum(axis=0)
+            hk = np.empty((natm, 3, nmo, nocc))
+            for ia, (a0, a1) in enumerate(aoslices):
+                for x in range(3):
+                    t = gam[ia][:, x] + ch.hd[ia, x] - ch.hb[ia, x]
+                    t[a0:a1] -= gtot[a0:a1, x]
+                    hk[ia, x] = ch.c.T @ t
+            gam = gtot = None
+            ch.hb = ch.hd = None
+        # rK_a,P[i, j] in blocks of rows i: -(Z_A,P + Z_A,P^T) + delta(P on A) (Z_P + Z_P^T) - (V_a ck)_P,
+        # Z_A,P = C_o[A]^T g_P[A],  -(V_a ck)_P = delta(P on A) (V1 ck)_P + sum_{Q on A} V1_QP ck_Q
+        rowb = max(1, min(nocc, int(budget / 2 / (naux * nocc * (3 * natm + 6)))))
+        gram = np.zeros((3 * natm, 3 * natm))
+        hr = np.zeros((nmo, nocc, natm, 3)) if with_h1 else None
+        for i0 in range(0, nocc, rowb):
+            i1 = min(nocc, i0 + rowb)
+            nb = i1 - i0
+            rk = np.empty((naux, nb, nocc, natm, 3))
+            zall = np.zeros((naux, nb, nocc, 3))
+            for ia, (a0, a1) in enumerate(aoslices):
+                if a1 == a0:
+                    rk[:, :, :, ia] = 0.0
+                    continue
+                ca = ch.co[a0:a1]
+                ga = ch.g[a0:a1]
+                z1 = (ca[:, i0:i1].T @ ga.reshape(a1 - a0, -1)).reshape(nb, 3, naux, nocc)
+                z2 = (ga[..., i0:i1].reshape(a1 - a0, -1).T @ ca).reshape(3, naux, nb, nocc)
+                zz = z1.transpose(2, 0, 3, 1) + z2.transpose(1, 2, 3, 0)
+                rk[:, :, :, ia] = -zz
+                zall += zz
+            for ia, (q0, q1) in enumerate(auxslices):
+                if q1 == q0:
+                    continue
+                rk[q0:q1, :, :, ia] += zall[q0:q1] + v1ck[:, q0:q1, i0:i1].transpose(1, 2, 3, 0)
+                cq = ch.ck[q0:q1, i0:i1].reshape(q1 - q0, -1)
+                for x in range(3):
+                    rk[:, :, :, ia, x] += (v1[x, q0:q1].T @ cq).reshape(naux, nb, nocc)
+            zall = None
+            if with_h1:
+                hr += np.tensordot(ch.ltil[:, :, i0:i1], rk, axes=([0, 2], [0, 1]))
+            rt = metric.whiten(rk).reshape(-1, 3 * natm)
+            rk = None
+            gram += rt.T @ rt
+            rt = None
+        de2 -= kappa * gram.reshape(natm, 3, natm, 3).transpose(0, 2, 1, 3)
+        if with_h1:
+            hk += hr.transpose(2, 3, 0, 1)
+            h1[chans.index(ch)] -= hyb * hk
+        ch.g = None
+    return de2, h1
+
+
+def _hess_e1(hessobj, mo_energy, mo_coeff, mo_occ):
+    """The one-electron (core Hamiltonian and overlap) part of the partial Hessian, (natm, natm, 3, 3),
+    as pyscf's ``_partial_hess_ejk`` forms it."""
+    from pyscf.hessian import rhf as rhf_hess
+
+    mol = hessobj.mol
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    cs = list(mo_coeff) if unrestricted else [mo_coeff]
+    occs = list(mo_occ) if unrestricted else [mo_occ]
+    es = list(mo_energy) if unrestricted else [mo_energy]
+    dm0 = 0.0
+    dme0 = 0.0
+    for c, o, e in zip(cs, occs, es):
+        c, o, e = np.asarray(c), np.asarray(o), np.asarray(e)
+        co = c[:, o > 0]
+        dm0 = dm0 + (co * o[o > 0]) @ co.T
+        dme0 = dme0 + (co * (o * e)[o > 0]) @ co.T
+    s1aa, s1ab, _ = rhf_hess.get_ovlp(mol)
+    hcore_deriv = hessobj.hcore_generator(mol)
+    aoslices = mol.aoslice_by_atom()
+    natm = mol.natm
+    e1 = np.zeros((natm, natm, 3, 3))
+    for ia in range(natm):
+        p0, p1 = aoslices[ia][2:]
+        e1[ia, ia] -= np.einsum("xypq,pq->xy", s1aa[:, :, p0:p1], dme0[p0:p1]) * 2
+        for ja in range(ia + 1):
+            q0, q1 = aoslices[ja][2:]
+            e1[ia, ja] -= np.einsum("xypq,pq->xy", s1ab[:, :, p0:p1, q0:q1], dme0[p0:p1, q0:q1]) * 2
+            e1[ia, ja] += np.einsum("xypq,pq->xy", hcore_deriv(ia, ja), dm0)
+        for ja in range(ia):
+            e1[ja, ia] = e1[ia, ja].T
+    return e1
+
+
+def _pyscf_xc_partial(hessobj, mo_coeff, mo_occ):
+    """The XC part of the partial Hessian from pyscf's ``_get_vxc_diag``/``_get_vxc_deriv2`` (any functional
+    pyscf's Hessian supports), contracted as pyscf's ``partial_hess_elec`` does."""
+    from pyscf import lib
+    from pyscf.hessian import rks as rks_hess
+    from pyscf.hessian import uks as uks_hess
+
+    mf = hessobj.base
+    mol = hessobj.mol
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    max_memory = max(2000, mf.max_memory * 0.9 - lib.current_memory()[0])
+    if unrestricted:
+        dms = [(c[:, o > 0]) @ c[:, o > 0].T for c, o in zip(mo_coeff, mo_occ)]
+        diag = uks_hess._get_vxc_diag(hessobj, mo_coeff, mo_occ, max_memory)
+        deriv2 = uks_hess._get_vxc_deriv2(hessobj, mo_coeff, mo_occ, max_memory)
+    else:
+        co = mo_coeff[:, mo_occ > 0]
+        dms = [2.0 * co @ co.T]
+        diag = [rks_hess._get_vxc_diag(hessobj, mo_coeff, mo_occ, max_memory)]
+        deriv2 = [rks_hess._get_vxc_deriv2(hessobj, mo_coeff, mo_occ, max_memory)]
+    aoslices = mol.aoslice_by_atom()
+    natm = mol.natm
+    de2 = np.zeros((natm, natm, 3, 3))
+    for ia in range(natm):
+        p0, p1 = aoslices[ia][2:]
+        for d, v, dm in zip(diag, deriv2, dms):
+            de2[ia, ia] += np.einsum("xypq,pq->xy", d[:, :, p0:p1], dm[p0:p1]) * 2
+            for ja in range(ia + 1):
+                q0, q1 = aoslices[ja][2:]
+                de2[ia, ja] += np.einsum("xypq,pq->xy", v[ia][:, :, q0:q1], dm[q0:q1]) * 2
+        for ja in range(ia):
+            de2[ja, ia] = de2[ia, ja].T
+    return de2
+
+
+def _pyscf_xc_h1mo(hessobj, mo_coeff, mo_occ):
+    """pyscf's ``_get_vxc_deriv1`` projected as :func:`xc_h1mo` returns it."""
+    from pyscf import lib
+    from pyscf.hessian import rks as rks_hess
+    from pyscf.hessian import uks as uks_hess
+
+    mf = hessobj.base
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    max_memory = max(2000, mf.max_memory * 0.9 - lib.current_memory()[0])
+    if unrestricted:
+        vs = uks_hess._get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
+        pairs = zip(mo_coeff, mo_occ, vs)
+    else:
+        pairs = [(mo_coeff, mo_occ, rks_hess._get_vxc_deriv1(hessobj, mo_coeff, mo_occ, max_memory))]
+    out = []
+    for c, o, v in pairs:
+        c = np.asarray(c)
+        co = c[:, np.asarray(o) > 0]
+        out.append(np.einsum("pi,axpq,qj->axij", c, np.asarray(v), co, optimize=True))
+    return out
+
+
 class _ZeroXC:
     """Within the block, pyscf's ``_get_vxc_diag``/``_get_vxc_deriv2`` (RKS or UKS) return zeros,
     so that pyscf's ``partial_hess_elec`` forms everything but the XC term (the long-range
@@ -360,34 +829,50 @@ class _ZeroXC1:
 
 
 class _MojoHessMixin:
-    """In front of pyscf's RKS/UKS Hessian classes (DF or not): the XC terms from the Mojo kernels."""
+    """In front of pyscf's RKS/UKS Hessian classes (DF or not): the XC terms from the Mojo kernels and,
+    for density-fitted references, the Coulomb/exchange terms from :func:`df_jk_terms`."""
 
     __name_mixin__ = "Mojo"
+
+    def _grids(self):
+        return self.grids if getattr(self, "grids", None) is not None else self.base.grids
+
+    def _xc_partial(self, mo_coeff, mo_occ):
+        """XC part of the partial Hessian (all atoms): the Mojo kernel, else pyscf's terms."""
+        mf = self.base
+        xc = xc_partial_hess(mf._numint, self.mol, self._grids(), mf.xc, mo_coeff, mo_occ)
+        return xc if xc is not None else _pyscf_xc_partial(self, mo_coeff, mo_occ)
 
     def partial_hess_elec(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None, max_memory=4000,
                           verbose=None):
         mf = self.base
         mol = self.mol
+        if mo_energy is None:
+            mo_energy = mf.mo_energy
         if mo_coeff is None:
             mo_coeff = mf.mo_coeff
         if mo_occ is None:
             mo_occ = mf.mo_occ
-        xc = None
-        if not getattr(self, "grid_response", False):
-            grids = self.grids if getattr(self, "grids", None) is not None else mf.grids
-            xc = xc_partial_hess(mf._numint, mol, grids, mf.xc, mo_coeff, mo_occ)
+        atm = list(range(mol.natm)) if atmlst is None else list(atmlst)
+        if getattr(self, "grid_response", False):
+            return super().partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, verbose)
+        jk = df_jk_terms(self, mo_coeff, mo_occ, with_h1=False)
+        if jk is not None:
+            de2 = _hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
+            return de2[np.ix_(atm, atm)]
+        xc = xc_partial_hess(mf._numint, mol, self._grids(), mf.xc, mo_coeff, mo_occ)
         if xc is None:
             return super().partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, verbose)
         with _ZeroXC(mol, np.asarray(mo_coeff).ndim == 3):
             de2 = super().partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, verbose)
-        atm = list(range(mol.natm)) if atmlst is None else list(atmlst)
         return de2 + xc[np.ix_(atm, atm)]
 
     def hess_elec(self, mo_energy=None, mo_coeff=None, mo_occ=None, mo1=None, mo_e1=None, h1ao=None,
                   atmlst=None, max_memory=4000, verbose=None):
         """pyscf's ``hess_elec`` with the first-order Fock matrices and the coupled-perturbed equations in the
-        MO basis: the XC part of the Fock derivatives from ``xc_h1mo``, the rest from pyscf's ``make_h1``
-        (projected), and the response from :func:`cphf_operator`."""
+        MO basis: the XC part of the Fock derivatives from ``xc_h1mo``, the Coulomb/exchange part from
+        :func:`df_jk_terms` (density fitting) or pyscf's ``make_h1`` (projected), and the response from
+        :func:`cphf_operator`."""
         from pyscf.lib import logger
 
         mf = self.base
@@ -398,40 +883,56 @@ class _MojoHessMixin:
             mo_occ = mf.mo_occ
         if mo_coeff is None:
             mo_coeff = mf.mo_coeff
-        xch1 = None
-        if mo1 is None and mo_e1 is None and h1ao is None and not getattr(self, "grid_response", False):
-            grids = self.grids if getattr(self, "grids", None) is not None else mf.grids
-            xch1 = xc_h1mo(mf._numint, mol, grids, mf.xc, mo_coeff, mo_occ)
-        if xch1 is None:
+        if mo1 is not None or mo_e1 is not None or h1ao is not None or getattr(self, "grid_response", False):
             return super().hess_elec(mo_energy, mo_coeff, mo_occ, mo1, mo_e1, h1ao, atmlst, max_memory, verbose)
         log = logger.new_logger(self, verbose)
         t0 = (logger.process_clock(), logger.perf_counter())
+        xch1 = xc_h1mo(mf._numint, mol, self._grids(), mf.xc, mo_coeff, mo_occ)
+        jk = df_jk_terms(self, mo_coeff, mo_occ, with_h1=True)
+        if xch1 is None and jk is None:
+            return super().hess_elec(mo_energy, mo_coeff, mo_occ, mo1, mo_e1, h1ao, atmlst, max_memory, verbose)
+        t1 = log.timer_debug1("J/K and XC Fock derivatives", *t0)
         atmlst = list(range(mol.natm)) if atmlst is None else list(atmlst)
         unrestricted = np.asarray(mo_coeff).ndim == 3
-        de2 = self.partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, log)
-        with _ZeroXC1(mol, unrestricted):
-            h1ao = self.make_h1(mo_coeff, mo_occ, None, atmlst, log)
-        t1 = log.timer_debug1("making H1", *t0)
         cs = [np.asarray(c) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff)]
         occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
         es = [np.asarray(e) for e in mo_energy] if unrestricted else [np.asarray(mo_energy)]
-        h1s = list(h1ao) if unrestricted else [h1ao]
+        if jk is not None:
+            de2 = _hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
+            de2 = de2[np.ix_(atmlst, atmlst)]
+            if xch1 is None:
+                xch1 = _pyscf_xc_h1mo(self, mo_coeff, mo_occ)
+            hcore_deriv = mf.nuc_grad_method().hcore_generator(mol)
+            hmo = jk[1]
+            for ia in atmlst:
+                h1 = hcore_deriv(ia)
+                for c, o, hm in zip(cs, occs, hmo):
+                    hm[ia] += c.T @ h1 @ c[:, o > 0]
+        else:
+            de2 = self.partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, log)
+            with _ZeroXC1(mol, unrestricted):
+                h1ao = self.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+            h1s = list(h1ao) if unrestricted else [h1ao]
+            hmo = []
+            for c, o, h1 in zip(cs, occs, h1s):
+                hm = np.zeros((mol.natm, 3, c.shape[1], int((o > 0).sum())))
+                for ia in atmlst:
+                    hm[ia] = c.T @ np.asarray(h1[ia]) @ c[:, o > 0]
+                hmo.append(hm)
+        t1 = log.timer_debug1("partial hessian and H1", *t1)
         nao = cs[0].shape[0]
         s1a = -mol.intor("int1e_ipovlp", comp=3)
         aoslices = mol.aoslice_by_atom()
-        hmo, smo = [], []
-        for c, o, h1 in zip(cs, occs, h1s):
+        smo = []
+        for c, o in zip(cs, occs):
             co = c[:, o > 0]
-            hm = np.zeros((mol.natm, 3, c.shape[1], co.shape[1]))
-            sm = np.zeros_like(hm)
+            sm = np.zeros((mol.natm, 3, c.shape[1], co.shape[1]))
             for ia in atmlst:
                 p0, p1 = aoslices[ia][2:]
-                hm[ia] = c.T @ np.asarray(h1[ia]) @ co
                 s1ao = np.zeros((3, nao, nao))
                 s1ao[:, p0:p1] += s1a[:, p0:p1]
                 s1ao[:, :, p0:p1] += s1a[:, p0:p1].transpose(0, 2, 1)
                 sm[ia] = c.T @ s1ao @ co
-            hmo.append(hm)
             smo.append(sm)
         for hm, xh in zip(hmo, xch1):
             hm[atmlst] += xh[atmlst]

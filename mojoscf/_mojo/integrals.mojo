@@ -550,6 +550,41 @@ def shell_nfunc(bs: Basis, sh: Int) -> Int:
     return bs.nctr[sh] * bs.nf[bs.l[sh]] if sh >= 0 else 1
 
 
+def _d2ops(comp: Int) -> Tuple[Int, Int, Int, Int]:
+    """The two derivative operators (centre 0 = a or 1 = b, direction) of second-derivative component ``comp``:
+    0-5 nabla_a nabla_a (xx, xy, xz, yy, yz, zz), 6-14 nabla_a,x nabla_b,y (x = (comp - 6) / 3),
+    15-20 nabla_b nabla_b (as 0-5)."""
+    if comp < 6 or comp >= 15:
+        var c = comp if comp < 6 else comp - 15
+        var cen = 0 if comp < 6 else 1
+        var x = 0 if c < 3 else (1 if c < 5 else 2)
+        var y = c if c < 3 else (c - 2 if c < 5 else 2)
+        return (cen, x, cen, y)
+    var k = comp - 6
+    return (0, k // 3, 1, k % 3)
+
+
+def _dapply(cen: Int, dirn: Int, lower: Bool, ea: Float64, eb: Float64, mut pa: SIMD[DType.int64, 4], mut pb: SIMD[DType.int64, 4]) -> Float64:
+    """Apply one derivative operator (lowering or raising term) to the powers of centre a or b; the weight."""
+    if cen == 0:
+        var p = Int(pa[dirn])
+        if lower:
+            if p == 0:
+                return 0.0
+            pa[dirn] = Int64(p - 1)
+            return Float64(p)
+        pa[dirn] = Int64(p + 1)
+        return -2.0 * ea
+    var p = Int(pb[dirn])
+    if lower:
+        if p == 0:
+            return 0.0
+        pb[dirn] = Int64(p - 1)
+        return Float64(p)
+    pb[dirn] = Int64(p + 1)
+    return -2.0 * eb
+
+
 def fill_pair(
     ba: Basis, a: Int, bb: Basis, b: Int, ht: HermTable, prim: F64Ptr, npad: Int, e: F64Ptr, escr: F64Ptr, cscr: F64Ptr,
     nderiv: Int = 0,
@@ -574,6 +609,9 @@ def fill_pair(
     With ``nderiv`` = 2 three more components follow, a (nabla b) (functions
     ``(3 + x) ncomp + j``).  nabla is the derivative with respect to the
     electron coordinate, minus the derivative with respect to the centre.
+    With ``nderiv`` = 3 the 21 second-derivative components of ``_d2ops``
+    (nabla_a nabla_a, nabla_a nabla_b, nabla_b nabla_b), Hermite degree
+    la + lb + 2, each the composition of two first-derivative operators.
     """
     var la = ba.l[a]
     var lb = bb.l[b] if b >= 0 else 0
@@ -588,12 +626,13 @@ def fill_pair(
     var tbb = b >= 0 and bb.needs_transform(b)
     var transform = ta or tbb
     var deriv = nderiv > 0
-    var ndir = 3 * nderiv if deriv else 1
+    var second = nderiv == 3
+    var ndir = (21 if second else 3 * nderiv) if deriv else 1
     var ccomp0 = nca * ncarta * ncb * ncartb
     var ncomp0 = nca * nfa * ncb * nfb
     var ccomp = ndir * ccomp0
     var ncomp = ndir * ncomp0
-    var nh = nherm(lab + 1 if deriv else lab)
+    var nh = nherm(lab + (2 if second else (1 if deriv else 0)))
     var stride = padded(ncomp)
     var cstride = ccomp if transform else stride
     var c2sa = list_ptr(ba.c2s).unsafe_offset(ba.c2s_off[la])
@@ -608,8 +647,8 @@ def fill_pair(
     var bz = bb.shell_coord(b, 2) if b >= 0 else az
     var rab2 = (ax - bx) * (ax - bx) + (ay - by) * (ay - by) + (az - bz) * (az - bz)
     var fac = ba.func_scale(a) * (bb.func_scale(b) if b >= 0 else 1.0)
-    var la_e = la + 1 if deriv else la
-    var lb_e = lb + 1 if nderiv == 2 else lb
+    var la_e = la + (2 if second else (1 if deriv else 0))
+    var lb_e = lb + (2 if second else (1 if nderiv == 2 else 0))
     var s = la_e + lb_e + 1
     var lb1 = lb_e + 1
     var esz = (la_e + 1) * lb1 * s
@@ -652,7 +691,7 @@ def fill_pair(
                         l = bb.cy[offb + icb]
                         n = bb.cz[offb + icb]
                     for x in range(ndir):
-                        for term in range(2 if deriv else 1):
+                        for term in range(4 if second else (2 if deriv else 1)):
                             var ii = i
                             var kk2 = k
                             var mm = m
@@ -660,7 +699,24 @@ def fill_pair(
                             var ll = l
                             var nn = n
                             var wterm = 1.0
-                            if deriv:
+                            if second:
+                                # two operators, each lowering (bit 0) or raising (bit 1) a power
+                                var ops = _d2ops(x)
+                                var pa = SIMD[DType.int64, 4](Int64(i), Int64(k), Int64(m), 0)
+                                var pb = SIMD[DType.int64, 4](Int64(j), Int64(l), Int64(n), 0)
+                                wterm = _dapply(ops[0], ops[1], (term & 1) == 0, ea, eb, pa, pb)
+                                if wterm == 0.0:
+                                    continue
+                                wterm *= _dapply(ops[2], ops[3], (term & 2) == 0, ea, eb, pa, pb)
+                                if wterm == 0.0:
+                                    continue
+                                ii = Int(pa[0])
+                                kk2 = Int(pa[1])
+                                mm = Int(pa[2])
+                                jj = Int(pb[0])
+                                ll = Int(pb[1])
+                                nn = Int(pb[2])
+                            elif deriv:
                                 var shift = -1 if term == 0 else 1
                                 var dirn = x % 3
                                 if x < 3:
@@ -749,9 +805,9 @@ struct PairTable(Movable):
     var maxlab: Int
 
     def __init__(out self, ba: Basis, bb: Basis, sa: List[Int], sb: List[Int], ht: HermTable, nderiv: Int = 0):
-        """Pairs (sa[i], sb[i]); ``nderiv`` as in ``fill_pair`` (then ``ht`` must reach la + lb + 1)."""
+        """Pairs (sa[i], sb[i]); ``nderiv`` as in ``fill_pair`` (then ``ht`` must reach la + lb + 1, + 2 for 3)."""
         var deriv = nderiv > 0
-        var ndir = 3 * nderiv if deriv else 1
+        var ndir = (21 if nderiv == 3 else 3 * nderiv) if deriv else 1
         var n = len(sa)
         var info = List[Int](length=max(n, 1) * NINFO, fill=0)
         var maxcomp = 1
@@ -763,7 +819,7 @@ struct PairTable(Movable):
             var b = sb[i]
             var la = ba.l[a]
             var lb = bb.l[b] if b >= 0 else 0
-            var lab = la + lb + (1 if deriv else 0)
+            var lab = la + lb + (2 if nderiv == 3 else (1 if deriv else 0))
             var ncomp = ndir * shell_nfunc(ba, a) * shell_nfunc(bb, b)
             var np = pair_nprim(ba, a, bb, b)
             var stride = padded(ncomp)
@@ -792,10 +848,10 @@ struct PairTable(Movable):
         var nworkers = max(1, min(parallelism_level(), n // 16))
 
         var nctr_max = max(ba.nctr_max, bb.nctr_max)
-        var csize = ndir * nherm(2 * lmax + 1) * (nctr_max * ncart(lmax)) * (nctr_max * ncart(lmax))
+        var csize = ndir * nherm(2 * lmax + 2) * (nctr_max * ncart(lmax)) * (nctr_max * ncart(lmax))
 
         def work(w: Int) {imm ba, imm bb, imm ht, imm pp, imm pe, imm pinfo, imm pcount, imm n, imm lmax, imm csize, imm nderiv}:
-            var escr = List[Float64](length=3 * (lmax + 2) * (lmax + 2) * (2 * lmax + 3), fill=0.0)
+            var escr = List[Float64](length=3 * (lmax + 3) * (lmax + 3) * (2 * lmax + 5), fill=0.0)
             var cscr = List[Float64](length=csize, fill=0.0)
             var pescr = list_ptr(escr)
             var pcscr = list_ptr(cscr)
