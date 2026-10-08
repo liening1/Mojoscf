@@ -290,6 +290,49 @@ def _openblas_thread_control(path: str, prefix: str):
     return _thread_ctl[key]
 
 
+def _scipy_blas_control():
+    """(get_num_threads, set_num_threads) of SciPy's bundled OpenBLAS, or None."""
+    try:
+        import scipy
+    except ImportError:  # pragma: no cover
+        return None
+    libdir = os.path.join(os.path.dirname(os.path.dirname(scipy.__file__)), "scipy.libs")
+    for path in sorted(glob.glob(os.path.join(libdir, "libscipy_openblas-*.so*"))):
+        ctl = _openblas_thread_control(path, "scipy_")
+        if ctl is not None:
+            return ctl
+    return None
+
+
+class serial_scipy_blas:
+    """Context manager: SciPy's own OpenBLAS (``scipy.linalg``) on one thread inside the block.
+
+    SciPy wheels bundle an OpenBLAS separate from NumPy's, with its own thread
+    pool; both pools keep their threads spinning for about 0.1 s after each
+    call, so alternating ``numpy.linalg`` and ``scipy.linalg`` calls on
+    matrices of a few hundred rows (pyscf's TDDFT subspace solver: ``lu``,
+    ``inv``, ``cholesky``, ``eigh`` every iteration) makes each wait for the
+    other pool's spinning threads: 52 ms for an ``inv`` + ``cholesky`` pair of
+    400 x 400 that takes 9 ms with SciPy's calls on the calling thread.
+    Nests; restores the previous thread count.
+    """
+
+    def __enter__(self):
+        self._ctl = _scipy_blas_control()
+        self._n = None
+        if self._ctl is not None and not _env_flag("MOJOSCF_KEEP_SCIPY_THREADS"):
+            get, set_ = self._ctl
+            self._n = get()
+            if self._n > 1:
+                set_(1)
+        return self
+
+    def __exit__(self, *exc):
+        if self._n is not None and self._n > 1:
+            self._ctl[1](self._n)
+        return False
+
+
 def worker_blas() -> tuple[str, str]:
     """``(path, prefix)`` of the BLAS for GEMMs issued concurrently from Mojo worker threads.
 

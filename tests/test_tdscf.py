@@ -199,10 +199,62 @@ def test_frozen_orbitals(water):
     _check(mtd.TDDFT(mf, frozen=[0, 1]), ref.TDDFT(frozen=[0, 1]))
 
 
+def _exact_scf(mol, xc, max_memory):
+    unrestricted = mol.spin > 0
+    if xc is None:
+        mf = (scf.UHF if unrestricted else scf.RHF)(mol)
+    else:
+        mf = mojoscf.dft.accelerate((dft.UKS if unrestricted else dft.RKS)(mol, xc=xc))
+    mf.max_memory = max_memory
+    mf.conv_tol = 1e-10
+    return mf.run()
+
+
+@pytest.mark.parametrize("path", ["mo", "direct", "ao"])
+@pytest.mark.parametrize("unrestricted", [False, True])
+def test_exact_integral_operators(water, water_cation, path, unrestricted, monkeypatch):
+    """Exact integrals: MO-basis ERIs from the in-core ones ("mo"), J/K of the AO transition densities with the
+    integral-direct kernel ("direct") or the in-core ERIs ("ao"); the XC response through the factor kernel."""
+    mol = water_cation if unrestricted else water
+    if path == "ao":
+        monkeypatch.setattr(mtd, "_exact_mo_two_electron", lambda *args, **kwargs: None)
+    cases = [("b3lyp", ["TDA", "TDDFT"]), ("pbe", ["TDA", "CasidaTDDFT"]), ("camb3lyp", ["TDDFT"]), (None, ["TDDFT"])]
+    for xc, names in cases:
+        mf = _exact_scf(mol, xc, 0 if path == "direct" else 4000)
+        ref = _pyscf_copy(mf)
+        ref.max_memory = mf.max_memory
+        for name in names:
+            for singlet in (True, False) if not unrestricted and xc == "b3lyp" else (True,):
+                td_m = getattr(mtd, name)(mf)
+                td_p = ptd.rhf.TDHF(ref) if (xc is None and name == "TDDFT") else getattr(ref, name)()
+                if unrestricted and xc is None:
+                    td_p = ptd.uhf.TDHF(ref)
+                if not unrestricted:
+                    td_m.singlet = td_p.singlet = singlet
+                _check(td_m, td_p)
+        assert (getattr(mf, "_eri", None) is None) == (path == "direct")
+
+
+def test_serial_scipy_blas_restores_threads():
+    from mojoscf import _backend
+
+    ctl = _backend._scipy_blas_control()
+    if ctl is None:
+        pytest.skip("SciPy's OpenBLAS thread control not found")
+    n = ctl[0]()
+    with _backend.serial_scipy_blas():
+        assert ctl[0]() == 1
+        with _backend.serial_scipy_blas():
+            assert ctl[0]() == 1
+        assert ctl[0]() == 1
+    assert ctl[0]() == n
+
+
 def test_fallbacks_give_pyscf_results(water):
     """Cases the MO-space operator does not take run pyscf's operator (same results)."""
-    # exact integrals: no DF tensor
+    # exact integrals with a get_jk of its own
     mf = _scf(water, "pbe0", df=False)
+    mf.get_jk = lambda *args, **kwargs: dft.rks.RKS.get_jk(mf, *args, **kwargs)
     td = mf.TDA()
     assert mtd._operator(td) is None
     _check(td, _pyscf_copy(mf).TDA(), mo_path=False)

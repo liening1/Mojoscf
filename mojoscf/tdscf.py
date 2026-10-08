@@ -17,17 +17,30 @@ block B x + A y = e y + J + XC - c (K_B x + K_A y) (TDA: y = 0; c the
 fraction of exact exchange, a second term with the long-range tensor for
 range-separated hybrids).  :func:`mojoscf.kernels.df_mo` transforms the
 tensor once per calculation and :func:`mojoscf.kernels.df_sandwich`
-contracts the exchange terms for all trial vectors at once; the XC kernel
-keeps pyscf's AO route, which :class:`mojoscf.dft.NumInt` runs with the Mojo
-density and potential passes.  The eigensolvers, initial guesses,
-normalisation and analysis stay pyscf's.
+contracts the exchange terms for all trial vectors at once.
+
+With exact integrals, ERIs pyscf keeps in core are transformed once to
+(ia|jb), (ij|ab) and (ib|ja) as (ov) x (ov) matrices, which turns every
+product into a GEMM; otherwise (integral-direct SCF, or MO matrices beyond
+``max_memory``) J and K of the AO transition densities of all vectors come
+from one call of the Mojo kernels (:func:`mojoscf.dft.exact_jk`: symmetric
+parts with J and K, antisymmetric ones with K).
+
+The XC response skips the AO densities as well: from the factors
+``C_v x^T`` and ``C_o`` of the transition densities a Mojo pass forms
+``V C_o`` of the response potential directly (:func:`mojoscf.dft.fxc_matrices`
+with ``project``).  The eigensolvers, initial guesses, normalisation and
+analysis stay pyscf's; they run with SciPy's OpenBLAS on one thread
+(:class:`mojoscf._backend.serial_scipy_blas`), as their ``scipy.linalg`` and
+``numpy.linalg`` calls on the subspace matrices otherwise wait for each
+other's spinning BLAS threads.
 
 Applies to RHF/UHF and RKS/UKS objects with pyscf's in-core density fitting
-(the objects :func:`mojoscf.dft.accelerate` returns create these classes
-from ``mf.TDA()``, ``mf.TDDFT()``, ``mf.CasidaTDDFT()``); point-group
-restrictions (``wfnsym``), solvent models, short-range-only hybrids,
-NLC response, exact integrals and tensors that do not fit in ``max_memory``
-fall back to pyscf's operator.
+or exact integrals (the objects :func:`mojoscf.dft.accelerate` returns create
+these classes from ``mf.TDA()``, ``mf.TDDFT()``, ``mf.CasidaTDDFT()``);
+point-group restrictions (``wfnsym``), solvent models, short-range-only
+hybrids, NLC response, DF tensors that do not fit in ``max_memory`` and
+objects with a ``get_jk`` of their own fall back to pyscf's operator.
 
 >>> mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="pbe0").density_fit()).run()
 >>> td = mf.TDA(); td.nstates = 10; td.kernel()
@@ -40,6 +53,7 @@ from pyscf import lib
 from pyscf.lib import logger
 
 from . import integrals, kernels
+from ._backend import serial_scipy_blas
 
 __all__ = ["TDA", "TDDFT", "TDHF", "CasidaTDDFT", "TDDFTNoHybrid", "RPA"]
 
@@ -56,6 +70,11 @@ class _MojoTD:
         if op is None:
             return super().gen_vind(mf)
         return op
+
+    def kernel(self, *args, **kwargs):
+        # pyscf's eigensolvers alternate numpy.linalg and scipy.linalg calls on the subspace matrices
+        with serial_scipy_blas():
+            return super().kernel(*args, **kwargs)
 
     def Gradients(self):
         from . import tdgrad
@@ -189,7 +208,6 @@ def _operator(td):
 
     mf = td._scf
     mol = mf.mol
-    log = logger.new_logger(td)
     kind = _kind(td)
     if kind is None or integrals.engine() != "mojo":
         return None
@@ -220,9 +238,31 @@ def _operator(td):
     kterms = _exchange_terms(mf)
     if kterms is None:
         return None
+    chans = _channels(td)
     cderi = dft._df_tensor(mf)
-    if cderi is None:
+    if cderi is not None:
+        two = _df_two_electron(td, chans, kterms, cderi, need_j=singlet or unrestricted, need_b=kind == "rpa")
+    elif dft.exact_jk_applies(mf):
+        two = _exact_mo_two_electron(td, chans, kterms, need_j=singlet or unrestricted, need_b=kind == "rpa")
+        if two is None:
+            two = _exact_two_electron(mf, chans, kterms)
+    else:
+        two = None
+    if two is None:
         return None
+    xc = _xc_response(td, ks, unrestricted, singlet, chans)
+    if unrestricted:
+        return _uks_operator(kind, chans, xc, two)
+    return _rks_operator(kind, chans[0], singlet, xc, two)
+
+
+def _df_two_electron(td, chans, kterms, cderi, need_j, need_b):
+    """``two(xs, ys, jscale)`` (:func:`_rks_operator`) from the MO-basis DF tensors, which this sets up on the
+    channels; None when a tensor is missing or they would not fit in ``max_memory``."""
+    from . import dft
+
+    mf = td._scf
+    log = logger.new_logger(td)
     tensors = {0.0: cderi}
     for _, omega in kterms:
         if omega not in tensors:
@@ -230,11 +270,7 @@ def _operator(td):
             if t is None:
                 return None
             tensors[omega] = t
-
-    chans = _channels(td)
     naux = cderi.shape[0]
-    need_j = singlet or unrestricted
-    need_b = kind == "rpa"
     words = 0
     for ch in chans:
         no, nv = ch.nocc, ch.nvir
@@ -265,10 +301,186 @@ def _operator(td):
             ch.k.append((c, loo, lvv, lov))
     log.timer("mojoscf.tdscf MO-basis DF tensors", *t0)
 
-    xc = _xc_response(td, ks, unrestricted, singlet, chans)
-    if unrestricted:
-        return _uks_operator(kind, chans, xc)
-    return _rks_operator(kind, chans[0], singlet, xc)
+    def two(xs, ys, jscale):
+        n = len(xs[0])
+        ws = xs if ys is None else [x + y for x, y in zip(xs, ys)]
+        tops = _coulomb(chans, ws, jscale) if jscale else [np.zeros_like(x) for x in xs]
+        bots = None if ys is None else [t.copy() for t in tops]
+        for s, ch in enumerate(chans):
+            if not _empty(ch, n):
+                _exchange(ch, xs[s], None if ys is None else ys[s], tops[s], None if bots is None else bots[s])
+        return tops, bots
+
+    return two
+
+
+def _exact_mo_two_electron(td, chans, kterms, need_j, need_b):
+    """``two(xs, ys, jscale)`` (:func:`_rks_operator`) from exact MO-basis integrals, transformed once from the
+    in-core 8-fold ERIs: (ia|jb) for J, and per exchange term (ij|ab) for K_A and (ib|ja) for K_B, each stored
+    as an (ov) x (ov) matrix, so that every product is one GEMM for all vectors.  Range-separated hybrids
+    take their long-range ERIs from pyscf (libcint).  None when the ERIs are not kept in core or the MO
+    matrices would not fit in ``max_memory`` (then :func:`_exact_two_electron`).
+    """
+    from pyscf import ao2mo
+
+    mf = td._scf
+    mol = mf.mol
+    log = logger.new_logger(td)
+    if getattr(mf, "_eri", None) is None and not (mol.incore_anyway or mf._is_mem_enough()):
+        return None
+    nao = mol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    nov = [ch.nocc * ch.nvir for ch in chans]
+    kts = [(c, omega) for c, omega in kterms if c != 0]
+    words = sum(nov[s] * nov[t] for s in range(len(chans)) for t in range(s + 1)) if need_j else 0
+    words += sum(n * n for n in nov) * len(kts) * (2 if need_b else 1) + max(nov) ** 2
+    words += npair * (npair + 1) // 2 * (1 if any(omega for _, omega in kts) else 0)
+    if getattr(mf, "_eri", None) is None:
+        words += npair * (npair + 1) // 2
+    avail = td.max_memory - lib.current_memory()[0]
+    if words * 8e-6 > 0.7 * avail:
+        log.info("mojoscf.tdscf: the MO-basis ERIs (%.0f MB) exceed max_memory; J/K of AO densities run", words * 8e-6)
+        return None
+    t0 = (logger.process_clock(), logger.perf_counter())
+    if getattr(mf, "_eri", None) is None:
+        mf._eri = integrals.int2e_s8(mol)
+    eri0 = mf._eri
+    nch = len(chans)
+    live = [ch.nocc > 0 and ch.nvir > 0 for ch in chans]
+
+    def ovov(eri, s, t):
+        a, b = chans[s], chans[t]
+        return ao2mo.incore.general(eri, (a.orbo, a.orbv, b.orbo, b.orbv), compact=False)
+
+    gj = {}
+    if need_j:
+        for s in range(nch):
+            for t in range(s + 1):
+                if live[s] and live[t]:
+                    gj[s, t] = ovov(eri0, s, t)
+    kmats = [[] for _ in chans]           # per channel [(c, K_A matrix, K_B matrix or None)]
+    for c, omega in kts:
+        if omega:
+            with mol.with_range_coulomb(omega):
+                eri = mol.intor("int2e", aosym="s8")
+        else:
+            eri = eri0
+        for s, ch in enumerate(chans):
+            if not live[s]:
+                continue
+            no, nv = ch.nocc, ch.nvir
+            ka = ao2mo.incore.general(eri, (ch.orbo, ch.orbo, ch.orbv, ch.orbv), compact=False)
+            ka = np.ascontiguousarray(ka.reshape(no, no, nv, nv).transpose(0, 2, 1, 3)).reshape(no * nv, no * nv)
+            kb = None
+            if need_b:
+                g = gj[s, s] if omega == 0 and (s, s) in gj else ovov(eri, s, s)
+                kb = np.ascontiguousarray(g.reshape(no, nv, no, nv).transpose(0, 3, 2, 1)).reshape(no * nv, no * nv)
+                g = None
+            kmats[s].append((c, ka, kb))
+        eri = None
+    log.timer("mojoscf.tdscf MO-basis ERIs", *t0)
+
+    def two(xs, ys, jscale):
+        n = len(xs[0])
+        xm = [x.reshape(n, -1) for x in xs]
+        ym = None if ys is None else [y.reshape(n, -1) for y in ys]
+        tops = [np.zeros((n, k)) for k in nov]
+        bots = None if ys is None else [np.zeros((n, k)) for k in nov]
+        if jscale and gj:
+            ws = xm if ym is None else [x + y for x, y in zip(xm, ym)]
+            for (s, t), g in gj.items():
+                # sum_jb (ia|jb) w_jb: rows of g are ia (channel s), columns jb (channel t)
+                j = ws[t] @ g.T
+                tops[s] += jscale * j
+                if bots is not None:
+                    bots[s] += jscale * j
+                if s != t:
+                    j = ws[s] @ g
+                    tops[t] += jscale * j
+                    if bots is not None:
+                        bots[t] += jscale * j
+        for s in range(nch):
+            for c, ka, kb in kmats[s]:
+                if ym is None:
+                    tops[s] -= c * (xm[s] @ ka)
+                    continue
+                xy = np.vstack((xm[s], ym[s]))
+                pa = xy @ ka
+                pb = xy @ kb
+                tops[s] -= c * (pa[:n] + pb[n:])
+                bots[s] -= c * (pb[:n] + pa[n:])
+        tops = [t.reshape(x.shape) for t, x in zip(tops, xs)]
+        if bots is not None:
+            bots = [b.reshape(x.shape) for b, x in zip(bots, xs)]
+        return tops, bots
+
+    return two
+
+
+def _exact_two_electron(mf, chans, kterms):
+    """``two(xs, ys, jscale)`` (:func:`_rks_operator`) with exact integrals: J and K of the AO transition
+    densities ``C_v x^T C_o^T + C_o y C_v^T`` of all vectors in one call of the Mojo kernels
+    (:func:`mojoscf.dft.exact_jk`, in-core or integral-direct; their symmetric parts give J and K, the
+    antisymmetric ones K), projected on the occupied-virtual block: ``C_v^T V C_o`` for the top block,
+    ``C_o^T V C_v`` for the bottom one.  The long-range exchange of range-separated hybrids is pyscf's
+    ``get_k(omega=...)``.
+    """
+    from . import dft
+
+    mol = mf.mol
+    cfull = sum(c for c, omega in kterms if omega == 0)
+    lr = [(c, omega) for c, omega in kterms if omega != 0 and c != 0]
+
+    def top(ch, m):
+        return (ch.orbv.T @ m @ ch.orbo).transpose(0, 2, 1)
+
+    def bot(ch, m):
+        return ch.orbo.T @ m @ ch.orbv
+
+    def two(xs, ys, jscale):
+        n = len(xs[0])
+        dms = []
+        for s, ch in enumerate(chans):
+            d = ch.orbv @ (xs[s].transpose(0, 2, 1) @ ch.orbo.T)
+            if ys is not None:
+                d += ch.orbo @ (ys[s] @ ch.orbv.T)
+            dms.append(d)
+        tops = [np.zeros_like(x) for x in xs]
+        bots = None if ys is None else [np.zeros_like(x) for x in xs]
+        vj = vk = None
+        if jscale and cfull == 0:
+            # Coulomb only: of the symmetric part of the summed densities
+            d = dms[0] if len(dms) == 1 else sum(dms)
+            vj = dft.exact_jk(mf, 0.5 * (d + d.transpose(0, 2, 1)), 1, True, False)[0]
+        elif jscale or cfull != 0:
+            vj, vk = dft.exact_jk(mf, np.concatenate(dms), 0, bool(jscale), cfull != 0)
+            if vj is not None:
+                vj = vj.reshape(len(chans), n, *vj.shape[1:]).sum(axis=0)
+        for s, ch in enumerate(chans):
+            if _empty(ch, n):
+                continue
+            if vj is not None:
+                j = top(ch, jscale * vj)
+                tops[s] += j
+                if bots is not None:
+                    bots[s] += j
+            if vk is not None:
+                k = vk[s * n:(s + 1) * n]
+                tops[s] -= top(ch, cfull * k)
+                if bots is not None:
+                    bots[s] -= bot(ch, cfull * k)
+        for c, omega in lr:
+            vk = np.asarray(mf.get_k(mol, np.concatenate(dms), hermi=0, omega=omega))
+            for s, ch in enumerate(chans):
+                if _empty(ch, n):
+                    continue
+                k = vk[s * n:(s + 1) * n]
+                tops[s] -= top(ch, c * k)
+                if bots is not None:
+                    bots[s] -= bot(ch, c * k)
+        return tops, bots
+
+    return two
 
 
 def _xc_response(td, ks, unrestricted, singlet, chans):
@@ -379,9 +591,13 @@ def _empty(ch, n):
     return ch.nocc == 0 or ch.nvir == 0 or n == 0
 
 
-def _rks_operator(kind, ch, singlet, xc):
+def _rks_operator(kind, ch, singlet, xc, two):
+    """``(vind, hdiag)`` for one closed-shell channel.  ``two(xs, ys, jscale)`` (per channel lists of
+    (n, nocc, nvir) vectors; ``ys`` None for TDA) returns the two-electron parts of the top and bottom blocks
+    (bottom None for TDA): ``jscale`` J(x + y) - c (K_A x + K_B y) and ``jscale`` J(x + y) - c (K_B x + K_A y)."""
     no, nv = ch.nocc, ch.nvir
     e_ia = ch.e_ia
+    jscale = 2.0 if singlet else 0.0
 
     if kind == "tda":
         def vind(zs):
@@ -389,9 +605,7 @@ def _rks_operator(kind, ch, singlet, xc):
             v = zs * e_ia
             if _empty(ch, len(zs)):
                 return v.reshape(len(zs), -1)
-            if singlet:
-                v += _coulomb([ch], [zs], 2.0)[0]
-            _exchange(ch, zs, None, v, None)
+            v += two([zs], None, jscale)[0][0]
             if xc is not None:
                 v += xc([_factor(ch, zs, 2.0)])[0]
             return v.reshape(len(zs), -1)
@@ -406,11 +620,9 @@ def _rks_operator(kind, ch, singlet, xc):
             top = xs * e_ia
             bot = ys * e_ia
             if not _empty(ch, nz):
-                if singlet:
-                    j = _coulomb([ch], [xs + ys], 2.0)[0]
-                    top += j
-                    bot += j
-                _exchange(ch, xs, ys, top, bot)
+                t2, b2 = two([xs], [ys], jscale)
+                top += t2[0]
+                bot += b2[0]
                 if xc is not None:
                     p = xc([_factor(ch, xs + ys, 2.0)])[0]
                     top += p
@@ -431,7 +643,7 @@ def _rks_operator(kind, ch, singlet, xc):
         if not _empty(ch, nz):
             w = zs * d_ia
             if singlet:
-                v += _coulomb([ch], [w], 4.0)[0]
+                v += two([w], None, 4.0)[0][0]
             if xc is not None:
                 v += xc([_factor(ch, w, 4.0)])[0]
         v *= d_ia
@@ -440,7 +652,7 @@ def _rks_operator(kind, ch, singlet, xc):
     return vind, (e_ia ** 2).ravel()
 
 
-def _uks_operator(kind, chans, xc):
+def _uks_operator(kind, chans, xc, two):
     a, b = chans
     nova = a.nocc * a.nvir
     e_ia = np.hstack((a.e_ia.ravel(), b.e_ia.ravel()))
@@ -464,15 +676,14 @@ def _uks_operator(kind, chans, xc):
             tops = [x * ch.e_ia for x, ch in zip(xs, chans)]
             bots = None if ys is None else [y * ch.e_ia for y, ch in zip(ys, chans)]
             if nz:
-                js = _coulomb(chans, ws, 1.0)
+                t2, b2 = two(xs, ys, 1.0)
                 pxc = xc_terms(ws, nz, False) if xc is not None else None
                 for s, ch in enumerate(chans):
                     if _empty(ch, nz):
                         continue
-                    tops[s] += js[s]
+                    tops[s] += t2[s]
                     if bots is not None:
-                        bots[s] += js[s]
-                    _exchange(ch, xs[s], None if ys is None else ys[s], tops[s], None if bots is None else bots[s])
+                        bots[s] += b2[s]
                     if pxc is not None:
                         tops[s] += pxc[s]
                         if bots is not None:
@@ -497,7 +708,7 @@ def _uks_operator(kind, chans, xc):
         hx = zs * ed_ia
         if nz:
             ws = split(zs * d_ia, nz)
-            js = _coulomb(chans, ws, 2.0)
+            js = two(ws, None, 2.0)[0]
             pxc = xc_terms(ws, nz, True) if xc is not None else None
             parts = []
             for s, ch in enumerate(chans):
