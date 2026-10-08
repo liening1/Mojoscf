@@ -48,13 +48,14 @@ iteration then runs without touching Python or pyscf's C code at all.
   pyscf RKS/UKS object the Mojo exchange-correlation integration (LDA, GGA
   and meta-GGA such as r2SCAN), J/K (including the long-range exchange of
   range-separated hybrids such as ωB97X), eigensolver and nuclear gradients
-  while pyscf's loop drives the SCF: 3.3 to 5.6x faster SCF and 5 to 13x
+  while pyscf's loop drives the SCF: 3.4 to 5.6x faster SCF and 5 to 13x
   faster gradients than pyscf, with energies agreeing to 1e-10 Eh or better.
 * **Excited states** (`mojoscf.tdscf`): `mf.TDA()`/`mf.TDDFT()` of
   accelerated objects build the linear response of density-fitted
   references in the occupied-virtual space (Coulomb and exchange through the
-  MO-basis DF tensor, the XC kernel in one fused pass): 5x faster than pyscf for
-  benzene/def2-SVP B3LYP TDDFT, with the same excitation energies.
+  MO-basis DF tensor, the XC kernel in one fused pass): 3.3 to 6.5x faster than pyscf's
+  operators for benzene, ferrocene and a Cu(II) complex, with the same
+  excitation energies.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -264,8 +265,6 @@ a 2.1 GHz Xeon.
 | [Cu(NH3)4]2+ doublet / def2-TZVP B3LYP (DF, UKS) | 241 | 193944 | 12/12 |  52.1 |  11.5 | 4.5x |  17.4 |  1.8 | 9.9x | 4.5e-13 |
 | ferrocene / def2-SVP r2SCAN (DF)                | 221 | 260168 | 76/99 | 377.1 |  90.9 | 4.1x |  16.6 |  1.8 | 9.4x | 4.0e-09 |
 | [Cu(NH3)4]2+ doublet / def2-TZVP r2SCAN (DF, UKS) | 241 | 193944 | 12/12 |  97.4 |  17.4 | 5.6x |  21.1 |  1.6 | 12.9x | 6.8e-12 |
-| ferrocene / def2-SVP ωB97X (DF)                 | 221 | 260168 | 38/38 | 146.0 |  44.5 | 3.3x |  24.6 |  4.9 | 5.1x | 1.5e-11 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP CAM-B3LYP (DF, UKS) | 241 | 193944 | 12/12 |  71.6 |  19.4 | 3.7x |  28.5 |  3.7 | 7.6x | 4.5e-12 |
 | (H2O)5 / def2-TZVP PBE (in-core)                | 215 | 168496 | 12/12 |  24.0 |   6.7 | 3.6x |  16.3 |  3.3 | 5.0x | 4.5e-13 |
 | C8H18 / 6-31G* B3LYP (direct)                   | 148 | 289488 |   9/9 |  30.4 |   7.9 | 3.9x |  15.7 |  2.2 | 7.0x | 9.1e-13 |
 
@@ -314,7 +313,13 @@ ferrocene/PBE, ferrocene/B3LYP and [Fe(H2O)6]2+/PBE0.
   long-range term from the attenuated derivative integrals.  Same-SCF
   gradients agree with pyscf to about 1e-9, the noise level of the nearly
   singular long-range metric (reciprocal condition number ~1e-22 for water
-  with ωB97X), confirmed against finite differences.
+  with ωB97X), confirmed against finite differences.  On the 2.8 GHz
+  machine of the excited-state table: ferrocene/def2-SVP ωB97X SCF 89.9 s
+  (pyscf) against 41.3 s (2.2x), gradient 21.9 s against 6.4 s (3.4x);
+  [Cu(NH3)4]2+ doublet/def2-TZVP CAM-B3LYP (UKS) SCF 49.1 s against 19.1 s
+  (2.6x), gradient 24.0 s against 5.1 s (4.7x).  (pyscf's
+  `range_coulomb(ω)` is a context manager; until this was handled, the
+  long-range exchange silently fell back to pyscf's code.)
 * **Meta-GGA** functionals add the kinetic-energy density
   `tau = 1/2 sum_k n_k |grad psi_k|^2` to the density pass (through the
   orbitals: `C^T grad phi`, three more GEMMs), `sum_c d_c phi (w_tau d_c phi)^T`
@@ -408,14 +413,24 @@ solvers, initial guesses and analysis and replaces the operator:
 `benchmarks/bench_tddft.py`: pyscf versus `mojoscf.dft.accelerate`, each in
 its own process, density fitting, pyscf's default grids, conv_tol 1e-9 for
 the SCF and pyscf's default 1e-5 for the excited states.  These runs used a
-different machine from the tables above (4 cores of a 2.8 GHz Xeon that is
-slower on this workload; compare the SCF columns with the Kohn-Sham table):
+different machine from the tables above (4 cores of a 2.8 GHz Xeon; the
+speedups of the two machines are not comparable, pyscf's SCF is relatively
+faster on this one):
 
-| system                                  | nao | states | TD pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dE\| [eV] |
-|-----------------------------------------|----:|---:|------:|-----:|-----:|-----:|-----:|--------:|
-| benzene / def2-SVP B3LYP, TDDFT         | 114 | 10 |  85.8 | 17.0 | 5.0x |  7.9 |  2.8 | 1.7e-11 |
+| system                                              | nao | states | TD pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dE\| [eV] |
+|-----------------------------------------------------|----:|---:|------:|------:|-----:|------:|-----:|--------:|
+| benzene / def2-SVP B3LYP, TDDFT                     | 114 | 10 |  85.8 |  17.0 | 5.0x |   7.9 |  2.8 | 1.7e-11 |
+| ferrocene / def2-SVP PBE0, TDA                      | 221 | 10 | 552.7 | 117.3 | 4.7x | 132.4 | 42.3 | 1.0e-04 |
+| ferrocene / def2-SVP PBE0, TDDFT                    | 221 | 10 | 869.1 | 222.5 | 3.9x | 175.4 | 41.2 | 2.7e-05 |
+| ferrocene / def2-SVP PBE, TDDFT (Casida)            | 221 | 10 | 144.9 |  43.6 | 3.3x |  52.2 | 17.5 | 1.1e-05 |
+| ferrocene / def2-SVP CAM-B3LYP, TDA                 | 221 | 10 | 757.8 | 146.8 | 5.2x |  91.4 | 42.2 | 3.2e-05 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP B3LYP, TDA (UKS)   | 241 |  8 | 493.7 |  75.5 | 6.5x |  45.4 | 15.9 | 2.4e-11 |
 
-The operator products agree with pyscf's to about 1e-14 (relative) for
+The ferrocene excitation energies differ by up to 1e-4 eV because the two
+independently converged SCFs do (conv_tol 1e-9; their orbital-energy gaps
+differ by 1.5e-4 eV, the densities by 2e-5); on the same SCF solution the
+ferrocene operator products agree to 1e-13.  The operator products agree
+with pyscf's to about 1e-14 (relative) for
 RHF/UHF/RKS/UKS, TDA, full TDDFT and the Casida form, singlets and triplets,
 global and range-separated hybrids and meta-GGAs, with and without frozen
 orbitals (`tests/test_tdscf.py`), and the excitation energies to 1e-12
