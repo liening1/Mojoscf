@@ -24,6 +24,7 @@ from _mojo.kernels import (
 )
 from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
+from _mojo.dfmo import df_mo_core, df_sandwich_core
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
@@ -31,9 +32,9 @@ from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
 from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core
 from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
 from _mojo.pcm import pcm_ds_core, pcm_pair_core
-from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core
+from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core
 
-comptime VERSION = "0.11.0"
+comptime VERSION = "0.12.0"
 
 
 @export
@@ -59,6 +60,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_norm_diff]("norm_diff", docstring="norm_diff(a, b) -> ||a - b||_F.")
         m.def_function[py_jk_dense]("jk_dense", docstring="jk_dense(eri, dm, vj_out, vk_out) from a full (n,n,n,n) ERI tensor.")
         m.def_function[py_df_jk]("df_jk", docstring="df_jk(cderi, dms, orbs_or_None, ms_or_None, signs_or_None, vj, vk, with_j, with_k, block_mb, fact_tol, path, prefix, seq_path, seq_prefix).")
+        m.def_function[py_df_mo]("df_mo", docstring="df_mo(cderi, cl, cr, out, seq_path, seq_prefix): out[Q] = cl^T E_Q cr for the packed DF tensor (naux, npair), out (naux, nl, nr).")
+        m.def_function[py_df_sandwich]("df_sandwich", docstring="df_sandwich(a, x, b, nvec, alpha, r, seq_path, seq_prefix): r (m*nvec, p) += alpha sum_Q reshape(a[Q] x, (m*nvec, k2)) b[Q] for a (nq, m, k1), x (k1, nvec*k2), b (nq, k2, p).")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k): J/K from 8-fold packed ERIs.")
         m.def_function[py_factorize_density]("factorize_density", docstring="factorize_density(dm, orb_out, sign_out, rel_tol, path, prefix) -> m.")
         m.def_function[scf_kernel]("scf_kernel", docstring="Native RHF/UHF SCF driver; see mojoscf.scf.kernel.")
@@ -76,6 +79,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_eval_ao]("eval_ao", docstring="eval_ao(basis, coords, deriv, out): AO values and derivatives (deriv <= 2) on the points, out (ncomp, ngrid, nao).")
         m.def_function[py_xc_rho]("xc_rho", docstring="xc_rho(basis, coords, kind, dms, orbs, occs, rho, seq_path, seq_prefix): densities (kind 0), with gradients (1), and tau (2: meta-GGA) of symmetric dms (nset, nao, nao), optionally also given as orbitals orbs (nset, nao, norb) with occupations occs (nset, norb; norb may be 0), into rho (nset, ncomp, ngrid).")
         m.def_function[py_xc_vmat]("xc_vmat", docstring="xc_vmat(basis, coords, kind, wv, vmat, seq_path, seq_prefix): sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T (+ the tau term for kind 2) into vmat (nset, nao, nao).")
+        m.def_function[py_xc_fxc]("xc_fxc", docstring="xc_fxc(basis, coords, weights, kind, fxc, dms, lfac, rfac, project, vmat, seq_path, seq_prefix): XC kernel fxc ((nspin nvar)^2, ngrid) contracted with the densities of the symmetric dms (nspin, nset, nao, nao), optionally also given as L R^T factors lfac (nspin, nset, nao, rank) and rfac (nspin, nao, rank), into vmat (nspin, nset, nao, nao), not symmetrised; with project, vmat (nspin, nset, nao, rank) = (V + V^T) R.")
         m.def_function[py_xc_grad]("xc_grad", docstring="xc_grad(basis, coords, gga, wv, vmat, seq_path, seq_prefix): XC gradient matrices (nset, 3, nao, nao) of pyscf's grad.rks.get_vxc, before its sign flip.")
         m.def_function[py_xc_grad_dm]("xc_grad_dm", docstring="xc_grad_dm(basis, coords, kind, wv, dms, orbs, occs, de, seq_path, seq_prefix): XC term of the nuclear gradient (natm, 3), the XC gradient matrices contracted with the densities (optionally also given as orbitals, norb may be 0).")
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
@@ -372,6 +376,31 @@ def py_df_jk(
     return PythonObject(None)
 
 
+def py_df_mo(
+    cderi: PythonObject, cl: PythonObject, cr: PythonObject, dst: PythonObject, seq_path: PythonObject,
+    seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    df_mo_core(
+        blas_seq, f64ptr(cderi), Int(py=cderi.shape[0]), Int(py=cl.shape[0]), f64ptr(cl), Int(py=cl.shape[1]),
+        f64ptr(cr), Int(py=cr.shape[1]), f64ptr(dst),
+    )
+    return PythonObject(None)
+
+
+def py_df_sandwich(
+    a: PythonObject, x: PythonObject, b: PythonObject, nvec: PythonObject, alpha: PythonObject, r: PythonObject,
+    seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    var nv = Int(py=nvec)
+    df_sandwich_core(
+        blas_seq, Int(py=a.shape[0]), f64ptr(a), Int(py=a.shape[1]), Int(py=a.shape[2]), f64ptr(x), nv,
+        Int(py=b.shape[1]), f64ptr(b), Int(py=b.shape[2]), Float64(py=alpha), f64ptr(r),
+    )
+    return PythonObject(None)
+
+
 def py_jk_s8(
     eri: PythonObject, dms: PythonObject, vj: PythonObject, vk: PythonObject, with_j: PythonObject, with_k: PythonObject
 ) raises -> PythonObject:
@@ -643,6 +672,22 @@ def py_xc_vmat(
     xc_vmat_core(
         _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv),
         Int(py=wv.shape[0]), f64ptr(wv), f64ptr(vmat),
+    )
+    _ = bs^
+    return PythonObject(None)
+
+
+def py_xc_fxc(
+    basis: PythonObject, coords: PythonObject, weights: PythonObject, kind: PythonObject, fxc: PythonObject,
+    dms: PythonObject, lfac: PythonObject, rfac: PythonObject, project: PythonObject, vmat: PythonObject,
+    seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var rank = Int(py=lfac.shape[3])
+    xc_fxc_core(
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(weights), Int(py=kind),
+        Int(py=dms.shape[0]), f64ptr(fxc), Int(py=dms.shape[1]), f64ptr(dms), rank,
+        f64ptr(lfac), f64ptr(rfac), Bool(py=project) and rank > 0, f64ptr(vmat),
     )
     _ = bs^
     return PythonObject(None)

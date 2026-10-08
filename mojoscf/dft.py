@@ -15,8 +15,12 @@ class) runs the same way for :class:`NumInt` objects: one density pass and
 one pass over the basis-function second derivatives (LDA and GGA; meta-GGA
 keeps pyscf's ``get_vxc``); the gradient classes of :mod:`mojoscf.grad`
 contract it with the density inside that pass (:func:`grad_xc`, meta-GGA
-included).  Laplacian meta-GGAs, non-symmetric densities, response kernels
-(``nr_rks_fxc`` ...) and the grid response of the gradient keep pyscf's code.
+included).  The second-order kernels of linear response (``cache_xc_kernel``,
+``nr_rks_fxc``, ``nr_rks_fxc_st``, ``nr_uks_fxc``: TDDFT, CPHF) take the
+densities from the same pass and contract the kernel in one fused pass
+(:func:`fxc_matrices`; for transition densities from their occupied-virtual
+factors, see :mod:`mojoscf.tdscf`).  Laplacian meta-GGAs, non-symmetric
+densities in the SCF and the grid response of the gradient keep pyscf's code.
 
 :func:`accelerate` gives a pyscf RKS/UKS object this ``NumInt``, J/K from
 mojoscf (density fitting, in-core ERIs or integral-direct), the Mojo
@@ -225,6 +229,175 @@ class NumInt(pyscf_numint.NumInt):
             return nelec[:, 0], excsum[0], vmat[:, 0]
         return nelec, excsum, vmat
 
+    # ---- second-order kernels (TDDFT, CPHF, Hessians) ----
+
+    def cache_xc_kernel(self, mol, grids, xc_code, mo_coeff, mo_occ, spin=0, max_memory=2000):
+        """pyscf's ``cache_xc_kernel`` (rho0, vxc, fxc on the grid) with the densities from the Mojo pass."""
+        mo_coeff = np.asarray(mo_coeff)
+        if not (_fxc_ok(self, mol, xc_code) and np.isrealobj(mo_coeff)):
+            return super().cache_xc_kernel(mol, grids, xc_code, mo_coeff, mo_occ, spin, max_memory)
+        kind = _kind(self, xc_code)
+        coords, _ = _grid(grids)
+        nao = mol.nao_nr()
+        if mo_coeff.ndim == 2:          # RKS
+            rho = _rho_orbitals(mol, coords, kind, [mo_coeff], [np.asarray(mo_occ)])[0]
+            if kind == 0:
+                rho = rho[0]
+            if spin == 1:               # RKS with nr_rks_fxc_st
+                rho = np.repeat((rho * 0.5)[np.newaxis], 2, axis=0)
+        else:
+            assert spin == 1
+            rho = _rho_orbitals(mol, coords, kind, list(mo_coeff), [np.asarray(o) for o in mo_occ])
+            rho = (rho[0, 0], rho[1, 0]) if kind == 0 else (rho[0], rho[1])
+        vxc, fxc = self.eval_xc_eff(xc_code, rho, deriv=2, xctype=self._xc_type(xc_code), spin=spin)[1:3]
+        return rho, vxc, fxc
+
+    def cache_xc_kernel1(self, mol, grids, xc_code, dm, spin=0, max_memory=2000):
+        """pyscf's ``cache_xc_kernel1`` (from a density matrix) with the densities from the Mojo pass."""
+        dm = np.asarray(dm)
+        if not (_fxc_ok(self, mol, xc_code) and np.isrealobj(dm)):
+            return super().cache_xc_kernel1(mol, grids, xc_code, dm, spin, max_memory)
+        kind = _kind(self, xc_code)
+        coords, _ = _grid(grids)
+        nao = mol.nao_nr()
+        if spin == 0:
+            d = 0.5 * (dm.reshape(nao, nao) + dm.reshape(nao, nao).T)
+            rho = _rho(mol, coords, kind, np.ascontiguousarray(d[None]))[0]
+            rho = rho[0] if kind == 0 else rho
+        else:
+            d = dm.reshape(-1, nao, nao)
+            if d.shape[0] == 1:     # an RKS density for the spin-resolved kernel
+                d = np.array([d[0] * 0.5, d[0] * 0.5])
+            d = 0.5 * (d + d.transpose(0, 2, 1))
+            r = _rho(mol, coords, kind, np.ascontiguousarray(d))
+            rho = (r[0, 0], r[1, 0]) if kind == 0 else (r[0], r[1])
+        vxc, fxc = self.eval_xc_eff(xc_code, rho, deriv=2, xctype=self._xc_type(xc_code), spin=spin)[1:3]
+        return rho, vxc, fxc
+
+    def nr_rks_fxc(self, mol, grids, xc_code, dm0=None, dms=None, relativity=0, hermi=0, rho0=None, vxc=None,
+                   fxc=None, max_memory=2000, verbose=None):
+        """pyscf's ``nr_rks_fxc``: the XC kernel contracted with the (response) densities ``dms``.
+
+        One fused Mojo pass (:func:`fxc_matrices`) forms the response
+        densities of all ``dms`` (their symmetric part: the only one that
+        enters) block by block, contracts them with ``fxc`` and builds the
+        matrices.
+        """
+        dms_arr = np.asarray(dms)
+        if not (_fxc_ok(self, mol, xc_code) and np.isrealobj(dms_arr) and relativity == 0):
+            return super().nr_rks_fxc(mol, grids, xc_code, dm0, dms, relativity, hermi, rho0, vxc, fxc,
+                                      max_memory, verbose)
+        kind = _kind(self, xc_code)
+        if fxc is None:
+            fxc = self.cache_xc_kernel1(mol, grids, xc_code, dm0, spin=0, max_memory=max_memory)[2]
+        nao = mol.nao_nr()
+        d = dms_arr.reshape(1, -1, nao, nao)
+        vmat = fxc_matrices(mol, grids, kind, fxc, d)[0]
+        return vmat[0] if dms_arr.ndim == 2 else vmat.reshape(dms_arr.shape)
+
+    def nr_uks_fxc(self, mol, grids, xc_code, dm0=None, dms=None, relativity=0, hermi=0, rho0=None, vxc=None,
+                   fxc=None, max_memory=2000, verbose=None):
+        """pyscf's ``nr_uks_fxc`` (spin-resolved kernel, response densities (2, [nset,] nao, nao))."""
+        dms_arr = np.asarray(dms)
+        if not (_fxc_ok(self, mol, xc_code) and np.isrealobj(dms_arr) and relativity == 0):
+            return super().nr_uks_fxc(mol, grids, xc_code, dm0, dms, relativity, hermi, rho0, vxc, fxc,
+                                      max_memory, verbose)
+        kind = _kind(self, xc_code)
+        if fxc is None:
+            fxc = self.cache_xc_kernel1(mol, grids, xc_code, dm0, spin=1, max_memory=max_memory)[2]
+        nao = mol.nao_nr()
+        d = dms_arr.reshape(2, -1, nao, nao)
+        vmat = fxc_matrices(mol, grids, kind, fxc, d)
+        return vmat.reshape(dms_arr.shape)
+
+
+def fxc_matrices(mol, grids, kind, fxc, dms=None, factors=None, project=False):
+    """Symmetrised response potentials (nspin, nset, nao, nao) of pyscf's ``nr_rks_fxc``/``nr_uks_fxc``.
+
+    ``fxc`` is the kernel on the grid in pyscf's layout ((nvar, nvar, ngrid)
+    for one spin channel, (2, nvar, 2, nvar, ngrid) for two); ``kind`` 0, 1
+    or 2 (LDA, GGA, meta-GGA).  The first-order densities are those of the
+    symmetric parts of ``dms`` (nspin, nset, nao, nao), or of ``L R^T`` for
+    ``factors`` = [(L (nset, nao, r_a), R (nao, r_a)) per spin] (transition
+    densities, whose rank is the number of occupied orbitals): the kernel
+    then forms them from the factors on the blocks where that is cheaper.
+    With ``project`` (factors required) only ``V R`` is formed, shape
+    (nspin, nset, nao, max r_a) (columns past r_a zero): all a
+    linear-response operator needs, at a fraction of the cost.  The sets are
+    processed in chunks that keep the per-thread sums within about 512 MB.
+    """
+    import os
+
+    coords, weights = _grid(grids)
+    nao = mol.nao_nr()
+    if factors is not None:
+        nspin = len(factors)
+        nset = factors[0][0].shape[0]
+        rank = max(r.shape[1] for _, r in factors)
+    else:
+        if project:
+            raise ValueError("project needs the factors")
+        dms = np.asarray(dms, dtype=np.float64)
+        nspin, nset = dms.shape[0], dms.shape[1]
+        rank = 0
+    project = bool(project) and rank > 0
+    ncol = rank if project else nao
+    nvar = (1, 4, 5)[kind]
+    fxc = np.ascontiguousarray(np.asarray(fxc, dtype=np.float64).reshape(nspin * nvar, nspin * nvar, -1))
+    nthreads = os.cpu_count() or 1
+    chunk = max(1, int(512e6 / (8.0 * nthreads * nspin * nao * max(ncol, 1))))
+    out = np.empty((nspin, nset, nao, ncol))
+    basis = integrals.basis_tables(mol)
+    path, prefix = worker_blas()
+    for s0 in range(0, nset, chunk):
+        s1 = min(s0 + chunk, nset)
+        n = s1 - s0
+        if factors is not None:
+            lfac = np.zeros((nspin, n, nao, rank))
+            rfac = np.zeros((nspin, nao, rank))
+            d = np.empty((nspin, n, nao, nao))
+            for a, (lf, rf) in enumerate(factors):
+                r = rf.shape[1]
+                lfac[a, :, :, :r] = lf[s0:s1]
+                rfac[a, :, :r] = rf
+                d[a] = lf[s0:s1] @ rf.T
+            d += d.transpose(0, 1, 3, 2)
+            d *= 0.5
+        else:
+            d = 0.5 * (dms[:, s0:s1] + dms[:, s0:s1].transpose(0, 1, 3, 2))
+            lfac = np.zeros((nspin, n, nao, 0))
+            rfac = np.zeros((nspin, nao, 0))
+        v = np.empty((nspin, n, nao, ncol))
+        get_extension().xc_fxc(basis, coords, weights, int(kind), fxc, np.ascontiguousarray(d), lfac, rfac,
+                               project, v, path, prefix)
+        out[:, s0:s1] = v if project else v + v.transpose(0, 1, 3, 2)
+    return out
+
+
+def _fxc_ok(ni, mol, xc_code) -> bool:
+    """The Mojo second-order kernels apply (LDA, GGA, meta-GGA without laplacian; engine enabled)."""
+    return _kind(ni, xc_code) is not None and integrals.engine() == "mojo" and supported(mol)
+
+
+def _rho_orbitals(mol, coords, kind, mo_coeffs, mo_occs):
+    """(nspin, ncomp, ngrid) densities of the occupied orbitals of each spin channel (pyscf's eval_rho2)."""
+    nao = mol.nao_nr()
+    dms, orbs, occs = [], [], []
+    for c, n in zip(mo_coeffs, mo_occs):
+        c = np.asarray(c, dtype=np.float64)
+        n = np.asarray(n, dtype=np.float64)
+        keep = np.flatnonzero(n)
+        dms.append((c[:, keep] * n[keep]) @ c[:, keep].T)
+        orbs.append(c[:, keep])
+        occs.append(n[keep])
+    norb = max(o.shape[1] for o in orbs)
+    po = np.zeros((len(orbs), nao, norb))
+    pn = np.zeros((len(orbs), norb))
+    for i, (o, n) in enumerate(zip(orbs, occs)):
+        po[i, :, : o.shape[1]] = o
+        pn[i, : n.size] = n
+    return _rho(mol, coords, kind, np.ascontiguousarray(np.array(dms)), (po, pn))
+
 
 def _grad_weights(ni, xc_code, rho, weights, spin):
     """Weighted XC potential on the grid in pyscf's gradient convention (GGA: w_0 halved).
@@ -350,20 +523,19 @@ def _install_grad_vxc():
 _install_grad_vxc()
 
 
-def _incore_cderi(mf, mol, dm, hermi, omega):
-    """pyscf's in-core DF tensor of ``mf`` for :func:`mojoscf.kernels.df_jk`, or None to use pyscf's get_jk.
+def _df_tensor(mf, omega=0.0):
+    """pyscf's in-core DF tensor ``(naux, nao*(nao+1)//2)`` of the density-fitted object ``mf``, or None.
 
     A missing tensor is built with the Mojo integrals when pyscf would keep
     it in core (``integrals.build_df``).  ``omega`` > 0 (the long-range
-    exchange of range-separated functionals) uses the tensor of pyscf's
+    exchange of range-separated functionals) gives the tensor of pyscf's
     ``with_df.range_coulomb(omega)``, built with the attenuated integrals.
+    None for other DF classes, out-of-core tensors and ``only_dfj`` objects.
     """
     from pyscf.df import df as pyscf_df
     from pyscf.df import df_jk
 
-    if not isinstance(mf, df_jk._DFHF) or (mol is not None and mol is not mf.mol):
-        return None
-    if (omega is not None and omega < 0) or hermi != 1 or not np.isrealobj(dm) or getattr(mf, "only_dfj", False):
+    if not isinstance(mf, df_jk._DFHF) or getattr(mf, "only_dfj", False):
         return None
     with_df = mf.with_df
     if type(with_df) is not pyscf_df.DF:
@@ -379,6 +551,15 @@ def _incore_cderi(mf, mol, dm, hermi, omega):
     if isinstance(cderi, np.ndarray) and cderi.ndim == 2 and cderi.dtype == np.float64 and cderi.shape[1] == nao * (nao + 1) // 2:
         return cderi
     return None
+
+
+def _incore_cderi(mf, mol, dm, hermi, omega):
+    """The DF tensor (:func:`_df_tensor`) for :func:`mojoscf.kernels.df_jk`, or None to use pyscf's get_jk."""
+    if mol is not None and mol is not mf.mol:
+        return None
+    if (omega is not None and omega < 0) or hermi != 1 or not np.isrealobj(dm):
+        return None
+    return _df_tensor(mf, omega or 0.0)
 
 
 def _exact_jk(mf, mol, dm, hermi, with_j, with_k, omega):
@@ -478,6 +659,25 @@ class _MojoKSHook:
         return _mojo_grad_method(self, _MojoKSHook)
 
     Gradients = nuc_grad_method
+
+    def TDA(self, frozen=None):
+        """pyscf's TDA with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
+        from . import tdscf
+
+        return tdscf.TDA(self, frozen)
+
+    def TDDFT(self, frozen=None):
+        """pyscf's ``TDDFT`` (full TDDFT for hybrids, the Casida form otherwise) with :mod:`mojoscf.tdscf`."""
+        from . import tdscf
+
+        return tdscf.TDDFT(self, frozen)
+
+    def CasidaTDDFT(self, frozen=None):
+        from . import tdscf
+
+        return tdscf.CasidaTDDFT(self, frozen)
+
+    TDDFTNoHybrid = CasidaTDDFT
 
     def _eigh(self, h, s, overwrite=False, x=None):
         from . import kernels

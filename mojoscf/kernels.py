@@ -27,6 +27,8 @@ __all__ = [
     "df_jk",
     "jk_s8",
     "factorize_density",
+    "df_mo",
+    "df_sandwich",
 ]
 
 
@@ -281,6 +283,49 @@ def df_jk(cderi, dm, mo_coeff=None, mo_occ=None, with_j=True, with_k=True, block
     vj = vj.reshape(dm_in.shape) if with_j else None
     vk = vk.reshape(dm_in.shape) if with_k else None
     return vj, vk
+
+
+def df_mo(cderi, cl, cr):
+    """The DF tensor in an orbital basis: ``out[Q] = cl^T E_Q cr``, shape ``(naux, nl, nr)``.
+
+    ``cderi`` is pyscf's in-core ``(naux, nao*(nao+1)//2)`` tensor (packed
+    symmetric ``E_Q``), ``cl`` and ``cr`` are ``(nao, nl)`` and ``(nao, nr)``
+    coefficient matrices (``(ia|Q)`` with the occupied and virtual orbitals).
+    """
+    cderi = _c(cderi)
+    cl = _c(cl)
+    cr = _c(cr)
+    nao = cl.shape[0]
+    if cderi.ndim != 2 or cderi.shape[1] != nao * (nao + 1) // 2 or cr.shape[0] != nao:
+        raise ValueError("cderi must have shape (naux, nao*(nao+1)//2) and cl, cr nao rows")
+    out = np.empty((cderi.shape[0], cl.shape[1], cr.shape[1]))
+    seq_path, seq_prefix = worker_blas()
+    get_extension().df_mo(cderi, cl, cr, out, seq_path, seq_prefix)
+    return out
+
+
+def df_sandwich(a, x, b, nvec, alpha=1.0, out=None):
+    """``out (m*nvec, p) += alpha * sum_Q reshape(a[Q] @ x, (m*nvec, k2)) @ b[Q]``.
+
+    ``a`` is ``(nq, m, k1)``, ``x`` is ``(k1, nvec*k2)`` and ``b`` is
+    ``(nq, k2, p)``: the exchange contractions of the linear-response
+    operators (:mod:`mojoscf.tdscf`).  A new zero ``out`` is used when none is
+    given; returns ``out``.
+    """
+    a = _c(a)
+    x = _c(x)
+    b = _c(b)
+    nq, m, k1 = a.shape
+    k2, p = b.shape[1], b.shape[2]
+    if b.shape[0] != nq or x.shape != (k1, nvec * k2):
+        raise ValueError(f"inconsistent shapes a {a.shape}, x {x.shape}, b {b.shape}, nvec {nvec}")
+    if out is None:
+        out = np.zeros((m * nvec, p))
+    elif out.shape != (m * nvec, p) or out.dtype != np.float64 or not out.flags.c_contiguous:
+        raise ValueError(f"out must be a C-contiguous float64 array of shape {(m * nvec, p)}")
+    seq_path, seq_prefix = worker_blas()
+    get_extension().df_sandwich(a, x, b, int(nvec), float(alpha), out, seq_path, seq_prefix)
+    return out
 
 
 def jk_s8(eri, dm, with_j=True, with_k=True):
