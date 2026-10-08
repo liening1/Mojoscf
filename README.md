@@ -50,6 +50,11 @@ iteration then runs without touching Python or pyscf's C code at all.
   range-separated hybrids such as ωB97X), eigensolver and nuclear gradients
   while pyscf's loop drives the SCF: 3.3 to 5.6x faster SCF and 5 to 13x
   faster gradients than pyscf, with energies agreeing to 1e-10 Eh or better.
+* **Excited states** (`mojoscf.tdscf`): `mf.TDA()`/`mf.TDDFT()` of
+  accelerated objects build the linear response of density-fitted
+  references in the occupied-virtual space (Coulomb and exchange through the
+  MO-basis DF tensor, the XC kernel in one fused pass): 5x faster than pyscf for
+  benzene/def2-SVP B3LYP TDDFT, with the same excitation energies.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -366,6 +371,57 @@ terms dominate these runs (ferrocene: 98 s of the SCF in `int3c2e`, 18 s in
 `einsum`, 5 s for the derivative arrays of the gradient); with the kernels
 the potential at the points and the charge matrix cost 0.14 s and 0.25 s
 per cycle for ferrocene's 2404 points.
+
+### Excited states (TDDFT, TDA)
+
+pyscf's linear-response solvers (`pyscf.tdscf`) need, in every Davidson
+iteration, the product of the response matrices with a batch of trial
+vectors.  pyscf forms it in the AO basis: every vector becomes a transition
+density `C_v z^T C_o^T`, which goes through `get_jk` and the XC kernel, and
+the result is projected back.  With density fitting the transition densities
+are not symmetric, so `get_jk` cannot use its occupied-orbital shortcut and
+contracts the whole AO tensor for each of them; in ferrocene/def2-SVP PBE0
+TDA that took 330 of 680 s, and the XC kernel (`nr_rks_fxc`, a Python loop
+over blocks per density) most of the rest.  `mojoscf.tdscf`, whose classes
+`mf.TDA()`, `mf.TDDFT()` and `mf.CasidaTDDFT()` of accelerated objects create
+(or explicitly, for any density-fitted RHF/UHF/RKS/UKS object), keeps pyscf's
+solvers, initial guesses and analysis and replaces the operator:
+
+* **Coulomb and exact exchange in the occupied-virtual space.**  The DF
+  tensor is transformed once to `(ov|Q)`, `(oo|Q)` and `(vv|Q)`
+  (`kernels.df_mo`); then `J = sum_Q (ia|Q) rho_Q`, the A-type exchange
+  `sum_Q (oo|Q) x (vv|Q)` and the B-type `sum_Q (ov|Q) y^T (ov|Q)` of all
+  trial vectors come from one pass over Q with two GEMMs per auxiliary
+  function in worker threads (`kernels.df_sandwich`); range-separated
+  hybrids add the same with the long-range tensor.
+* **XC kernel in one fused pass.**  `xc_fxc_core` evaluates a block's basis
+  functions once, forms the response densities from the factors `C_v z^T`
+  and `C_o` (three GEMMs of nocc x nrow instead of one of nrow x nrow),
+  contracts them with the kernel on the spot and returns `V C_o` rather
+  than V: `phi U^T + Z B^T` with `B = C_o^T phi` shared by all vectors, so
+  the nrow x nrow GEMM and the nao x nao matrices disappear.  For
+  ferrocene/def2-SVP a trial vector costs 0.30 s, against 0.44 s with
+  separate density and potential passes.  `cache_xc_kernel`, `nr_rks_fxc`,
+  `nr_rks_fxc_st` and `nr_uks_fxc` of `mojoscf.dft.NumInt` run on the same
+  pass (CPHF, polarisabilities, ...).
+
+`benchmarks/bench_tddft.py`: pyscf versus `mojoscf.dft.accelerate`, each in
+its own process, density fitting, pyscf's default grids, conv_tol 1e-9 for
+the SCF and pyscf's default 1e-5 for the excited states.  These runs used a
+different machine from the tables above (4 cores of a 2.8 GHz Xeon that is
+slower on this workload; compare the SCF columns with the Kohn-Sham table):
+
+| system                                  | nao | states | TD pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dE\| [eV] |
+|-----------------------------------------|----:|---:|------:|-----:|-----:|-----:|-----:|--------:|
+| benzene / def2-SVP B3LYP, TDDFT         | 114 | 10 |  85.8 | 17.0 | 5.0x |  7.9 |  2.8 | 1.7e-11 |
+
+The operator products agree with pyscf's to about 1e-14 (relative) for
+RHF/UHF/RKS/UKS, TDA, full TDDFT and the Casida form, singlets and triplets,
+global and range-separated hybrids and meta-GGAs, with and without frozen
+orbitals (`tests/test_tdscf.py`), and the excitation energies to 1e-12
+Hartree.  Exact (non-DF) integrals, `wfnsym` restrictions, solvent models,
+short-range-only hybrids and tensors that do not fit in `max_memory` run
+pyscf's operator (Kohn-Sham objects still with the Mojo XC kernels).
 
 ### QM/MM
 
