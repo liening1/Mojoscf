@@ -526,8 +526,9 @@ def mm_grad_terms(mol, dm, coords, weights, zetas=None):
 def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14):
     """Gradient J/K exactly as ``pyscf.grad.rhf.get_jk``: ``(-sum (nabla i j|kl) D_lk, -sum (nabla i j|kl) D_jk)``.
 
-    ``dm`` is (nao, nao) or (n, nao, nao) and must be symmetric; the results
-    have shape (3, nao, nao) or (n, 3, nao, nao).
+    ``dm`` is (nao, nao) or (n, nao, nao); the results have shape (3, nao, nao)
+    or (n, 3, nao, nao).  K is right for any density, J only for symmetric
+    ones (``grad._jk_ip1`` handles the others).
     """
     dm = np.asarray(dm, dtype=np.float64)
     single = dm.ndim == 2

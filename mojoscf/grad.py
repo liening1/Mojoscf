@@ -222,17 +222,49 @@ class _MojoGrad1eMixin:
         return de
 
 
+def _jk_ip1(mol, dm, with_j=True, with_k=True):
+    """pyscf's ``grad.rhf.get_jk`` (derivative J/K matrices) from the Mojo engine for any real densities.
+
+    The kernel's exchange matrix is right for any density; its Coulomb
+    matrix assumes a symmetric one, and J depends only on the symmetric part:
+    antisymmetric densities (TDHF/TDDFT gradients pass one) have J = 0, and
+    densities that are neither go in a second time, symmetrised, for J, so
+    that one pass over the integrals serves all.
+    """
+    dm = np.asarray(dm, dtype=np.float64)
+    single = dm.ndim == 2
+    dms = dm.reshape(-1, dm.shape[-2], dm.shape[-1])
+    n = dms.shape[0]
+    tr = dms.transpose(0, 2, 1)
+    sym = [bool(np.allclose(d, t, rtol=0.0, atol=1e-12)) for d, t in zip(dms, tr)]
+    anti = [bool(np.allclose(d, -t, rtol=0.0, atol=1e-12)) for d, t in zip(dms, tr)]
+    general = [i for i in range(n) if not (sym[i] or anti[i])] if with_j else []
+    stack = dms if not general else np.concatenate([dms, 0.5 * (dms[general] + tr[general])])
+    vj, vk = integrals.get_jk_ip1(mol, np.ascontiguousarray(stack), with_j, with_k, tol=grad_tol)
+    if with_j:
+        for k, i in enumerate(general):
+            vj[i] = vj[n + k]
+        vj = vj[:n]
+        for i in range(n):
+            if anti[i] and not sym[i]:
+                vj[i] = 0.0
+    if with_k:
+        vk = vk[:n]
+    if single:
+        vj = vj[0] if vj is not None else None
+        vk = vk[0] if vk is not None else None
+    return vj, vk
+
+
 class _MojoGradMixin(_MojoGrad1eMixin):
     """Exact two-electron integrals: ``grad2e`` and the derivative J/K matrices from the Mojo engine."""
 
     def _mojo_jk_ok(self, mol, dm, omega):
-        """The Mojo derivative J/K needs real symmetric densities (pyscf also passes others, e.g. in TDHF)."""
+        """The Mojo derivative J/K takes real densities (non-symmetric ones too, through :func:`_jk_ip1`)."""
         if not self._mojo_2e_ok(mol, omega):
             return False
         dm = np.asarray(dm)
-        if dm.ndim < 2 or not np.isrealobj(dm):
-            return False
-        return np.allclose(dm, dm.swapaxes(-1, -2), rtol=0.0, atol=1e-12)
+        return dm.ndim >= 2 and np.isrealobj(dm)
 
     def get_jk(self, mol=None, dm=None, hermi=0, omega=None):
         mol = self.mol if mol is None else mol
@@ -241,7 +273,7 @@ class _MojoGradMixin(_MojoGrad1eMixin):
         if not self._mojo_jk_ok(mol, dm, omega):
             return super().get_jk(mol, dm, hermi, omega)
         cpu0 = (logger.process_clock(), logger.perf_counter())
-        vj, vk = integrals.get_jk_ip1(mol, np.asarray(dm), tol=grad_tol)
+        vj, vk = _jk_ip1(mol, np.asarray(dm))
         logger.timer(self, "vj and vk (Mojo)", *cpu0)
         return vj, vk
 
@@ -251,7 +283,7 @@ class _MojoGradMixin(_MojoGrad1eMixin):
             dm = self.base.make_rdm1()
         if not self._mojo_jk_ok(mol, dm, omega):
             return super().get_j(mol, dm, hermi, omega)
-        return integrals.get_jk_ip1(mol, np.asarray(dm), with_k=False, tol=grad_tol)[0]
+        return _jk_ip1(mol, np.asarray(dm), with_k=False)[0]
 
     def get_k(self, mol=None, dm=None, hermi=0, omega=None):
         mol = self.mol if mol is None else mol
@@ -259,7 +291,7 @@ class _MojoGradMixin(_MojoGrad1eMixin):
             dm = self.base.make_rdm1()
         if not self._mojo_jk_ok(mol, dm, omega):
             return super().get_k(mol, dm, hermi, omega)
-        return integrals.get_jk_ip1(mol, np.asarray(dm), with_j=False, tol=grad_tol)[1]
+        return _jk_ip1(mol, np.asarray(dm), with_j=False)[1]
 
     def _direct_2e(self):
         """True if the two-electron term can bypass ``get_veff`` (it is not overridden)."""

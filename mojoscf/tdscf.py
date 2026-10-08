@@ -47,7 +47,8 @@ _CLASSES: dict = {}
 
 
 class _MojoTD:
-    """In front of a pyscf TD class: ``gen_vind`` builds the response in the occupied-virtual space."""
+    """In front of a pyscf TD class: ``gen_vind`` builds the response in the occupied-virtual space, and the
+    nuclear gradients (``Gradients``/``nuc_grad_method``) carry the Mojo kernels (:mod:`mojoscf.tdgrad`)."""
 
     def gen_vind(self, mf=None):
         assert mf is None or mf is self._scf
@@ -55,6 +56,11 @@ class _MojoTD:
         if op is None:
             return super().gen_vind(mf)
         return op
+
+    def Gradients(self):
+        from . import tdgrad
+
+        return tdgrad.accelerate(super().Gradients())
 
 
 def _td_class(mf, name):
