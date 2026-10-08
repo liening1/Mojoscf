@@ -32,7 +32,7 @@ from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
 from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core
 from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
 from _mojo.pcm import pcm_ds_core, pcm_pair_core
-from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core, xc_hess_core
+from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core, xc_hess_core, xc_h1_core
 
 comptime VERSION = "0.12.0"
 
@@ -82,6 +82,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_xc_vmat]("xc_vmat", docstring="xc_vmat(basis, coords, kind, wv, vmat, seq_path, seq_prefix): sum_p phi(p) (sum_c wv_c(p) phi_c(p))^T (+ the tau term for kind 2) into vmat (nset, nao, nao).")
         m.def_function[py_xc_fxc]("xc_fxc", docstring="xc_fxc(basis, coords, weights, kind, fxc, dms, lfac, rfac, project, vmat, seq_path, seq_prefix): XC kernel fxc ((nspin nvar)^2, ngrid) contracted with the densities of the symmetric dms (nspin, nset, nao, nao), optionally also given as L R^T factors lfac (nspin, nset, nao, rank) and rfac (nspin, nao, rank), into vmat (nspin, nset, nao, nao), not symmetrised; with project, vmat (nspin, nset, nao, rank) = (V + V^T) R.")
         m.def_function[py_xc_hess]("xc_hess", docstring="xc_hess(basis, coords, weights, kind, dms, vxc, fxc, aoatm, de2, seq_path, seq_prefix): XC part of the nuclear Hessian at fixed density (pyscf's _get_vxc_diag + _get_vxc_deriv2 contracted), LDA/GGA, dms (nspin, nao, nao), de2 (natm, natm, 3, 3).")
+        m.def_function[py_xc_h1]("xc_h1", docstring="xc_h1(basis, coords, weights, kind, dms, fxc, aoatm, cmo, nocc, h1, seq_path, seq_prefix): kernel part C^T (F + F^T) C_o of the XC first-derivative Fock matrices of the Hessian, h1 (nspin, natm, 3, nmo, nocc).")
         m.def_function[py_xc_grad]("xc_grad", docstring="xc_grad(basis, coords, gga, wv, vmat, seq_path, seq_prefix): XC gradient matrices (nset, 3, nao, nao) of pyscf's grad.rks.get_vxc, before its sign flip.")
         m.def_function[py_xc_grad_dm]("xc_grad_dm", docstring="xc_grad_dm(basis, coords, kind, wv, dms, orbs, occs, de, seq_path, seq_prefix): XC term of the nuclear gradient (natm, 3), the XC gradient matrices contracted with the densities (optionally also given as orbitals, norb may be 0).")
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
@@ -717,6 +718,22 @@ def py_xc_hess(
     xc_hess_core(
         _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(weights), Int(py=kind),
         Int(py=dms.shape[0]), f64ptr(dms), f64ptr(vxc), f64ptr(fxc), pat, Int(py=de2.shape[0]), f64ptr(de2),
+    )
+    _ = bs^
+    return PythonObject(None)
+
+
+def py_xc_h1(
+    basis: PythonObject, coords: PythonObject, weights: PythonObject, kind: PythonObject, dms: PythonObject,
+    fxc: PythonObject, aoatm: PythonObject, cmo: PythonObject, nocc: PythonObject, h1: PythonObject,
+    seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var pat = Pointer[Int64, MutAnyOrigin](unsafe_from_address=Int(py=aoatm.__array_interface__["data"][0]))
+    xc_h1_core(
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(weights), Int(py=kind),
+        Int(py=dms.shape[0]), f64ptr(dms), f64ptr(fxc), pat, Int(py=h1.shape[1]), f64ptr(cmo), Int(py=cmo.shape[2]),
+        Int(py=nocc), f64ptr(h1),
     )
     _ = bs^
     return PythonObject(None)

@@ -63,6 +63,78 @@ def xc_partial_hess(ni, mol, grids, xc_code, mo_coeff, mo_occ):
     return de2
 
 
+def _xc_inputs(ni, mol, grids, xc_code, mo_coeff, mo_occ, kind):
+    """(coords, weights, dms (nspin, nao, nao), vxc (nspin nvar, ngrid), fxc ((nspin nvar)^2, ngrid))."""
+    from . import dft
+
+    mo_coeff = np.asarray(mo_coeff)
+    coords, weights = dft._grid(grids)
+    if mo_coeff.ndim == 2:
+        occ = np.asarray(mo_occ)
+        rho = dft._rho_orbitals(mol, coords, kind, [mo_coeff], [occ])[0]
+        vxc, fxc = ni.eval_xc_eff(xc_code, rho[0] if kind == 0 else rho, deriv=2, xctype=ni._xc_type(xc_code))[1:3]
+        c = mo_coeff[:, occ > 0]
+        dms = ((c * occ[occ > 0]) @ c.T)[None]
+    else:
+        occs = [np.asarray(o) for o in mo_occ]
+        rho = dft._rho_orbitals(mol, coords, kind, list(mo_coeff), occs)
+        r = (rho[0, 0], rho[1, 0]) if kind == 0 else (rho[0], rho[1])
+        vxc, fxc = ni.eval_xc_eff(xc_code, r, deriv=2, xctype=ni._xc_type(xc_code), spin=1)[1:3]
+        dms = np.array([(c[:, o > 0] * o[o > 0]) @ c[:, o > 0].T for c, o in zip(mo_coeff, occs)])
+    nspin = dms.shape[0]
+    nvar = (1, 4)[kind]
+    ngrid = coords.shape[0]
+    vxc = np.ascontiguousarray(np.asarray(vxc, dtype=np.float64).reshape(nspin * nvar, ngrid))
+    fxc = np.ascontiguousarray(np.asarray(fxc, dtype=np.float64).reshape(nspin * nvar, nspin * nvar, ngrid))
+    return coords, np.ascontiguousarray(weights, dtype=np.float64), np.ascontiguousarray(dms, dtype=np.float64), vxc, fxc
+
+
+def xc_h1mo(ni, mol, grids, xc_code, mo_coeff, mo_occ):
+    """The XC first-derivative Fock matrices of pyscf's ``_get_vxc_deriv1`` projected to the MO basis.
+
+    Returns ``C_s^T h1[s][A][x] C_o,s`` as one (natm, 3, nmo, nocc_s) array per
+    spin (MOs in their original order, occupied ones as in ``mo_occ > 0``), or
+    None for functionals the kernels do not cover.  The gradient-matrix part
+    comes from the XC gradient kernel (``dft._xc_grad``), the kernel part from
+    ``xc_h1_core`` without forming the nao x nao matrices.
+    """
+    from . import dft
+
+    kind = dft._kind(ni, xc_code)
+    if kind not in (0, 1) or not dft._fxc_ok(ni, mol, xc_code):
+        return None
+    coords, weights, dms, vxc, fxc = _xc_inputs(ni, mol, grids, xc_code, mo_coeff, mo_occ, kind)
+    nspin = dms.shape[0]
+    nvar = (1, 4)[kind]
+    wv = (vxc * weights).reshape(nspin, nvar, -1)
+    if kind == 1:
+        wv[:, 0] *= 0.5
+    vgrad = dft._xc_grad(mol, coords, kind == 1, np.ascontiguousarray(wv))        # (nspin, 3, nao, nao)
+    cs = [np.asarray(mo_coeff)] if nspin == 1 else [np.asarray(c) for c in mo_coeff]
+    occs = [np.asarray(mo_occ)] if nspin == 1 else [np.asarray(o) for o in mo_occ]
+    perms = [np.concatenate((np.flatnonzero(o > 0), np.flatnonzero(o == 0))) for o in occs]
+    noccs = [int((o > 0).sum()) for o in occs]
+    nao, nmo = cs[0].shape
+    nocc = max(max(noccs), 1)
+    cmo = np.ascontiguousarray(np.array([c[:, p] for c, p in zip(cs, perms)]))
+    h1 = np.empty((nspin, mol.natm, 3, nmo, nocc))
+    path, prefix = worker_blas()
+    get_extension().xc_h1(integrals.basis_tables(mol), coords, weights, int(kind), dms, fxc, _ao_atoms(mol), cmo, nocc,
+                          h1, path, prefix)
+    out = []
+    for s in range(nspin):
+        c = cmo[s]
+        co = c[:, : noccs[s]]
+        h = -h1[s][..., : noccs[s]]
+        for ia, (_, _, p0, p1) in enumerate(mol.aoslice_by_atom()):
+            t = vgrad[s][:, p0:p1]                                  # rows of atom A: (3, nA, nao)
+            h[ia] -= c[p0:p1].T @ (t @ co) + (t @ c).transpose(0, 2, 1) @ co[p0:p1]
+        back = np.empty_like(h)
+        back[:, :, perms[s]] = h
+        out.append(back)
+    return out
+
+
 class _CPHFChannel:
     """One spin channel of the coupled-perturbed operator: orbitals (occupied first) and MO-basis DF tensors."""
 
@@ -258,6 +330,35 @@ class _ZeroXC:
         return False
 
 
+class _ZeroXC1:
+    """Within the block, pyscf's ``_get_vxc_deriv1`` (RKS or UKS) returns zeros, so that pyscf's
+    ``make_h1`` forms everything but the XC term."""
+
+    def __init__(self, mol, unrestricted):
+        from pyscf.hessian import rks as rks_hess
+        from pyscf.hessian import uks as uks_hess
+
+        self.module = uks_hess if unrestricted else rks_hess
+        self.mol = mol
+        self.unrestricted = unrestricted
+
+    def __enter__(self):
+        nao, natm = self.mol.nao_nr(), self.mol.natm
+        two = self.unrestricted
+
+        def deriv1(*args, **kwargs):
+            z = np.zeros((natm, 3, nao, nao))
+            return (z, np.zeros_like(z)) if two else z
+
+        self.saved = self.module._get_vxc_deriv1
+        self.module._get_vxc_deriv1 = deriv1
+        return self
+
+    def __exit__(self, *exc):
+        self.module._get_vxc_deriv1 = self.saved
+        return False
+
+
 class _MojoHessMixin:
     """In front of pyscf's RKS/UKS Hessian classes (DF or not): the XC terms from the Mojo kernels."""
 
@@ -281,6 +382,117 @@ class _MojoHessMixin:
             de2 = super().partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, verbose)
         atm = list(range(mol.natm)) if atmlst is None else list(atmlst)
         return de2 + xc[np.ix_(atm, atm)]
+
+    def hess_elec(self, mo_energy=None, mo_coeff=None, mo_occ=None, mo1=None, mo_e1=None, h1ao=None,
+                  atmlst=None, max_memory=4000, verbose=None):
+        """pyscf's ``hess_elec`` with the first-order Fock matrices and the coupled-perturbed equations in the
+        MO basis: the XC part of the Fock derivatives from ``xc_h1mo``, the rest from pyscf's ``make_h1``
+        (projected), and the response from :func:`cphf_operator`."""
+        from pyscf.lib import logger
+
+        mf = self.base
+        mol = self.mol
+        if mo_energy is None:
+            mo_energy = mf.mo_energy
+        if mo_occ is None:
+            mo_occ = mf.mo_occ
+        if mo_coeff is None:
+            mo_coeff = mf.mo_coeff
+        xch1 = None
+        if mo1 is None and mo_e1 is None and h1ao is None and not getattr(self, "grid_response", False):
+            grids = self.grids if getattr(self, "grids", None) is not None else mf.grids
+            xch1 = xc_h1mo(mf._numint, mol, grids, mf.xc, mo_coeff, mo_occ)
+        if xch1 is None:
+            return super().hess_elec(mo_energy, mo_coeff, mo_occ, mo1, mo_e1, h1ao, atmlst, max_memory, verbose)
+        log = logger.new_logger(self, verbose)
+        t0 = (logger.process_clock(), logger.perf_counter())
+        atmlst = list(range(mol.natm)) if atmlst is None else list(atmlst)
+        unrestricted = np.asarray(mo_coeff).ndim == 3
+        de2 = self.partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, log)
+        with _ZeroXC1(mol, unrestricted):
+            h1ao = self.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+        t1 = log.timer_debug1("making H1", *t0)
+        cs = [np.asarray(c) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff)]
+        occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
+        es = [np.asarray(e) for e in mo_energy] if unrestricted else [np.asarray(mo_energy)]
+        h1s = list(h1ao) if unrestricted else [h1ao]
+        nao = cs[0].shape[0]
+        s1a = -mol.intor("int1e_ipovlp", comp=3)
+        aoslices = mol.aoslice_by_atom()
+        hmo, smo = [], []
+        for c, o, h1 in zip(cs, occs, h1s):
+            co = c[:, o > 0]
+            hm = np.zeros((mol.natm, 3, c.shape[1], co.shape[1]))
+            sm = np.zeros_like(hm)
+            for ia in atmlst:
+                p0, p1 = aoslices[ia][2:]
+                hm[ia] = c.T @ np.asarray(h1[ia]) @ co
+                s1ao = np.zeros((3, nao, nao))
+                s1ao[:, p0:p1] += s1a[:, p0:p1]
+                s1ao[:, :, p0:p1] += s1a[:, p0:p1].transpose(0, 2, 1)
+                sm[ia] = c.T @ s1ao @ co
+            hmo.append(hm)
+            smo.append(sm)
+        for hm, xh in zip(hmo, xch1):
+            hm[atmlst] += xh[atmlst]
+        mo1s, e1s = self._solve_mo1_mo(mo_energy, mo_coeff, mo_occ, hmo, smo, atmlst, max_memory, log)
+        t1 = log.timer_debug1("solving MO1", *t1)
+        fac = (4.0, 2.0) if not unrestricted else (2.0, 1.0)
+        for s in range(len(cs)):
+            eo = es[s][occs[s] > 0]
+            occ_rows = np.flatnonzero(occs[s] > 0)
+            hm, sm, m1, e1 = hmo[s], smo[s], mo1s[s], e1s[s]
+            for i0, ia in enumerate(atmlst):
+                s1oo = sm[ia][:, occ_rows]
+                for j0, ja in enumerate(atmlst[: i0 + 1]):
+                    de2[i0, j0] += fac[0] * np.einsum("xpi,ypi->xy", hm[ia], m1[ja])
+                    de2[i0, j0] -= fac[0] * np.einsum("xpi,ypi,i->xy", sm[ia], m1[ja], eo)
+                    de2[i0, j0] -= fac[1] * np.einsum("xij,yij->xy", s1oo, e1[ja])
+        for i0 in range(len(atmlst)):
+            for j0 in range(i0):
+                de2[j0, i0] = de2[i0, j0].T
+        log.timer("Mojo hessian", *t0)
+        return de2
+
+    def _solve_mo1_mo(self, mo_energy, mo_coeff, mo_occ, hmo, smo, atmlst, max_memory, log):
+        """pyscf's ``solve_mo1`` with the first-order matrices already in the MO basis; MO-basis results."""
+        from pyscf import lib
+        from pyscf.hessian import rhf as rhf_hess
+        from pyscf.hessian import uhf as uhf_hess
+        from pyscf.scf import cphf, ucphf
+
+        mf = self.base
+        mol = self.mol
+        unrestricted = len(hmo) == 2
+        fx = cphf_operator(mf, mo_coeff, mo_occ)
+        if fx is None:
+            fx = (uhf_hess if unrestricted else rhf_hess).gen_vind(mf, mo_coeff, mo_occ)
+        nao = mol.nao_nr()
+        nmo, nocc = hmo[0].shape[2], sum(h.shape[3] for h in hmo)
+        mem_now = lib.current_memory()[0]
+        max_memory = max(2000, max_memory * 0.9 - mem_now)
+        blksize = max(2, int(max_memory * 1e6 / 8 / (nmo * nocc * 3 * 6)))
+        mo1s = [[None] * mol.natm for _ in hmo]
+        e1s = [[None] * mol.natm for _ in hmo]
+        for a0, a1 in lib.prange(0, len(atmlst), blksize):
+            atoms = atmlst[a0:a1]
+            h1vo = [np.vstack([h[ia] for ia in atoms]) for h in hmo]
+            s1vo = [np.vstack([sm[ia] for ia in atoms]) for sm in smo]
+            tol = mf.conv_tol_cpscf * (a1 - a0)
+            if unrestricted:
+                mo1, e1 = ucphf.solve(fx, mo_energy, mo_occ, tuple(h1vo), tuple(s1vo), max_cycle=self.max_cycle,
+                                      level_shift=self.level_shift, tol=tol)
+            else:
+                mo1, e1 = cphf.solve(fx, mo_energy, mo_occ, h1vo[0], s1vo[0], max_cycle=self.max_cycle,
+                                     level_shift=self.level_shift, tol=tol)
+                mo1, e1 = (mo1,), (e1,)
+            for s in range(len(hmo)):
+                m = np.asarray(mo1[s]).reshape(len(atoms), 3, nmo, -1)
+                e = np.asarray(e1[s]).reshape(len(atoms), 3, m.shape[3], m.shape[3])
+                for k, ia in enumerate(atoms):
+                    mo1s[s][ia] = m[k]
+                    e1s[s][ia] = e[k]
+        return mo1s, e1s
 
     def solve_mo1(self, mo_energy, mo_coeff, mo_occ, h1ao_or_chkfile, fx=None, atmlst=None, max_memory=4000,
                   verbose=None):

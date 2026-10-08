@@ -105,3 +105,21 @@ def test_cphf_operator_falls_back_without_df():
     mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
     mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="pbe")).run()
     assert mhess.cphf_operator(mf) is None
+
+
+@pytest.mark.parametrize("xc, spin", [("lda,vwn", 0), ("pbe", 0), ("b3lyp", 1)])
+def test_xc_h1mo_matches_pyscf(xc, spin):
+    """The projected XC first-derivative Fock matrices against pyscf's _get_vxc_deriv1."""
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc).run()
+    h = mf.Hessian()
+    if spin:
+        ref = uks_hess._get_vxc_deriv1(h, mf.mo_coeff, mf.mo_occ, 4000)
+        cs, os = mf.mo_coeff, mf.mo_occ
+    else:
+        ref = [rks_hess._get_vxc_deriv1(h, mf.mo_coeff, mf.mo_occ, 4000)]
+        cs, os = [mf.mo_coeff], [mf.mo_occ]
+    out = mhess.xc_h1mo(mdft.NumInt(), mol, mf.grids, xc, mf.mo_coeff, mf.mo_occ)
+    for r, o, c, occ in zip(ref, out, cs, os):
+        proj = np.einsum("pm,axpq,qi->axmi", c, r, c[:, occ > 0])
+        assert abs(o - proj).max() < 1e-10

@@ -25,7 +25,7 @@ from std.math import sqrt, floor, exp
 from std.memory import Pointer, bitcast
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
-from _mojo.linalg import F64Ptr, Blas, list_ptr, vfill
+from _mojo.linalg import F64Ptr, Blas, list_ptr, vfill, vcopy, vaxpy
 from _mojo.integrals import Basis, ncart, W, aligned_addr
 
 comptime BLK = 128              # grid points per block
@@ -1849,3 +1849,202 @@ def xc_hess_core(
     _ = rcut^
     _ = d2t^
     _ = d3t^
+
+
+def xc_h1_core(
+    blas: Blas,
+    basis: Basis,
+    ngrid: Int,
+    coords: F64Ptr,
+    weights: F64Ptr,
+    kind: Int,
+    nspin: Int,
+    dms: F64Ptr,
+    fxc: F64Ptr,
+    aoatm: Pointer[Int64, MutAnyOrigin],
+    natm: Int,
+    cmo: F64Ptr,
+    nmo: Int,
+    nocc: Int,
+    h1_out: F64Ptr,
+) raises:
+    """Kernel part of the XC first-derivative Fock matrices of the Hessian, projected to the MO basis.
+
+    pyscf's ``_get_vxc_deriv1`` forms, for every atom A and direction x, the
+    nao x nao matrix F + F^T with F = Z phi^T, Z = sum_c u_c d_c phi and
+    u = w fxc rho1_{A,x} (rho1 = -d rho / d R_{A,x} as in ``xc_hess_core``, the
+    density component of u halved), per spin from both spins' rho1.  Only
+    C^T (F + F^T) C_o is needed (the Hessian projects every first-order Fock
+    matrix): with Phi_c = C_sub^T d_c phi, shared by all perturbations, it is
+    Z_m B^T + Phi_0 Z_o^T, Z_m = sum_c u_c Phi_c and Z_o, B its occupied rows
+    (the orbitals are ordered occupied first): two GEMMs over all
+    perturbations of a block instead of one nao x nao GEMM each.
+
+    dms: nspin x nao x nao; fxc: (nspin nvar) x (nspin nvar) x ngrid (unweighted);
+    cmo: nspin x nao x nmo (occupied first); h1_out: nspin x natm x 3 x nmo x nocc
+    with nocc the largest occupied count (a spin with fewer occupied orbitals
+    uses its first columns), overwritten (the gradient-matrix part and the
+    overall sign are the caller's).  LDA (``kind`` 0) and GGA (1).
+    """
+    var gga = kind == 1
+    var nderiv = 2 if gga else 1
+    var nvar = 4 if gga else 1
+    var nv2 = nspin * nvar
+    var ncy = 4 if gga else 1
+    var grid = Grid(ngrid, coords)
+    var rcut = _rcuts(basis, nderiv)
+    var nao = basis.nao
+    var n2 = nao * nao
+    var ncomp = _ncomp(nderiv)
+    var nblk = grid.nblk
+    var nworkers = max(1, min(parallelism_level(), nblk))
+    var nh = nspin * natm * 3 * nmo * nocc
+    var accl = List[Float64](length=nworkers * nh + 1, fill=0.0)
+    var pacc = list_ptr(accl)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+    var d2t = List[Int](length=9, fill=0)
+    for x in range(3):
+        for y in range(3):
+            d2t[x * 3 + y] = _didx((1 if x == 0 else 0) + (1 if y == 0 else 0), (1 if x == 1 else 0) + (1 if y == 1 else 0),
+                                   (1 if x == 2 else 0) + (1 if y == 2 else 0))
+    var pd2 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d2t.unsafe_ptr()))
+
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm nvar, imm nv2, imm ncy, imm nspin, imm dms, imm fxc, imm weights, imm aoatm, imm natm, imm cmo, imm nmo, imm nocc, imm pacc, imm nh, imm ngrid, imm pd2}:
+        var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
+        var acc = pacc.unsafe_offset(w * nh)
+        var kmax = 3 * natm
+        var n_y = nspin * ncy * nao * BLK
+        var n_r1 = kmax * nv2 * BLK
+        var n_phi = nvar * nmo * BLK
+        var n_z = kmax * nmo * BLK
+        var n_zo = kmax * nocc * BLK
+        var n_o1 = kmax * nmo * nocc
+        var scratch = List[Float64](length=n_y + 2 * n_r1 + nao * nmo + n_phi + n_z + n_zo + 2 * n_o1 + 10 * W, fill=0.0)
+        var ybuf = F64Ptr(unsafe_from_address=aligned_addr(scratch))
+        var r1 = ybuf.unsafe_offset(n_y)
+        var ub = r1.unsafe_offset(n_r1)
+        var csub = ub.unsafe_offset(n_r1)
+        var phi = csub.unsafe_offset(nao * nmo)
+        var zb = phi.unsafe_offset(n_phi)
+        var zo = zb.unsafe_offset(n_z)
+        var o1 = zo.unsafe_offset(n_zo)
+        var o2 = o1.unsafe_offset(n_o1)
+        var alist = List[Int](length=natm + 1, fill=0)
+        var a0l = List[Int](length=natm + 1, fill=0)
+        var a1l = List[Int](length=natm + 1, fill=0)
+        while True:
+            var blk = Int(pcount[].fetch_add(1))
+            if blk >= nblk:
+                break
+            var sel = select_shells(basis, grid, blk, rcut, ws)
+            var nrow = sel[1]
+            if nrow == 0:
+                continue
+            var p0 = blk * BLK
+            var npt = min(BLK, ngrid - p0)
+            eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            var cs = nrow * BLK
+            var ao = ws.ao()
+            var na = 0
+            for r in range(nrow):
+                var a = Int(aoatm[unsafe_offset=ws.rows[r]])
+                if na == 0 or alist[na - 1] != a:
+                    alist[na] = a
+                    a0l[na] = r
+                    na += 1
+                a1l[na - 1] = r + 1
+            var nk = 3 * na
+            vfill(r1, nk * nv2 * BLK, 0.0)
+            # ---- rho1_{A,x} of every spin
+            for s in range(nspin):
+                var ys = ybuf.unsafe_offset(s * ncy * nao * BLK)
+                gather_block(dms.unsafe_offset(s * n2), nao, nrow, ws)
+                for c in range(ncy):
+                    try:
+                        blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao.unsafe_offset(c * cs), 0.0, ys.unsafe_offset(c * nrow * BLK))
+                    except:
+                        pass
+                for ia in range(na):
+                    for p in range(a0l[ia], a1l[ia]):
+                        var o = p * BLK
+                        for x in range(3):
+                            var dx = ao.unsafe_offset((1 + x) * cs)
+                            var rr = r1.unsafe_offset(((ia * 3 + x) * nv2 + s * nvar) * BLK)
+                            for v in range(NV):
+                                var q = v * W
+                                var dxp = dx.unsafe_load[width=W](o + q)
+                                var y0p = ys.unsafe_load[width=W](o + q)
+                                rr.unsafe_store(q, rr.unsafe_load[width=W](q) + dxp * y0p * 2.0)
+                                if gga:
+                                    for c in range(3):
+                                        var hxc = ao.unsafe_offset(pd2[unsafe_offset=x * 3 + c] * cs)
+                                        var t = hxc.unsafe_load[width=W](o + q) * y0p + dxp * ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
+                                        rr.unsafe_store((c + 1) * BLK + q, rr.unsafe_load[width=W]((c + 1) * BLK + q) + t * 2.0)
+            # ---- u = w fxc rho1 (density component halved)
+            for k in range(nk):
+                var rk = r1.unsafe_offset(k * nv2 * BLK)
+                var uk = ub.unsafe_offset(k * nv2 * BLK)
+                for j in range(nv2):
+                    var half = 0.5 if j % nvar == 0 else 1.0
+                    for v in range(NV):
+                        var q = v * W
+                        var t = F64V(0.0)
+                        for i in range(nv2):
+                            t += _load_w(fxc, (i * nv2 + j) * ngrid + p0, v, npt) * rk.unsafe_load[width=W](i * BLK + q)
+                        uk.unsafe_store(j * BLK + q, t * _load_w(weights, p0, v, npt) * half)
+            # ---- projected matrices per output spin
+            for t in range(nspin):
+                gather_rows_to(cmo.unsafe_offset(t * nao * nmo), nmo, ws, csub)
+                for c in range(nvar):
+                    try:
+                        blas.gemm(True, False, nmo, BLK, nrow, 1.0, csub, ao.unsafe_offset(c * cs), 0.0, phi.unsafe_offset(c * nmo * BLK))
+                    except:
+                        pass
+                for k in range(nk):
+                    var uk = ub.unsafe_offset((k * nv2 + t * nvar) * BLK)
+                    var zk = zb.unsafe_offset(k * nmo * BLK)
+                    for m in range(nmo):
+                        for v in range(NV):
+                            var q = v * W
+                            var z = uk.unsafe_load[width=W](q) * phi.unsafe_load[width=W](m * BLK + q)
+                            if gga:
+                                for c in range(1, 4):
+                                    z += uk.unsafe_load[width=W](c * BLK + q) * phi.unsafe_load[width=W]((c * nmo + m) * BLK + q)
+                            zk.unsafe_store(m * BLK + q, z)
+                    vcopy(zo.unsafe_offset(k * nocc * BLK), zk, nocc * BLK)
+                try:
+                    # o1 = Z_m B^T (all perturbations), o2 = Phi_0 Z_o^T
+                    blas.gemm(False, True, nk * nmo, nocc, BLK, 1.0, zb, phi, 0.0, o1)
+                    blas.gemm(False, True, nmo, nk * nocc, BLK, 1.0, phi, zo, 0.0, o2)
+                except:
+                    pass
+                for ia in range(na):
+                    for x in range(3):
+                        var k = ia * 3 + x
+                        var dst = acc.unsafe_offset((((t * natm + alist[ia]) * 3 + x) * nmo) * nocc)
+                        vaxpy(dst, nmo * nocc, 1.0, o1.unsafe_offset(k * nmo * nocc))
+                        for m in range(nmo):
+                            vaxpy(dst.unsafe_offset(m * nocc), nocc, 1.0, o2.unsafe_offset(m * nk * nocc + k * nocc))
+        _ = ws^
+        _ = scratch^
+        _ = alist^
+        _ = a0l^
+        _ = a1l^
+
+    var nthr = blas.serial_begin()
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    blas.serial_end(nthr)
+    for i in range(nh):
+        var v = 0.0
+        for w2 in range(nworkers):
+            v += pacc[unsafe_offset=w2 * nh + i]
+        h1_out[unsafe_offset=i] = v
+    _ = accl^
+    _ = counter^
+    _ = grid^
+    _ = rcut^
+    _ = d2t^
