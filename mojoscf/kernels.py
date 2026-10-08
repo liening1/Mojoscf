@@ -362,11 +362,37 @@ def cphf_k(lfull, lmo, loo, x, alpha=1.0, out=None):
     return out
 
 
-def jk_s8(eri, dm, with_j=True, with_k=True):
+def _sym_anti(dms, hermi):
+    """Densities for the J/K kernels: (stack, anti) with ``stack`` the symmetric parts of ``dms`` followed by
+    their antisymmetric parts that are not zero, at the indices ``anti`` (``hermi`` 1: ``dms`` taken as
+    symmetric; 2: as antisymmetric; 0: general).  J depends on the symmetric part only, K is linear."""
+    if hermi == 1:
+        return dms, []
+    tr = dms.transpose(0, 2, 1)
+    sym = np.zeros_like(dms) if hermi == 2 else 0.5 * (dms + tr)
+    asym = dms if hermi == 2 else 0.5 * (dms - tr)
+    anti = [i for i in range(dms.shape[0]) if np.abs(asym[i]).max(initial=0.0) > 0.0]
+    if not anti:
+        return np.ascontiguousarray(sym), []
+    return np.ascontiguousarray(np.concatenate([sym, asym[anti]])), anti
+
+
+def _merge_anti(vj, vk, n, anti):
+    """J/K of the original densities from those of :func:`_sym_anti`'s stack."""
+    if vk is not None and anti:
+        vk = vk.copy()
+        for k, i in enumerate(anti):
+            vk[i] += vk[n + k]
+    return (vj[:n] if vj is not None else None), (vk[:n] if vk is not None else None)
+
+
+def jk_s8(eri, dm, with_j=True, with_k=True, hermi=1):
     """``(vj, vk)`` from 8-fold packed ERIs (``mol.intor('int2e', aosym='s8')``).
 
-    Same semantics as ``pyscf.scf.hf.dot_eri_dm(eri, dm, hermi=1)``: ``dm`` must be
-    symmetric (one matrix or a stack); the outputs are shaped like ``dm``.
+    Same semantics as ``pyscf.scf.hf.dot_eri_dm(eri, dm, hermi)`` (one matrix
+    or a stack; the outputs are shaped like ``dm``): ``hermi=1`` takes the
+    densities as symmetric, ``hermi=0`` any (their antisymmetric parts go
+    through the kernel as such, J being that of the symmetric parts).
     """
     eri = _c(eri)
     dm_in = np.asarray(dm, dtype=np.float64)
@@ -375,9 +401,11 @@ def jk_s8(eri, dm, with_j=True, with_k=True):
     npair = nao * (nao + 1) // 2
     if eri.ndim != 1 or eri.size != npair * (npair + 1) // 2:
         raise ValueError("eri must be the 8-fold packed int2e vector for this nao")
-    vj = np.zeros((nset, nao, nao))
-    vk = np.zeros((nset, nao, nao))
-    get_extension().jk_s8(eri, dms, vj, vk, bool(with_j), bool(with_k))
+    stack, anti = _sym_anti(dms, hermi)
+    vj = np.zeros(stack.shape)
+    vk = np.zeros(stack.shape)
+    get_extension().jk_s8(eri, stack, vj, vk, bool(with_j), bool(with_k), len(anti))
+    vj, vk = _merge_anti(vj if with_j else None, vk if with_k else None, nset, anti)
     vj = vj.reshape(dm_in.shape) if with_j else None
     vk = vk.reshape(dm_in.shape) if with_k else None
     return vj, vk

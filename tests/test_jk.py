@@ -104,6 +104,24 @@ def test_jk_s8_tiny_basis():
     assert np.allclose(vj, vj_ref, atol=1e-13) and np.allclose(vk, vk_ref, atol=1e-13)
 
 
+def test_jk_s8_nonsymmetric(eri_s8, h2o_dz, rng):
+    """hermi=0: general, antisymmetric and symmetric densities in one stack, as pyscf's dot_eri_dm."""
+    n = h2o_dz.nao_nr()
+    a = rng.standard_normal((3, n, n))
+    a[1] = a[1] - a[1].T
+    a[2] = a[2] + a[2].T
+    vj_ref, vk_ref = pyscf_hf.dot_eri_dm(eri_s8, a, hermi=0)
+    vj, vk = kernels.jk_s8(eri_s8, a, hermi=0)
+    assert abs(vj - vj_ref).max() < 1e-11 and abs(vk - vk_ref).max() < 1e-11
+    assert abs(vj[1]).max() < 1e-12                       # J of an antisymmetric density
+    eri = h2o_dz.intor("int2e")
+    assert np.allclose(vk[0], np.einsum("ijkl,jk->il", eri, a[0]), atol=1e-10)
+    none, vk0 = kernels.jk_s8(eri_s8, a[0], with_j=False, hermi=0)
+    assert none is None and abs(vk0 - vk_ref[0]).max() < 1e-11
+    vj0, none = kernels.jk_s8(eri_s8, a[:2], with_k=False, hermi=0)
+    assert none is None and abs(vj0 - vj_ref[:2]).max() < 1e-11
+
+
 # ------------------------------------------------------------- full SCF
 
 
@@ -239,6 +257,21 @@ def test_direct_get_jk_matches_pyscf(h2o_dz, rng):
     assert abs(vk - rk).max() < 1e-11
     vj1, vk1 = mojoscf.integrals.get_jk(h2o_dz, dms[0], with_k=False)
     assert vk1 is None and abs(vj1 - rj[0]).max() < 1e-10
+
+
+def test_direct_get_jk_nonsymmetric(h2o_dz, rng):
+    """hermi=0 through the integral-direct kernel: one pass for all densities, antisymmetric parts K only."""
+    n = h2o_dz.nao_nr()
+    a = rng.standard_normal((3, n, n))
+    a[1] = a[1] - a[1].T
+    a[2] = a[2] + a[2].T
+    rj, rk = scf.hf.get_jk(h2o_dz, a, hermi=0)
+    vj, vk = mojoscf.integrals.get_jk(h2o_dz, a, direct_scf_tol=0.0, hermi=0)
+    assert abs(vj - rj).max() < 1e-11 and abs(vk - rk).max() < 1e-11
+    none, vk1 = mojoscf.integrals.get_jk(h2o_dz, a[1], with_j=False, direct_scf_tol=0.0, hermi=0)
+    assert none is None and abs(vk1 - rk[1]).max() < 1e-11
+    vj1, none = mojoscf.integrals.get_jk(h2o_dz, a[0], with_k=False, direct_scf_tol=0.0, hermi=0)
+    assert none is None and abs(vj1 - rj[0]).max() < 1e-11
 
 
 @pytest.mark.parametrize("atom, basis", [

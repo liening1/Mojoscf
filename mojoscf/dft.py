@@ -570,27 +570,56 @@ def _incore_cderi(mf, mol, dm, hermi, omega):
 
 
 def _exact_jk(mf, mol, dm, hermi, with_j, with_k, omega):
-    """J/K with exact integrals from mojoscf for a non-DF object whose ``get_jk`` is pyscf's ``SCF.get_jk``:
-
-    in-core 8-fold ERIs (built with the Mojo engine when pyscf would keep them
-    in core) contracted by :func:`mojoscf.kernels.jk_s8`, else integral-direct
-    J/K (:func:`mojoscf.integrals.get_jk`).  None when that does not apply.
-    """
+    """J/K with exact integrals from mojoscf (:func:`exact_jk`) for a non-DF object whose ``get_jk`` behind
+    :class:`_MojoKSHook` is pyscf's ``SCF.get_jk``; None when that does not apply."""
     from pyscf.df import df_jk
 
     if isinstance(mf, df_jk._DFHF) or (mol is not None and mol is not mf.mol):
         return None
-    if omega or hermi != 1 or not np.isrealobj(dm) or "get_jk" in vars(mf):
+    if omega or hermi not in (0, 1) or not np.isrealobj(dm) or "get_jk" in vars(mf):
         return None
     mro = type(mf).__mro__
     nxt = next((c for c in mro[mro.index(_MojoKSHook) + 1:] if "get_jk" in c.__dict__), None)
     if nxt is None or nxt.__module__ not in ("pyscf.scf.hf", "pyscf.scf.uhf"):
         return None
-    mol = mf.mol
-    if integrals.engine() != "mojo" or not integrals.available(mol, two_electron=True):
+    if integrals.engine() != "mojo" or not integrals.available(mf.mol, two_electron=True):
         return None
+    return exact_jk(mf, dm, hermi, with_j, with_k)
+
+
+def exact_jk_applies(mf) -> bool:
+    """Whether ``mf.get_jk`` is pyscf's exact-integral ``SCF.get_jk`` (``RHF``/``UHF``, with at most
+    :class:`_MojoKSHook` in front) and the Mojo engine handles the molecule, so that :func:`exact_jk`
+    returns the same matrices."""
+    from pyscf.df import df_jk
+
+    if isinstance(mf, df_jk._DFHF) or "get_jk" in vars(mf):
+        return False
+    nxt = next((c for c in type(mf).__mro__ if "get_jk" in c.__dict__ and c is not _MojoKSHook), None)
+    if nxt is None or nxt.__module__ not in ("pyscf.scf.hf", "pyscf.scf.uhf"):
+        return False
+    if integrals.engine() != "mojo" or not integrals.available(mf.mol, two_electron=True):
+        return False
+    eri = getattr(mf, "_eri", None)
+    nao = mf.mol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    return eri is None or (isinstance(eri, np.ndarray) and eri.dtype == np.float64
+                           and eri.size == npair * (npair + 1) // 2)
+
+
+def exact_jk(mf, dm, hermi=1, with_j=True, with_k=True):
+    """J/K of ``dm`` with exact integrals over ``mf.mol``, as pyscf's ``RHF.get_jk`` forms them.
+
+    pyscf's in-core 8-fold ERIs ``mf._eri`` (built with the Mojo engine when
+    pyscf would keep them in core) are contracted by
+    :func:`mojoscf.kernels.jk_s8`, else the integral-direct kernel runs
+    (:func:`mojoscf.integrals.get_jk`, screened with ``mf.direct_scf_tol``).
+    ``hermi`` 1: symmetric densities, 0: any.  None when ``mf._eri`` is not an
+    8-fold ERI array.
+    """
     from . import kernels
 
+    mol = mf.mol
     nao = mol.nao_nr()
     npair = nao * (nao + 1) // 2
     dm = np.asarray(dm, dtype=np.float64)
@@ -599,9 +628,9 @@ def _exact_jk(mf, mol, dm, hermi, with_j, with_k, omega):
         eri = mf._eri = integrals.int2e_s8(mol)
     if eri is not None:
         if isinstance(eri, np.ndarray) and eri.dtype == np.float64 and eri.size == npair * (npair + 1) // 2:
-            return kernels.jk_s8(eri.reshape(-1), dm, with_j, with_k)
+            return kernels.jk_s8(eri.reshape(-1), dm, with_j, with_k, hermi)
         return None
-    return integrals.get_jk(mol, dm, with_j, with_k, direct_scf_tol=mf.direct_scf_tol)
+    return integrals.get_jk(mol, dm, with_j, with_k, direct_scf_tol=mf.direct_scf_tol, hermi=hermi)
 
 
 class _MojoKSHook:

@@ -244,21 +244,18 @@ def digest_quartet(
         scale *= 0.5
     if same_pair:
         scale *= 0.5
-    if nk == 0:
-        digest_any[True, False](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dmj, aj, dmj, ak, ploc)
-    elif nj == 0:
-        for s in range(nk):
-            digest_any[False, True](
-                blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dmj, aj,
-                dmk.unsafe_offset(s * n2), ak.unsafe_offset(s * n2), ploc,
-            )
-    else:
-        digest_any[True, True](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dmj, aj, dmk, ak, ploc)
-        for s in range(1, nk):
-            digest_any[False, True](
-                blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dmj, aj,
-                dmk.unsafe_offset(s * n2), ak.unsafe_offset(s * n2), ploc,
-            )
+    # density s: J and K together while both have one, then the rest of either
+    for s in range(max(nj, nk)):
+        var pj = dmj.unsafe_offset(min(s, max(nj - 1, 0)) * n2)
+        var qj = aj.unsafe_offset(min(s, max(nj - 1, 0)) * n2)
+        var pk = dmk.unsafe_offset(min(s, max(nk - 1, 0)) * n2)
+        var qk = ak.unsafe_offset(min(s, max(nk - 1, 0)) * n2)
+        if s < nj and s < nk:
+            digest_any[True, True](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, pj, qj, pk, qk, ploc)
+        elif s < nj:
+            digest_any[True, False](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, pj, qj, pj, qk, ploc)
+        else:
+            digest_any[False, True](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, pj, qj, pk, qk, ploc)
 
 
 def flush_batch(
@@ -342,10 +339,15 @@ struct DirectJK(Movable):
         _ = sa^
         _ = sb^
 
-    def jk(self, nj: Int, dmj: F64Ptr, vj: F64Ptr, nk: Int, dmk: F64Ptr, vk: F64Ptr, tol: Float64):
-        """vj = J[dmj] (nj <= 1 densities) and vk[s] = K[dmk[s]] (nk densities); outputs overwritten.
+    def jk(
+        self, nj: Int, dmj: F64Ptr, vj: F64Ptr, nk: Int, dmk: F64Ptr, vk: F64Ptr, tol: Float64, nanti: Int = 0
+    ):
+        """vj[s] = J[dmj[s]] (nj densities) and vk[s] = K[dmk[s]] (nk densities); outputs overwritten.
 
-        All densities must be symmetric (nao x nao, row-major).
+        The densities are symmetric (nao x nao, row-major), except the last
+        ``nanti`` exchange densities, which are antisymmetric: the four index
+        orderings the digestion adds are then minus the transpose of the
+        other four, K = A - A^T.
         """
         var nao = self.nao
         var n2 = nao * nao
@@ -365,7 +367,7 @@ struct DirectJK(Movable):
                 var j1 = self.basis.ao_loc[b + 1]
                 var m = 0.0
                 for s in range(nacc):
-                    var d = dmj if s < nj else dmk.unsafe_offset((s - nj) * n2)
+                    var d = dmj.unsafe_offset(s * n2) if s < nj else dmk.unsafe_offset((s - nj) * n2)
                     for i in range(i0, i1):
                         for j in range(j0, j1):
                             var v = abs(d[unsafe_offset=i * nao + j])
@@ -458,11 +460,12 @@ struct DirectJK(Movable):
                 reduce(0)
             else:
                 parallelize(reduce, nchunk)
-        # J = A + A^T, K = A + A^T (tiled transpose)
+        # J = A + A^T, K = A + A^T (A - A^T for the antisymmetric densities) (tiled transpose)
         comptime TB = 32
         for s in range(nacc):
             var src = pacc.unsafe_offset(s * n2)
-            var dst = vj if s < nj else vk.unsafe_offset((s - nj) * n2)
+            var dst = vj.unsafe_offset(s * n2) if s < nj else vk.unsafe_offset((s - nj) * n2)
+            var sgn = -1.0 if s >= nacc - nanti else 1.0
             var i0 = 0
             while i0 < nao:
                 var i1 = min(i0 + TB, nao)
@@ -471,7 +474,7 @@ struct DirectJK(Movable):
                     var j1 = min(j0 + TB, nao)
                     for i in range(i0, i1):
                         for j in range(j0, j1):
-                            dst[unsafe_offset=i * nao + j] = src[unsafe_offset=i * nao + j] + src[unsafe_offset=j * nao + i]
+                            dst[unsafe_offset=i * nao + j] = src[unsafe_offset=i * nao + j] + sgn * src[unsafe_offset=j * nao + i]
                     j0 = j1
                 i0 = i1
         _ = acc^

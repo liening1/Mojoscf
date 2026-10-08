@@ -33,8 +33,10 @@ def jk_s8_core(
     nk: Int,
     dms_k: F64Ptr,
     vk: F64Ptr,
+    nanti: Int = 0,
 ):
-    """J for ``nj`` densities and K for ``nk`` densities (all symmetric, nao x nao).
+    """J for ``nj`` densities and K for ``nk`` densities (symmetric, nao x nao; the last ``nanti`` exchange
+    densities antisymmetric: their K = K' - K'^T, the transposed tuples changing sign).
 
     vj : nj x nao x nao and vk : nk x nao x nao are overwritten.
     """
@@ -144,9 +146,10 @@ def jk_s8_core(
             for c in range(nchunks):
                 vaxpy(pks, n2, 1.0, pkb.unsafe_offset((c * nk + s) * n2))
             var out = vk.unsafe_offset(s * n2)
+            var sgn = -1.0 if s >= nk - nanti else 1.0
             for a in range(nao):
                 for b in range(nao):
-                    out[unsafe_offset=a * nao + b] = pks[unsafe_offset=a * nao + b] + pks[unsafe_offset=b * nao + a]
+                    out[unsafe_offset=a * nao + b] = pks[unsafe_offset=a * nao + b] + sgn * pks[unsafe_offset=b * nao + a]
         _ = ksum^
     _ = pi^
     _ = pj^

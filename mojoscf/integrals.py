@@ -353,19 +353,26 @@ def attach(mf, schwarz_tol: float = 1e-14, auxbasis=None):
     return mf
 
 
-def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13):
-    """Integral-direct J and K of symmetric density matrices, like ``pyscf.scf.hf.get_jk``.
+def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13, hermi=1):
+    """Integral-direct J and K of density matrices, like ``pyscf.scf.hf.get_jk``.
 
     ``dm`` is (nao, nao) or (n, nao, nao); returns (vj, vk) of the same shape
     (None for a matrix that was not requested).  Shell quartets are screened
     with the Schwarz bounds times the density, as pyscf's ``direct_scf_tol``.
+    All densities share one pass over the integrals; ``hermi=0`` accepts
+    non-symmetric densities (their antisymmetric parts go through the kernel
+    as such, J being that of the symmetric parts).
     """
+    from .kernels import _merge_anti, _sym_anti
+
     dm = np.asarray(dm, dtype=np.float64)
-    single = dm.ndim == 2
     dms = np.ascontiguousarray(dm.reshape(-1, dm.shape[-2], dm.shape[-1]))
-    vj = np.empty_like(dms)
-    vk = np.empty_like(dms)
-    get_extension().direct_jk(basis_tables(mol), _boys_table(), dms, vj, vk, bool(with_j), bool(with_k), float(direct_scf_tol))
+    stack, anti = _sym_anti(dms, hermi)
+    vj = np.zeros(stack.shape)
+    vk = np.zeros(stack.shape)
+    get_extension().direct_jk(basis_tables(mol), _boys_table(), stack, vj, vk, bool(with_j), bool(with_k),
+                              float(direct_scf_tol), len(anti))
+    vj, vk = _merge_anti(vj if with_j else None, vk if with_k else None, dms.shape[0], anti)
     shape = dm.shape
     vj = vj.reshape(shape) if with_j else None
     vk = vk.reshape(shape) if with_k else None

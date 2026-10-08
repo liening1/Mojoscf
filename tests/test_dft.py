@@ -139,6 +139,12 @@ def test_exact_jk_matches_pyscf():
             assert abs(j0 - j1).max() < 1e-10 and abs(k0 - k1).max() < 1e-10
             assert abs(mf.get_j(mol, d) - j0).max() < 1e-10
         assert abs(mf.get_k(mol, dm, omega=0.3) - ref.get_k(mol, dm, omega=0.3)).max() < 1e-10   # pyscf's
+        # non-symmetric densities (TDDFT X - Y) through the same kernels
+        x = np.random.default_rng(1).normal(size=(2, mol.nao, mol.nao))
+        j0, k0 = ref.get_jk(mol, x, hermi=0)
+        j1, k1 = mf.get_jk(mol, x, hermi=0)
+        assert abs(j0 - j1).max() < 1e-10 and abs(k0 - k1).max() < 1e-10
+        assert mdft._exact_jk(mf, mol, x, 0, True, True, None) is not None
 
 
 @pytest.mark.parametrize("df", [False, True])
