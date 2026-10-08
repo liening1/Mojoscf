@@ -181,6 +181,8 @@ def test_range_separated_df(xc, spin):
     mf = mdft.accelerate(make())
     dm = ref.make_rdm1()
     omega = mf._numint.rsh_and_hybrid_coeff(xc)[0]
+    if omega > 0:   # the long-range tensor comes from the Mojo engine (pyscf's range_coulomb context)
+        assert mdft._df_tensor(mf, omega) is not None and mol.omega == 0
     assert abs(mf.get_k(mol, dm, omega=omega) - ref.get_k(mol, dm, omega=omega)).max() < 1e-10
     mf.run(conv_tol=1e-11)
     assert abs(mf.e_tot - ref.e_tot) < 1e-9

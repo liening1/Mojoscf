@@ -304,17 +304,18 @@ def build_df(with_df) -> bool:
     from pyscf import lib as pyscf_lib
 
     mol = with_df.mol
-    omega = getattr(with_df, "omega", None) or 0.0
+    # the long-range objects of DF.range_coulomb(omega) carry omega on their molecule while in use
+    omega = getattr(with_df, "omega", None) or getattr(mol, "omega", 0.0) or 0.0
     if with_df._cderi is not None or omega < 0:
         return False
-    if unsupported_reason(mol, two_electron=True) is not None or engine() != "mojo":
+    if unsupported_reason(mol, two_electron=True, allow_omega=omega > 0) is not None or engine() != "mojo":
         return False
     if isinstance(getattr(with_df, "_cderi_to_save", None), str):
         return False
     auxmol = with_df.auxmol
     if auxmol is None:
         auxmol = df_addons.make_auxmol(mol, with_df.auxbasis)
-    if unsupported_reason(auxmol, two_electron=True) is not None:
+    if unsupported_reason(auxmol, two_electron=True, allow_omega=omega > 0) is not None:
         return False
     nao = mol.nao_nr()
     max_memory = with_df.max_memory - pyscf_lib.current_memory()[0]

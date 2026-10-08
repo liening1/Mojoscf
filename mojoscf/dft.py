@@ -529,8 +529,10 @@ def _df_tensor(mf, omega=0.0):
     A missing tensor is built with the Mojo integrals when pyscf would keep
     it in core (``integrals.build_df``).  ``omega`` > 0 (the long-range
     exchange of range-separated functionals) gives the tensor of pyscf's
-    ``with_df.range_coulomb(omega)``, built with the attenuated integrals.
-    None for other DF classes, out-of-core tensors and ``only_dfj`` objects.
+    ``with_df.range_coulomb(omega)`` (a context manager that sets the
+    molecules' ``omega`` while it is open), built with the attenuated
+    integrals.  None for other DF classes, out-of-core tensors and
+    ``only_dfj`` objects.
     """
     from pyscf.df import df as pyscf_df
     from pyscf.df import df_jk
@@ -540,17 +542,22 @@ def _df_tensor(mf, omega=0.0):
     with_df = mf.with_df
     if type(with_df) is not pyscf_df.DF:
         return None
-    if omega:
-        with_df = with_df.range_coulomb(omega)
-        if type(with_df) is not pyscf_df.DF:
-            return None
-    if with_df._cderi is None and not integrals.build_df(with_df):
-        with_df.build()
-    cderi = with_df._cderi
     nao = mf.mol.nao_nr()
-    if isinstance(cderi, np.ndarray) and cderi.ndim == 2 and cderi.dtype == np.float64 and cderi.shape[1] == nao * (nao + 1) // 2:
-        return cderi
-    return None
+
+    def tensor(d):
+        if type(d) is not pyscf_df.DF:
+            return None
+        if d._cderi is None and not integrals.build_df(d):
+            d.build()
+        cderi = d._cderi
+        if isinstance(cderi, np.ndarray) and cderi.ndim == 2 and cderi.dtype == np.float64 and cderi.shape[1] == nao * (nao + 1) // 2:
+            return cderi
+        return None
+
+    if omega:
+        with with_df.range_coulomb(omega) as rsh_df:
+            return tensor(rsh_df)
+    return tensor(with_df)
 
 
 def _incore_cderi(mf, mol, dm, hermi, omega):

@@ -52,7 +52,9 @@ def _pyscf_copy(mf):
     return ref
 
 
-def _check(td_m, td_p, nstates=3, op_tol=1e-11, e_tol=1e-8):
+def _check(td_m, td_p, nstates=3, op_tol=1e-11, e_tol=1e-8, mo_path=True):
+    if mo_path:     # the occupied-virtual operator runs (not pyscf's, which gives the same results)
+        assert mtd._operator(td_m) is not None
     vm, hm = td_m.gen_vind()
     vp, hp = td_p.gen_vind()
     assert abs(hm - hp).max() < 1e-14
@@ -203,7 +205,7 @@ def test_fallbacks_give_pyscf_results(water):
     mf = _scf(water, "pbe0", df=False)
     td = mf.TDA()
     assert mtd._operator(td) is None
-    _check(td, _pyscf_copy(mf).TDA())
+    _check(td, _pyscf_copy(mf).TDA(), mo_path=False)
     # short-range-only exact exchange (HSE)
     mf = _scf(water, "hse06")
     td = mf.TDA()
@@ -216,7 +218,7 @@ def test_fallbacks_give_pyscf_results(water):
     assert mtd._operator(td) is None
     td_p = _pyscf_copy(mf).TDA()
     td_p.wfnsym = "B2"
-    _check(td, td_p)
+    _check(td, td_p, mo_path=False)
 
 
 def test_metal_complex_uks():
