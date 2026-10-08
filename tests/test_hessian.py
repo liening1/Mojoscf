@@ -74,3 +74,34 @@ def test_accelerated_hessian_matches_pyscf(xc, spin, df):
     h = mf.Hessian()
     assert isinstance(h, mhess._MojoHessMixin)
     assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-9
+
+
+@pytest.mark.parametrize("xc, spin", [("pbe", 0), ("b3lyp", 0), ("camb3lyp", 0), ("tpss", 0), (None, 0),
+                                      ("b3lyp", 1), ("wb97x", 1), (None, 1)])
+def test_cphf_operator_matches_pyscf(xc, spin):
+    """The MO-basis coupled-perturbed operator against pyscf's Hessian gen_vind on random first-order orbitals."""
+    from pyscf import scf
+    from pyscf.hessian import rhf as rhf_hess
+    from pyscf.hessian import uhf as uhf_hess
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    if xc is None:
+        mf = (scf.UHF if spin else scf.RHF)(mol).density_fit().run()
+    else:
+        mf = mojoscf.dft.accelerate((dft.UKS if spin else dft.RKS)(mol, xc=xc).density_fit()).run()
+    fx = mhess.cphf_operator(mf)
+    assert fx is not None
+    ref = (uhf_hess if spin else rhf_hess).gen_vind(mf, mf.mo_coeff, mf.mo_occ)
+    cs = mf.mo_coeff if spin else [mf.mo_coeff]
+    os = mf.mo_occ if spin else [mf.mo_occ]
+    n = sum(c.shape[1] * int((o > 0).sum()) for c, o in zip(cs, os))
+    x = np.random.default_rng(3).normal(size=(5, n))
+    a, b = fx(x), ref(x)
+    assert a.shape == np.asarray(b).shape
+    assert abs(a - b).max() < 1e-12 * abs(b).max()
+
+
+def test_cphf_operator_falls_back_without_df():
+    mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
+    mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="pbe")).run()
+    assert mhess.cphf_operator(mf) is None

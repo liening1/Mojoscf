@@ -102,3 +102,66 @@ def df_sandwich_core(
         vaxpy(r, rsize, alpha, pr.unsafe_offset(c * rsize))
     _ = tbuf^
     _ = rbuf^
+
+
+def cphf_k_core(
+    blas_seq: Blas,
+    nq: Int,
+    nmo: Int,
+    nocc: Int,
+    nset: Int,
+    lfull: F64Ptr,
+    lmo: F64Ptr,
+    loo: F64Ptr,
+    xs: F64Ptr,
+    xts: F64Ptr,
+    alpha: Float64,
+    r: F64Ptr,
+) raises:
+    """Exchange of the coupled-perturbed (orbital Hessian) response in the MO basis.
+
+    For first-order orbitals x_n (nmo x nocc, occupied orbitals first) the
+    projected exchange of D = C x C_o^T + C_o x^T C^T is
+
+        C^T K[D] C_o = sum_Q [L_Q x (oo|Q) + (po|Q) x^T (po|Q)] = sum_Q L_Q T_Q,
+        T_Q = x (oo|Q) + E_o x^T (po|Q)
+
+    (L_Q = (pq|Q) over all orbitals, E_o puts a nocc x nocc block into the
+    occupied rows): per auxiliary function two GEMMs over all vectors for T
+    and one nmo x nmo x nocc GEMM per vector, half the work of the two
+    separate exchange terms.  r (nset x nmo x nocc) += alpha * sum_Q L_Q T_Q.
+    lfull: nq x nmo x nmo, lmo: nq x nmo x nocc, loo: nq x nocc x nocc,
+    xs: nset x nmo x nocc, xts: nset x nocc x nmo (the transposes).
+    """
+    if nq == 0 or nset == 0 or nocc == 0 or nmo == 0:
+        return
+    var nwork = max(1, min(parallelism_level(), nq))
+    var tsize = nset * nmo * nocc
+    var psize = nset * nocc * nocc
+    var buf = List[Float64](length=nwork * (2 * tsize + psize), fill=0.0)
+    var pb = list_ptr(buf)
+
+    def work(c: Int) {imm blas_seq, imm nq, imm nmo, imm nocc, imm nset, imm lfull, imm lmo, imm loo, imm xs, imm xts, imm pb, imm tsize, imm psize, imm nwork}:
+        var t = pb.unsafe_offset(c * (2 * tsize + psize))
+        var acc = t.unsafe_offset(tsize)
+        var p = acc.unsafe_offset(tsize)
+        var q = c
+        while q < nq:
+            try:
+                # T = x (oo|Q) for all vectors ((n, p) rows), P_n = x_n^T (po|Q)
+                blas_seq.gemm(False, False, nset * nmo, nocc, nocc, 1.0, xs, loo.unsafe_offset(q * nocc * nocc), 0.0, t)
+                blas_seq.gemm(False, False, nset * nocc, nocc, nmo, 1.0, xts, lmo.unsafe_offset(q * nmo * nocc), 0.0, p)
+                for n in range(nset):
+                    vaxpy(t.unsafe_offset(n * nmo * nocc), nocc * nocc, 1.0, p.unsafe_offset(n * nocc * nocc))
+                    blas_seq.gemm(False, False, nmo, nocc, nmo, 1.0, lfull.unsafe_offset(q * nmo * nmo),
+                                  t.unsafe_offset(n * nmo * nocc), 1.0, acc.unsafe_offset(n * nmo * nocc))
+            except:
+                pass
+            q += nwork
+
+    var nthr = blas_seq.serial_begin()
+    parallelize(work, nwork)
+    blas_seq.serial_end(nthr)
+    for c in range(nwork):
+        vaxpy(r, tsize, alpha, pb.unsafe_offset(c * (2 * tsize + psize) + tsize))
+    _ = buf^

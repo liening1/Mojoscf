@@ -29,6 +29,7 @@ __all__ = [
     "factorize_density",
     "df_mo",
     "df_sandwich",
+    "cphf_k",
 ]
 
 
@@ -325,6 +326,29 @@ def df_sandwich(a, x, b, nvec, alpha=1.0, out=None):
         raise ValueError(f"out must be a C-contiguous float64 array of shape {(m * nvec, p)}")
     seq_path, seq_prefix = worker_blas()
     get_extension().df_sandwich(a, x, b, int(nvec), float(alpha), out, seq_path, seq_prefix)
+    return out
+
+
+def cphf_k(lfull, lmo, loo, x, alpha=1.0, out=None):
+    """``out (nset, nmo, nocc) += alpha * sum_Q L_Q (x_n (oo|Q) + E_o x_n^T (po|Q))``.
+
+    The projected exchange ``C^T K[C x C_o^T + C_o x^T C^T] C_o`` of first-order
+    orbitals ``x`` (nset, nmo, nocc) with the occupied orbitals first:
+    ``lfull`` (naux, nmo, nmo) is the DF tensor in the MO basis, ``lmo`` and
+    ``loo`` its (naux, nmo, nocc) and (naux, nocc, nocc) blocks.
+    """
+    lfull, lmo, loo, x = _c(lfull), _c(lmo), _c(loo), _c(x)
+    nq, nmo, _ = lfull.shape
+    nset, _, nocc = x.shape
+    if lmo.shape != (nq, nmo, nocc) or loo.shape != (nq, nocc, nocc) or x.shape[1] != nmo:
+        raise ValueError(f"inconsistent shapes lfull {lfull.shape}, lmo {lmo.shape}, loo {loo.shape}, x {x.shape}")
+    if out is None:
+        out = np.zeros((nset, nmo, nocc))
+    elif out.shape != (nset, nmo, nocc) or out.dtype != np.float64 or not out.flags.c_contiguous:
+        raise ValueError(f"out must be a C-contiguous float64 array of shape {(nset, nmo, nocc)}")
+    xts = np.ascontiguousarray(x.transpose(0, 2, 1))
+    seq_path, seq_prefix = worker_blas()
+    get_extension().cphf_k(lfull, lmo, loo, x, xts, float(alpha), out, seq_path, seq_prefix)
     return out
 
 
