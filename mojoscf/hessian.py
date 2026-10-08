@@ -390,13 +390,12 @@ class _KChannel:
         self.nocc = self.co.shape[1]
         self.lmo = None       # (naux, nmo, nocc): C^T (mu nu|P) C_o
         self.ck = None        # (naux, nocc, nocc): V^-1 C_o^T (mu nu|P) C_o
-        self.ltil = None      # (naux, nmo, nocc): V^-1 lmo
-        self.g = None         # (nao, 3, naux, nocc): (nabla mu nu|P) C_o
+        self.g = None         # (3, nao, naux, nocc): (nabla mu nu|P) C_o
         self.hb = None        # (natm, 3, nao, nocc): sum_P N_P[A]^T C_o[A] ck_P
         self.hd = None        # (natm, 3, nao, nocc): sum_{P on A} N_P^T C_o ck_P
 
 
-def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
+def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, verbose=None):
     """Coulomb and exchange terms of a density-fitted RKS/UKS (or RHF/UHF) Hessian, or None.
 
     Returns ``(de2, h1)``: ``de2`` (natm, natm, 3, 3) the J/K part of pyscf's
@@ -433,6 +432,7 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
     from pyscf import lib
     from pyscf.df import addons as df_addons
     from pyscf.df.grad.rhf import LINEAR_DEP_THRESHOLD
+    from pyscf.lib import logger
     from pyscf.scf import hf
 
     from . import kernels
@@ -477,6 +477,8 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
         return None
     budget = max(200.0, 0.7 * free - words * 8e-6) * 1e6 / 8      # words for the blocks
 
+    log = logger.new_logger(hessobj, verbose)
+    t1 = (logger.process_clock(), logger.perf_counter())
     ext = get_extension()
     boys = integrals._boys_table()
     tables = integrals.basis_tables(mol)
@@ -499,9 +501,8 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
                 ch.ck = metric.solve(np.ascontiguousarray(lmo[:, ch.occ > 0]))
             if with_h1:
                 ch.lmo = lmo
-                if ch in kchans:
-                    ch.ltil = metric.solve(lmo.copy())
     j3c = None
+    t1 = log.timer_debug1("DF Hessian: fitted densities, MO three-centre tensors", *t1)
 
     # second-derivative three-centre term
     de2 = np.empty((natm, natm, 3, 3))
@@ -518,6 +519,7 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
     ext.hess_df3c(tables, aux_tables, boys, np.ascontiguousarray(coef), np.ascontiguousarray(lib.pack_tril(dm)), 1.0,
                   float(kappa), xs, cns, blk, float(tol), de2, seq_path, seq_prefix)
     cns = xs = None
+    t1 = log.timer_debug1("DF Hessian: second-derivative three-centre term", *t1)
 
     # second-derivative two-centre term: -1/2 sum d2V_PQ W_PQ = C_AB - delta_AB sum_B' C_AB'
     w = np.outer(coef, coef)
@@ -535,18 +537,22 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
     de2 += cab
     for ia in range(natm):
         de2[ia, ia] -= cab[ia].sum(axis=0)
+    t1 = log.timer_debug1("DF Hessian: second-derivative two-centre term", *t1)
 
     # first-derivative integrals, block by block of auxiliary shells
     v1 = auxmol.intor("int2c2e_ip1", comp=3)                     # (nabla P|Q)
     ndm = np.empty((3, naux, nao))                               # sum_nu N_P,mu nu D_mu nu
     nt = np.zeros((natm, 3, nao, nao)) if with_h1 else None      # sum_{P on A} c_P N_P
     for ch in kchans:
-        ch.g = np.empty((nao, 3, naux, ch.nocc))
+        ch.g = np.empty((3, nao, naux, ch.nocc))
         if with_h1:
             ch.hb = np.zeros((natm, 3, nao, ch.nocc))
             ch.hd = np.zeros((natm, 3, nao, ch.nocc))
     aux_loc = auxmol.ao_loc_nr()
-    maxp = max(1, int(budget / 2 / (3 * nao * nao + 3 * nao * (m + 1))))
+    # blocks of first-derivative integrals: at most 1/4 of the budget and 256 MB (one buffer, reused)
+    maxp = max(1, int(min(budget / 4, 32e6) / (3 * nao * nao + 3 * nao * (m + 1))))
+    maxf = max(int(aux_loc[i + 1] - aux_loc[i]) for i in range(auxmol.nbas))
+    n3buf = np.empty(3 * max(maxp, maxf) * nao * nao)
     sh0 = 0
     while sh0 < auxmol.nbas:
         sh1 = sh0 + 1
@@ -554,7 +560,8 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
             sh1 += 1
         p0, p1 = int(aux_loc[sh0]), int(aux_loc[sh1])
         npf = p1 - p0
-        n3 = np.zeros((3, npf, nao, nao))
+        n3 = n3buf[: 3 * npf * nao * nao].reshape(3, npf, nao, nao)
+        n3[:] = 0.0
         ext.int3c2e_ip1(tables, aux_tables, boys, sh0, sh1, float(tol), n3)
         ndm[:, p0:p1] = np.einsum("xpmn,mn->xpm", n3, dm)
         segs = [(ia, max(q0, p0) - p0, min(q1, p1) - p0) for ia, (q0, q1) in enumerate(auxslices)
@@ -564,7 +571,7 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
                 nt[ia] += np.einsum("p,xpmn->xmn", coef[p0 + s0: p0 + s1], n3[:, s0:s1])
         for ch in kchans:
             nocc = ch.nocc
-            ch.g[:, :, p0:p1] = (n3.reshape(-1, nao) @ ch.co).reshape(3, npf, nao, nocc).transpose(2, 0, 1, 3)
+            ch.g[:, :, p0:p1] = (n3.reshape(-1, nao) @ ch.co).reshape(3, npf, nao, nocc).transpose(0, 2, 1, 3)
             if with_h1:
                 mk = np.matmul(ch.co, ch.ck[p0:p1])              # (npf, nao, nocc): C_o ck_P
                 for x in range(3):
@@ -576,6 +583,8 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
                         ch.hd[ia, x] += nx[s0:s1].reshape(-1, nao).T @ mk[s0:s1].reshape(-1, nocc)
         n3 = None
         sh0 = sh1
+    n3buf = None
+    t1 = log.timer_debug1("DF Hessian: first-derivative integrals and their contractions", *t1)
 
     # Coulomb: r_a = y_a - V_a c,  y_(A,x),P = -2 sum_{mu on A} ndm_P,mu + delta(P on A) 2 sum_mu ndm_P,mu
     tot = ndm.sum(axis=2)
@@ -610,64 +619,101 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14):
                         h[ia, x] += ch.c.T @ (f @ ch.co)
             h1.append(h)
         nt = ntot = vr = None
+    t1 = log.timer_debug1("DF Hessian: Coulomb response", *t1)
 
     # exchange
     for ch in kchans:
         nocc = ch.nocc
+        g = ch.g
         v1ck = (v1.reshape(3 * naux, naux) @ ch.ck.reshape(naux, -1)).reshape(3, naux, nocc, nocc)
         if with_h1:
             # sum_P (C^T dB_P C_o) ck_P = C^T [-E_A gam - hb_A + gam_A + hd_A],  gam_A = sum_{P on A} g_P ck_P
-            gam = np.zeros((natm, nao, 3, nocc))
+            gam = np.zeros((natm, 3, nao, nocc))
             for ia, (q0, q1) in enumerate(auxslices):
                 if q1 > q0:
-                    gam[ia] = (ch.g[:, :, q0:q1].reshape(3 * nao, -1) @ ch.ck[q0:q1].reshape(-1, nocc)).reshape(nao, 3, nocc)
+                    ckq = ch.ck[q0:q1].reshape(-1, nocc)
+                    for x in range(3):
+                        gam[ia, x] = g[x][:, q0:q1].reshape(nao, -1) @ ckq
             gtot = gam.sum(axis=0)
             hk = np.empty((natm, 3, nmo, nocc))
             for ia, (a0, a1) in enumerate(aoslices):
                 for x in range(3):
-                    t = gam[ia][:, x] + ch.hd[ia, x] - ch.hb[ia, x]
-                    t[a0:a1] -= gtot[a0:a1, x]
+                    t = gam[ia, x] + ch.hd[ia, x] - ch.hb[ia, x]
+                    t[a0:a1] -= gtot[x, a0:a1]
                     hk[ia, x] = ch.c.T @ t
             gam = gtot = None
             ch.hb = ch.hd = None
-        # rK_a,P[i, j] in blocks of rows i: -(Z_A,P + Z_A,P^T) + delta(P on A) (Z_P + Z_P^T) - (V_a ck)_P,
-        # Z_A,P = C_o[A]^T g_P[A],  -(V_a ck)_P = delta(P on A) (V1 ck)_P + sum_{Q on A} V1_QP ck_Q
-        rowb = max(1, min(nocc, int(budget / 2 / (naux * nocc * (3 * natm + 6)))))
+            t1 = log.timer_debug1("DF Hessian: exchange Fock derivatives (integral part)", *t1)
+        # rK_a,P[i, j] for a = (A, x), in blocks of rows i, each a contiguous (P, i, j) slab:
+        # -(Z_A,P + Z_A,P^T) + delta(P on A) (Z_P + Z_P^T) - (V_a ck)_P with Z_A,P = C_o[A]^T g_P[A]
+        # and -(V_a ck)_P = delta(P on A) (V1 ck)_P + sum_{Q on A} V1_QP ck_Q
+        # blocks of rows: the response vectors of a block (and their whitened copy) within 1/4 of the
+        # budget and 256 MB each
+        rowb = max(1, min(nocc, int(min(budget / 4, 32e6) / (naux * nocc * (3 * natm + 4)))))
         gram = np.zeros((3 * natm, 3 * natm))
-        hr = np.zeros((nmo, nocc, natm, 3)) if with_h1 else None
+        hr = np.zeros((3 * natm, nmo, nocc)) if with_h1 else None
+        # L^-1 C^T B C_o (nmo, naux', nocc): sum_P lmo_P (V^-1 r)_P = sum_Q (L^-1 lmo)_Q (L^-1 r)_Q
+        lt = np.ascontiguousarray(metric.whiten(ch.lmo.copy()).transpose(1, 0, 2)) if with_h1 else None
+        rkbuf = np.empty(3 * natm * naux * rowb * nocc)
+        rtbuf = np.empty(3 * natm * naux * rowb * nocc)
+        tmpbuf = np.empty(naux * rowb * nocc)
+        zbuf = np.empty(3 * naux * rowb * nocc)
         for i0 in range(0, nocc, rowb):
             i1 = min(nocc, i0 + rowb)
             nb = i1 - i0
-            rk = np.empty((naux, nb, nocc, natm, 3))
-            zall = np.zeros((naux, nb, nocc, 3))
+            # rk[P, A, x, i, j]: the auxiliary index outermost, so that L^-1 is one triangular solve
+            rk = rkbuf[: 3 * natm * naux * nb * nocc].reshape(naux, natm, 3, nb, nocc)
+            tmp = tmpbuf[: naux * nb * nocc].reshape(naux * nb, nocc)
+            # Z_P + Z_P^T (all atoms) for the delta(P on A) term
+            zall = zbuf[: 3 * naux * nb * nocc].reshape(3, naux, nb, nocc)
+            cot = np.ascontiguousarray(ch.co[:, i0:i1].T)
+            for x in range(3):
+                z1 = (cot @ g[x].reshape(nao, -1)).reshape(nb, naux, nocc)
+                np.matmul(np.ascontiguousarray(g[x][:, :, i0:i1]).reshape(nao, -1).T, ch.co, out=tmp)
+                np.add(z1.transpose(1, 0, 2), tmp.reshape(naux, nb, nocc), out=zall[x])
             for ia, (a0, a1) in enumerate(aoslices):
                 if a1 == a0:
-                    rk[:, :, :, ia] = 0.0
+                    rk[:, ia] = 0.0
                     continue
-                ca = ch.co[a0:a1]
-                ga = ch.g[a0:a1]
-                z1 = (ca[:, i0:i1].T @ ga.reshape(a1 - a0, -1)).reshape(nb, 3, naux, nocc)
-                z2 = (ga[..., i0:i1].reshape(a1 - a0, -1).T @ ca).reshape(3, naux, nb, nocc)
-                zz = z1.transpose(2, 0, 3, 1) + z2.transpose(1, 2, 3, 0)
-                rk[:, :, :, ia] = -zz
-                zall += zz
+                ca = -ch.co[a0:a1]
+                cat = np.ascontiguousarray(ca[:, i0:i1].T)
+                for x in range(3):
+                    ga = g[x, a0:a1]                                                     # (nA, naux, nocc)
+                    z1 = (cat @ ga.reshape(a1 - a0, -1)).reshape(nb, naux, nocc)         # -Z_A,P[i, j] at (i, P)
+                    gb = ga if nb == nocc else np.ascontiguousarray(ga[:, :, i0:i1])
+                    np.matmul(gb.reshape(a1 - a0, -1).T, ca, out=tmp)                    # -Z_A,P[j, i] at (P, i)
+                    np.add(z1.transpose(1, 0, 2), tmp.reshape(naux, nb, nocc), out=rk[:, ia, x])
+            z1 = None
             for ia, (q0, q1) in enumerate(auxslices):
                 if q1 == q0:
                     continue
-                rk[q0:q1, :, :, ia] += zall[q0:q1] + v1ck[:, q0:q1, i0:i1].transpose(1, 2, 3, 0)
                 cq = ch.ck[q0:q1, i0:i1].reshape(q1 - q0, -1)
                 for x in range(3):
-                    rk[:, :, :, ia, x] += (v1[x, q0:q1].T @ cq).reshape(naux, nb, nocc)
-            zall = None
-            if with_h1:
-                hr += np.tensordot(ch.ltil[:, :, i0:i1], rk, axes=([0, 2], [0, 1]))
-            rt = metric.whiten(rk).reshape(-1, 3 * natm)
+                    r = rk[:, ia, x]
+                    r[q0:q1] += zall[x, q0:q1]
+                    r[q0:q1] += v1ck[x, q0:q1, i0:i1]
+                    r += (v1[x, q0:q1].T @ cq).reshape(naux, nb, nocc)
+            tmp = cot = zall = None
+            rt = metric.whiten(rk.reshape(naux, -1)).reshape(-1, 3 * natm, nb * nocc)
             rk = None
-            gram += rt.T @ rt
+            nw = rt.shape[0]
+            rtt = rtbuf[: 3 * natm * nw * nb * nocc].reshape(3 * natm, nw, nb * nocc)
+            rtt[:] = rt.transpose(1, 0, 2)
             rt = None
+            r2 = rtt.reshape(3 * natm, -1)
+            gram += r2 @ r2.T
+            if with_h1:
+                ltb = lt[:, :, i0:i1].reshape(nmo, -1)
+                for a in range(3 * natm):
+                    hr[a] += ltb @ rtt[a].reshape(-1, nocc)
+                ltb = None
+            rtt = r2 = None
+        rtbuf = None
+        rkbuf = tmpbuf = zbuf = lt = None
         de2 -= kappa * gram.reshape(natm, 3, natm, 3).transpose(0, 2, 1, 3)
+        t1 = log.timer_debug1("DF Hessian: exchange response", *t1)
         if with_h1:
-            hk += hr.transpose(2, 3, 0, 1)
+            hk += hr.reshape(natm, 3, nmo, nocc)
             h1[chans.index(ch)] -= hyb * hk
         ch.g = None
     return de2, h1
