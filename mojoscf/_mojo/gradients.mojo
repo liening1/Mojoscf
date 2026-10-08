@@ -641,7 +641,10 @@ def grad2c_core(var aux: Basis, var boys: BoysTable, wmat: F64Ptr, natm: Int, de
     _ = boys^
 
 
-def int3c2e_ip1_core(var basis: Basis, var aux: Basis, var boys: BoysTable, ps0: Int, ps1: Int, tol: Float64, dst: F64Ptr):
+def int3c2e_ip1_core(
+    var basis: Basis, var aux: Basis, var boys: BoysTable, ps0: Int, ps1: Int, tol: Float64, dst: F64Ptr,
+    omega: Float64 = 0.0,
+):
     """dst[x][P - p0][mu][nu] = (nabla_x mu nu|P) for the auxiliary shells [ps0, ps1) (3 x np x nao x nao).
 
     pyscf's ``int3c2e_ip1`` as full matrices (nabla on the first function, the
@@ -649,6 +652,7 @@ def int3c2e_ip1_core(var basis: Basis, var aux: Basis, var boys: BoysTable, ps0:
     shell pair a >= b gives both (nabla mu nu|P) and (mu nabla nu|P) =
     (nabla nu mu|P).  Triples with q'_ab q_P < tol are left at zero (``dst``
     must be zeroed by the caller).  Parallel over the auxiliary shells.
+    ``omega`` > 0: the long-range operator erf(omega r) / r (as ``grad_df3c_core``).
     """
     var nbas = basis.nbas
     var nao = basis.nao
@@ -665,6 +669,8 @@ def int3c2e_ip1_core(var basis: Basis, var aux: Basis, var boys: BoysTable, ps0:
     var q2 = schwarz_bounds(boys, tab2, ht)
     var atab = aux_table(aux, ht)
     var qa = schwarz_bounds(boys, atab, ht)
+    if omega > 0.0:
+        attenuate(atab, omega)
     var pq2 = list_ptr(q2)
     var pqa = list_ptr(qa)
     var p0 = aux.ao_loc[ps0]
@@ -784,6 +790,7 @@ def df3c_hess_contract(
 def hess_df3c_core(
     blas_seq: Blas, var basis: Basis, var aux: Basis, var boys: BoysTable, coef: F64Ptr, dpack: F64Ptr,
     jfac: Float64, kfac: Float64, nset: Int, m: Int, xs: F64Ptr, cns: F64Ptr, blk: Int, tol: Float64, hess: F64Ptr,
+    omega: Float64 = 0.0,
 ) raises:
     """hess[A][B][x][y] = d^2/dR_Ax dR_By sum_{P, mu nu} (mu nu|P) Gamma_P,mu nu at fixed Gamma (natm x natm x 3 x 3,
     overwritten): the second-derivative integral term of the DF Hessian.
@@ -792,7 +799,7 @@ def hess_df3c_core(
     per block of auxiliary functions by worker threads); each auxiliary shell is a
     task over all AO shell pairs a >= b with the 21-component second-derivative
     pair table (``fill_pair`` nderiv 3), the auxiliary centre's derivatives from
-    translational invariance (weight 2 for a != b).
+    translational invariance (weight 2 for a != b).  ``omega`` > 0: the long-range operator.
     """
     var nbas = basis.nbas
     var natm = basis.natm
@@ -812,6 +819,8 @@ def hess_df3c_core(
     var q2 = schwarz_bounds(boys, tab2, ht)
     var atab = aux_table(aux, ht)
     var qa = schwarz_bounds(boys, atab, ht)
+    if omega > 0.0:
+        attenuate(atab, omega)
     var nthreads = max(1, parallelism_level())
     var nwork = 2 * nthreads
     var per = natm * natm * 9

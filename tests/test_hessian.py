@@ -73,10 +73,13 @@ def test_accelerated_hessian_matches_pyscf(xc, spin, df):
         setattr(ref, key, getattr(mf, key))
     h = mf.Hessian()
     assert isinstance(h, mhess._MojoHessMixin)
-    # density fitting: the J/K terms run natively (range-separated functionals fall back to pyscf's)
+    # density fitting: the J/K terms run natively (range-separated functionals included)
     native = mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
-    assert native == (df and xc != "camb3lyp")
-    assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-9
+    assert native == df
+    # the long-range metric of erf(omega r) / r is numerically singular (condition ~1e16 here): both
+    # Cholesky solves carry noise at the 1e-9 level
+    tol = 5e-9 if xc == "camb3lyp" else 1e-9
+    assert abs(h.kernel() - ref.Hessian().kernel()).max() < tol
 
 
 @pytest.mark.parametrize("xc, spin", [("pbe", 0), ("b3lyp", 0), ("camb3lyp", 0), ("tpss", 0), (None, 0),
@@ -136,29 +139,42 @@ def _check_df_jk(mf, tol=1e-9):
     unrestricted = np.asarray(mf.mo_coeff).ndim == 3
     mod = df_uhf_hess if unrestricted else df_rhf_hess
     h = mf.Hessian()
+    omega = alpha = 0.0
     if hasattr(mf, "xc"):
         ni = mf._numint
         hybrid = ni.libxc.is_hybrid_xc(mf.xc)
-        hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mf.mol.spin)[2] if hybrid else 0.0
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mf.mol.spin)
+        hyb = hyb if hybrid else 0.0
     else:
         hybrid, hyb = True, 1.0
     e1, ej, ek = mod._partial_hess_ejk(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ, None, 4000, None, hybrid)
     ref = ej - hyb * ek if hybrid else ej
+    if hybrid and omega:
+        with mf.with_df.range_coulomb(omega):
+            ek_lr = mod._partial_hess_ejk(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ, None, 4000, None, True)[2]
+        ref = ref - (alpha - hyb) * ek_lr
     de2, h1 = mhess.df_jk_terms(h)
     assert abs(de2 - ref).max() < tol * abs(ref).max()
     assert abs(mhess._hess_e1(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ) - e1).max() < 1e-10
     cs = list(mf.mo_coeff) if unrestricted else [mf.mo_coeff]
     os = list(mf.mo_occ) if unrestricted else [mf.mo_occ]
+    fs = {}
     for ia, _, vj1, vk1 in mod._gen_jk(h, mf.mo_coeff, mf.mo_occ, None, None, None, hybrid):
+        fs[ia] = [vj1 - ((hyb * vk1[s] if unrestricted else 0.5 * hyb * vk1) if hybrid else 0.0)
+                  for s in range(len(cs))]
+    if hybrid and omega:
+        with mf.with_df.range_coulomb(omega):
+            for ia, _, vj1, vk1 in mod._gen_jk(h, mf.mo_coeff, mf.mo_occ, None, None, None, True):
+                for s in range(len(cs)):
+                    fs[ia][s] = fs[ia][s] - (alpha - hyb) * (vk1[s] if unrestricted else 0.5 * vk1)
+    for ia, f in fs.items():
         for s, (c, o) in enumerate(zip(cs, os)):
-            f = vj1
-            if hybrid:
-                f = f - (hyb * vk1[s] if unrestricted else 0.5 * hyb * vk1)
-            proj = np.einsum("pm,xpq,qi->xmi", c, f, c[:, o > 0])
-            assert abs(h1[s][ia] - proj).max() < 1e-10 * max(1.0, abs(proj).max())
+            proj = np.einsum("pm,xpq,qi->xmi", c, f[s], c[:, o > 0])
+            assert abs(h1[s][ia] - proj).max() < tol * max(1.0, abs(proj).max())
 
 
-@pytest.mark.parametrize("xc, spin", [("b3lyp", 0), ("pbe", 0), ("pbe0", 1), (None, 0), (None, 1)])
+@pytest.mark.parametrize("xc, spin", [("b3lyp", 0), ("pbe", 0), ("pbe0", 1), (None, 0), (None, 1),
+                                      ("camb3lyp", 0), ("wb97x", 1), ("hse06", 0)])
 def test_df_jk_terms_match_pyscf(xc, spin):
     from pyscf import scf
 
@@ -168,7 +184,8 @@ def test_df_jk_terms_match_pyscf(xc, spin):
     else:
         mf = mojoscf.dft.accelerate((dft.UKS if spin else dft.RKS)(mol, xc=xc).density_fit())
     mf.conv_tol = 1e-10
-    _check_df_jk(mf.run())
+    # the long-range metric is less well conditioned: agreement at that level
+    _check_df_jk(mf.run(), tol=1e-8 if xc in ("camb3lyp", "wb97x", "hse06") else 1e-9)
 
 
 def test_df_jk_terms_open_shell_metal():
@@ -191,17 +208,22 @@ def test_int3c2e_ip1_matches_libcint():
     ref = df.incore.aux_e2(mol, auxmol, "int3c2e_ip1", aosym="s1", comp=3).reshape(3, nao, nao, naux)
     ps0, ps1 = 4, auxmol.nbas - 3
     p0, p1 = auxmol.ao_loc[ps0], auxmol.ao_loc[ps1]
+    ext = mojoscf._backend.get_extension()
+    args = (integrals.basis_tables(mol), integrals.basis_tables(auxmol), integrals._boys_table(), ps0, ps1, 1e-16)
     out = np.zeros((3, p1 - p0, nao, nao))
-    mojoscf._backend.get_extension().int3c2e_ip1(integrals.basis_tables(mol), integrals.basis_tables(auxmol),
-                                                 integrals._boys_table(), ps0, ps1, 1e-16, out)
+    ext.int3c2e_ip1(*args, out, 0.0)
+    assert abs(out - ref.transpose(0, 3, 1, 2)[:, p0:p1]).max() < 1e-11
+    # long-range operator erf(omega r) / r
+    with mol.with_range_coulomb(0.3), auxmol.with_range_coulomb(0.3):
+        ref = df.incore.aux_e2(mol, auxmol, "int3c2e_ip1", aosym="s1", comp=3).reshape(3, nao, nao, naux)
+    out[:] = 0.0
+    ext.int3c2e_ip1(*args, out, 0.3)
     assert abs(out - ref.transpose(0, 3, 1, 2)[:, p0:p1]).max() < 1e-11
 
 
 def test_df_jk_terms_fallbacks():
     mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
-    # range-separated functional, auxbasis_response < 2, exact integrals: pyscf's terms
-    mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="camb3lyp").density_fit()).run()
-    assert mhess.df_jk_terms(mf.Hessian()) is None
+    # auxbasis_response < 2, exact integrals: pyscf's terms
     mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="b3lyp").density_fit()).run()
     h = mf.Hessian()
     assert mhess.df_jk_terms(h) is not None

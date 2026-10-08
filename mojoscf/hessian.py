@@ -359,12 +359,10 @@ def _df_jk_reason(hessobj, mo_coeff, mo_occ):
             return "solvent models"
     except ImportError:  # pragma: no cover
         pass
-    if isinstance(mf, hf.KohnShamDFT):
-        if mf.do_nlc():
-            return "NLC functionals"
-        omega = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)[0]
-        if omega != 0:
-            return "range-separated functionals"
+    if isinstance(mf, hf.KohnShamDFT) and mf.do_nlc():
+        return "NLC functionals"
+    if _hess_exchange_terms(mf) is None:
+        return "short-range operator (omega < 0)"
     if getattr(mol, "omega", 0) or getattr(mf.with_df, "omega", None):
         return "range-separated Coulomb operator"
     reason = integrals.unsupported_reason(mol, two_electron=True)
@@ -395,17 +393,41 @@ class _KChannel:
         self.hd = None        # (natm, 3, nao, nocc): sum_{P on A} N_P^T C_o ck_P
 
 
+def _hess_exchange_terms(mf):
+    """[(coefficient, omega)] of the exact exchange in the energy (pyscf's DF Hessian), or None.
+
+    hyb with the full-range operator and alpha - hyb with erf(omega r) / r
+    (range-separated hybrids, short-range ones included as full minus
+    long-range, as pyscf's ``partial_hess_elec`` and ``make_h1`` form them);
+    None for omega < 0.
+    """
+    from pyscf.scf import hf
+
+    if not isinstance(mf, hf.KohnShamDFT):
+        return [(1.0, 0.0)]
+    ni = mf._numint
+    if not ni.libxc.is_hybrid_xc(mf.xc):
+        return []
+    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mf.mol.spin)
+    if omega < 0:
+        return None
+    terms = [(hyb, 0.0)] if hyb != 0 else []
+    if omega > 0 and alpha - hyb != 0:
+        terms.append((alpha - hyb, omega))
+    return terms
+
+
 def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, verbose=None):
     """Coulomb and exchange terms of a density-fitted RKS/UKS (or RHF/UHF) Hessian, or None.
 
     Returns ``(de2, h1)``: ``de2`` (natm, natm, 3, 3) the J/K part of pyscf's
-    ``partial_hess_elec`` (``ej - hyb ek`` with the full auxiliary-basis
-    response, ``auxbasis_response = 2``), and ``h1`` (``with_h1``) per spin the
-    J/K part of ``make_h1`` projected to the MO basis, C^T F^(A,x) C_o as
-    (natm, 3, nmo, nocc_s) (MOs in their original order, occupied ones as in
-    ``mo_occ > 0``).  None (pyscf's code runs) for the cases
-    :func:`_df_jk_reason` names and when the intermediates do not fit in
-    ``max_memory``.
+    ``partial_hess_elec`` (``ej - hyb ek - (alpha - hyb) ek_lr`` with the full
+    auxiliary-basis response, ``auxbasis_response = 2``), and ``h1``
+    (``with_h1``) per spin the J/K part of ``make_h1`` projected to the MO
+    basis, C^T F^(A,x) C_o as (natm, 3, nmo, nocc_s) (MOs in their original
+    order, occupied ones as in ``mo_occ > 0``).  None (pyscf's code runs) for
+    the cases :func:`_df_jk_reason` names and when the intermediates do not
+    fit in ``max_memory``.
 
     With B_P = (mu nu|P), V = (P|Q), c = V^-1 (B . D) and, per spin, the
     fitted occupied products c_P = V^-1 C_o^T B C_o, the DF energy
@@ -427,15 +449,13 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
     invariance.  The exchange vectors rK are then built from N C_o in blocks
     of occupied orbitals, whitened with the Cholesky factor of V and
     contracted (the Hessian term) and contracted with V^-1 C^T B C_o (the
-    Fock derivative), never as nao x nao matrices per atom.
+    Fock derivative), never as nao x nao matrices per atom.  The long-range
+    exchange of range-separated hybrids is a second pass of the same with
+    every integral (three-centre, metric and their derivatives) of
+    erf(omega r) / r, as pyscf's ``with_df.range_coulomb(omega)``.
     """
-    from pyscf import lib
     from pyscf.df import addons as df_addons
-    from pyscf.df.grad.rhf import LINEAR_DEP_THRESHOLD
     from pyscf.lib import logger
-    from pyscf.scf import hf
-
-    from . import kernels
 
     mf = hessobj.base
     mol = hessobj.mol
@@ -445,6 +465,7 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
         mo_occ = mf.mo_occ
     if _df_jk_reason(hessobj, mo_coeff, mo_occ) is not None:
         return None
+    terms = _hess_exchange_terms(mf)
     with_df = mf.with_df
     auxmol = with_df.auxmol
     if auxmol is None:
@@ -454,13 +475,38 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
     unrestricted = np.asarray(mo_coeff).ndim == 3
     cs = [np.asarray(c, dtype=np.float64) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff, np.float64)]
     occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
-    hyb = 1.0
-    if isinstance(mf, hf.KohnShamDFT):
-        ni = mf._numint
-        hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=mol.spin)[2] if ni.libxc.is_hybrid_xc(mf.xc) else 0.0
-    kappa = hyb * (1.0 if unrestricted else 2.0)
+    log = logger.new_logger(hessobj, verbose)
+    full = sum(c for c, omega in terms if omega == 0)
+    res = _df_jk_pass(hessobj, auxmol, cs, occs, True, full, 0.0, with_h1, tol, log)
+    if res is None:
+        return None
+    de2, h1 = res
+    for c, omega in terms:
+        if omega > 0:
+            res = _df_jk_pass(hessobj, auxmol, cs, occs, False, c, omega, with_h1, tol, log)
+            if res is None:
+                return None
+            de2 += res[0]
+            if with_h1:
+                for h, d in zip(h1, res[1]):
+                    h += d
+    return de2, h1
+
+
+def _df_jk_pass(hessobj, auxmol, cs, occs, with_j, kcoef, omega, with_h1, tol, log):
+    """One operator of :func:`df_jk_terms`: Coulomb (``with_j``) and exchange with coefficient ``kcoef``
+    (``omega`` > 0: every integral of erf(omega r) / r); (de2, h1) or None if it does not fit in memory."""
+    from pyscf import lib
+    from pyscf.df.grad.rhf import LINEAR_DEP_THRESHOLD
+    from pyscf.lib import logger
+
+    from . import kernels
+
+    mol = hessobj.mol
+    unrestricted = len(cs) == 2
+    kappa = kcoef * (1.0 if unrestricted else 2.0)
     chans = [_KChannel(c, o) for c, o in zip(cs, occs)]
-    kchans = [ch for ch in chans if ch.nocc > 0] if hyb != 0 else []
+    kchans = [ch for ch in chans if ch.nocc > 0] if kcoef != 0 else []
     nao, natm, naux = mol.nao_nr(), mol.natm, auxmol.nao_nr()
     npair = nao * (nao + 1) // 2
     nmo = cs[0].shape[1]
@@ -477,7 +523,6 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
         return None
     budget = max(200.0, 0.7 * free - words * 8e-6) * 1e6 / 8      # words for the blocks
 
-    log = logger.new_logger(hessobj, verbose)
     t1 = (logger.process_clock(), logger.perf_counter())
     ext = get_extension()
     boys = integrals._boys_table()
@@ -488,14 +533,16 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
     auxslices = [tuple(int(v) for v in s[2:]) for s in auxmol.aoslice_by_atom()]
 
     # fitted densities and the three-centre integrals in the MO basis
-    j3c = integrals.int3c2e(mol, auxmol)
-    metric = _Metric(integrals.int2c2e(auxmol), LINEAR_DEP_THRESHOLD)
-    dm_tril = lib.pack_tril(dm + dm.T)
-    diag = np.arange(nao)
-    dm_tril[diag * (diag + 1) // 2 + diag] *= 0.5
-    coef = metric.solve((j3c @ dm_tril)[:, None])[:, 0]
+    j3c = integrals.int3c2e(mol, auxmol, omega)
+    metric = _Metric(integrals.int2c2e(auxmol, omega), LINEAR_DEP_THRESHOLD)
+    coef = np.zeros(naux)
+    if with_j:
+        dm_tril = lib.pack_tril(dm + dm.T)
+        diag = np.arange(nao)
+        dm_tril[diag * (diag + 1) // 2 + diag] *= 0.5
+        coef = metric.solve((j3c @ dm_tril)[:, None])[:, 0]
     for ch in chans:
-        if (with_h1 or ch in kchans) and ch.nocc:
+        if ch.nocc and (ch in kchans or (with_h1 and with_j)):
             lmo = kernels.df_mo(j3c, ch.c, ch.co)
             if ch in kchans:
                 ch.ck = metric.solve(np.ascontiguousarray(lmo[:, ch.occ > 0]))
@@ -516,8 +563,9 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
         xs[s] = lib.pack_tril(pad)
     pad = None
     blk = max(1, min(naux, int(budget / 2 / npair)))
-    ext.hess_df3c(tables, aux_tables, boys, np.ascontiguousarray(coef), np.ascontiguousarray(lib.pack_tril(dm)), 1.0,
-                  float(kappa), xs, cns, blk, float(tol), de2, seq_path, seq_prefix)
+    ext.hess_df3c(tables, aux_tables, boys, np.ascontiguousarray(coef), np.ascontiguousarray(lib.pack_tril(dm)),
+                  1.0 if with_j else 0.0, float(kappa), xs, cns, blk, float(tol), de2, seq_path, seq_prefix,
+                  float(omega))
     cns = xs = None
     t1 = log.timer_debug1("DF Hessian: second-derivative three-centre term", *t1)
 
@@ -529,7 +577,8 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
     onehot = np.zeros((naux, natm))
     for ia, (q0, q1) in enumerate(auxslices):
         onehot[q0:q1, ia] = 1.0
-    wv = auxmol.intor("int2c2e_ipip1", comp=9).reshape(9, naux, naux)
+    with auxmol.with_range_coulomb(omega):
+        wv = auxmol.intor("int2c2e_ipip1", comp=9).reshape(9, naux, naux)
     wv *= w
     w = None
     cab = (onehot.T @ wv @ onehot).reshape(3, 3, natm, natm).transpose(2, 3, 0, 1)
@@ -540,9 +589,10 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
     t1 = log.timer_debug1("DF Hessian: second-derivative two-centre term", *t1)
 
     # first-derivative integrals, block by block of auxiliary shells
-    v1 = auxmol.intor("int2c2e_ip1", comp=3)                     # (nabla P|Q)
-    ndm = np.empty((3, naux, nao))                               # sum_nu N_P,mu nu D_mu nu
-    nt = np.zeros((natm, 3, nao, nao)) if with_h1 else None      # sum_{P on A} c_P N_P
+    with auxmol.with_range_coulomb(omega):
+        v1 = auxmol.intor("int2c2e_ip1", comp=3)                 # (nabla P|Q)
+    ndm = np.empty((3, naux, nao)) if with_j else None           # sum_nu N_P,mu nu D_mu nu
+    nt = np.zeros((natm, 3, nao, nao)) if with_h1 and with_j else None   # sum_{P on A} c_P N_P
     for ch in kchans:
         ch.g = np.empty((3, nao, naux, ch.nocc))
         if with_h1:
@@ -562,11 +612,12 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
         npf = p1 - p0
         n3 = n3buf[: 3 * npf * nao * nao].reshape(3, npf, nao, nao)
         n3[:] = 0.0
-        ext.int3c2e_ip1(tables, aux_tables, boys, sh0, sh1, float(tol), n3)
-        ndm[:, p0:p1] = np.einsum("xpmn,mn->xpm", n3, dm)
+        ext.int3c2e_ip1(tables, aux_tables, boys, sh0, sh1, float(tol), n3, float(omega))
+        if with_j:
+            ndm[:, p0:p1] = np.einsum("xpmn,mn->xpm", n3, dm)
         segs = [(ia, max(q0, p0) - p0, min(q1, p1) - p0) for ia, (q0, q1) in enumerate(auxslices)
                 if max(q0, p0) < min(q1, p1)]
-        if with_h1:
+        if with_h1 and with_j:
             for ia, s0, s1 in segs:
                 nt[ia] += np.einsum("p,xpmn->xmn", coef[p0 + s0: p0 + s1], n3[:, s0:s1])
         for ch in kchans:
@@ -586,40 +637,38 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
     n3buf = None
     t1 = log.timer_debug1("DF Hessian: first-derivative integrals and their contractions", *t1)
 
-    # Coulomb: r_a = y_a - V_a c,  y_(A,x),P = -2 sum_{mu on A} ndm_P,mu + delta(P on A) 2 sum_mu ndm_P,mu
-    tot = ndm.sum(axis=2)
-    v1c = v1 @ coef
-    rj = np.empty((natm, 3, naux))
-    for ia, (a0, a1) in enumerate(aoslices):
-        q0, q1 = auxslices[ia]
-        r = -2.0 * ndm[:, :, a0:a1].sum(axis=2)
-        r[:, q0:q1] += 2.0 * tot[:, q0:q1] + v1c[:, q0:q1]
-        r += np.einsum("xqp,q->xp", v1[:, q0:q1], coef[q0:q1])
-        rj[ia] = r
-    ndm = None
-    rj = np.ascontiguousarray(rj.reshape(3 * natm, naux).T)          # (naux, 3 natm)
-    vr = metric.solve(rj.copy()) if with_h1 else None
-    rt = metric.whiten(rj)
-    de2 += (rt.T @ rt).reshape(natm, 3, natm, 3).transpose(0, 2, 1, 3)
-    rj = rt = None
+    h1 = [np.zeros((natm, 3, nmo, ch.nocc)) for ch in chans] if with_h1 else None
+    if with_j:
+        # Coulomb: r_a = y_a - V_a c,  y_(A,x),P = -2 sum_{mu on A} ndm_P,mu + delta(P on A) 2 sum_mu ndm_P,mu
+        tot = ndm.sum(axis=2)
+        v1c = v1 @ coef
+        rj = np.empty((natm, 3, naux))
+        for ia, (a0, a1) in enumerate(aoslices):
+            q0, q1 = auxslices[ia]
+            r = -2.0 * ndm[:, :, a0:a1].sum(axis=2)
+            r[:, q0:q1] += 2.0 * tot[:, q0:q1] + v1c[:, q0:q1]
+            r += np.einsum("xqp,q->xp", v1[:, q0:q1], coef[q0:q1])
+            rj[ia] = r
+        ndm = None
+        rj = np.ascontiguousarray(rj.reshape(3 * natm, naux).T)          # (naux, 3 natm)
+        vr = metric.solve(rj.copy()) if with_h1 else None
+        rt = metric.whiten(rj)
+        de2 += (rt.T @ rt).reshape(natm, 3, natm, 3).transpose(0, 2, 1, 3)
+        rj = rt = None
 
-    h1 = None
-    if with_h1:
-        h1 = []
-        ntot = nt.sum(axis=0)
-        for ch in chans:
-            h = np.zeros((natm, 3, nmo, ch.nocc))
-            if ch.nocc:
-                h += (ch.lmo.reshape(naux, -1).T @ vr).reshape(nmo, ch.nocc, natm, 3).transpose(2, 3, 0, 1)
-                for ia, (a0, a1) in enumerate(aoslices):
-                    for x in range(3):
-                        f = nt[ia, x] + nt[ia, x].T
-                        f[a0:a1] -= ntot[x, a0:a1]
-                        f[:, a0:a1] -= ntot[x, a0:a1].T
-                        h[ia, x] += ch.c.T @ (f @ ch.co)
-            h1.append(h)
-        nt = ntot = vr = None
-    t1 = log.timer_debug1("DF Hessian: Coulomb response", *t1)
+        if with_h1:
+            ntot = nt.sum(axis=0)
+            for ch, h in zip(chans, h1):
+                if ch.nocc:
+                    h += (ch.lmo.reshape(naux, -1).T @ vr).reshape(nmo, ch.nocc, natm, 3).transpose(2, 3, 0, 1)
+                    for ia, (a0, a1) in enumerate(aoslices):
+                        for x in range(3):
+                            f = nt[ia, x] + nt[ia, x].T
+                            f[a0:a1] -= ntot[x, a0:a1]
+                            f[:, a0:a1] -= ntot[x, a0:a1].T
+                            h[ia, x] += ch.c.T @ (f @ ch.co)
+            nt = ntot = vr = None
+        t1 = log.timer_debug1("DF Hessian: Coulomb response", *t1)
 
     # exchange
     for ch in kchans:
@@ -714,7 +763,7 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
         t1 = log.timer_debug1("DF Hessian: exchange response", *t1)
         if with_h1:
             hk += hr.reshape(natm, 3, nmo, nocc)
-            h1[chans.index(ch)] -= hyb * hk
+            h1[chans.index(ch)] -= kcoef * hk
         ch.g = None
     return de2, h1
 
