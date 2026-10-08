@@ -231,3 +231,42 @@ def test_df_jk_terms_fallbacks():
     assert mhess.df_jk_terms(h) is None
     mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="b3lyp")).run()
     assert mhess.df_jk_terms(mf.Hessian()) is None
+
+
+def test_solvent_hessian_keeps_pyscf_solvent_terms():
+    """PCM: pyscf's solvent Hessian wraps the accelerated one; its solvent terms stay in (J/K via pyscf)."""
+    mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
+
+    def make():
+        return dft.RKS(mol, xc="b3lyp").density_fit().PCM()
+
+    mf = mojoscf.dft.accelerate(make())
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    ref = make()
+    ref.conv_tol = 1e-11
+    ref.kernel()
+    h = mf.Hessian()
+    assert isinstance(h, mhess._MojoHessMixin)
+    assert mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) == "solvent models"
+    assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-7
+
+
+def test_ecp_metal_hessian_matches_pyscf():
+    """A Pd complex with def2 effective core potentials: the core-potential second derivatives are pyscf's
+    one-electron terms, the two-electron and XC terms run natively."""
+    mol = gto.M(atom="Pd 0 0 0; Cl 2.31 0 0; Cl -2.31 0 0", basis="def2-svp", ecp={"Pd": "def2-svp"}, verbose=0)
+    assert mol.has_ecp()
+
+    def make():
+        return dft.RKS(mol, xc="pbe").density_fit()
+
+    mf = mojoscf.dft.accelerate(make())
+    mf.conv_tol = 1e-10
+    mf.kernel()
+    ref = make()
+    for key in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(ref, key, getattr(mf, key))
+    h = mf.Hessian()
+    assert mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
+    assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-8

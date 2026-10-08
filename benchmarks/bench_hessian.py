@@ -8,7 +8,11 @@ the Mojo kernels) and computes the nuclear Hessian with pyscf's driver
 Reported: the Hessian time, the SCF time, the largest difference of the
 Hessian elements and of the harmonic frequencies.  Usage:
 
-    python benchmarks/bench_hessian.py [--cases a,b,...] [--list]
+    python benchmarks/bench_hessian.py [--cases a,b,...] [--list] [--cache FILE] [--drivers pyscf,mojoscf]
+
+``--cache`` keeps pyscf's results in a JSON file and reuses them (its
+Hessians of the larger systems take tens of minutes; mojoscf always runs);
+``--drivers pyscf`` only fills it.
 """
 from __future__ import annotations
 
@@ -73,17 +77,39 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", default=",".join(CASES))
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--cache", default=None)
+    ap.add_argument("--drivers", default="pyscf,mojoscf")
     args = ap.parse_args()
+    cache = {}
+    if args.cache and os.path.exists(args.cache):
+        with open(args.cache) as f:
+            cache = json.load(f)
+
+    def result(key, driver):
+        if driver != "pyscf":
+            return run(key, driver, bench_dir)
+        tag = f"{key}/{driver}"
+        if tag not in cache:
+            cache[tag] = run(key, driver, bench_dir)
+            if args.cache:
+                with open(args.cache, "w") as f:
+                    json.dump(cache, f)
+        return cache[tag]
+
     if args.list:
         print("\n".join(f"{k:12s} {v[0]}" for k, v in CASES.items()))
         return
     bench_dir = os.path.dirname(os.path.abspath(__file__))
     print(f"{'system':42s} {'nao':>4s} | {'Hess pyscf':>10s} {'mojoscf':>8s} {'x':>5s} | "
           f"{'SCF pyscf':>9s} {'mojoscf':>8s} | {'max|dH|':>8s} {'max|dfreq|':>10s}")
+    drivers = args.drivers.split(",")
     for key in args.cases.split(","):
         name = CASES[key][0]
-        ref = run(key, "pyscf", bench_dir)
-        moj = run(key, "mojoscf", bench_dir)
+        ref = result(key, "pyscf")
+        if "mojoscf" not in drivers:
+            print(f"{name:42s} {ref['nao']:4d} | {ref['thess']:10.1f}", flush=True)
+            continue
+        moj = result(key, "mojoscf")
         flag = "" if ref["conv"] and moj["conv"] else "  NOT CONVERGED"
         dh = abs(np.array(ref["hess"]) - np.array(moj["hess"])).max()
         n = min(len(ref["freq"]), len(moj["freq"]))

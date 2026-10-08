@@ -668,7 +668,8 @@ class _MojoKSHook:
     Gradients = nuc_grad_method
 
     def Hessian(self):
-        """pyscf's analytical Hessian (DF or not) with the XC terms from the Mojo kernels (:mod:`mojoscf.hessian`)."""
+        """pyscf's analytical Hessian (DF or not) with the Mojo kernels (:mod:`mojoscf.hessian`): the XC terms,
+        and for density fitting the Coulomb/exchange terms and the coupled-perturbed operator."""
         from . import hessian
 
         return hessian.accelerate(super().Hessian())

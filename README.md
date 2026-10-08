@@ -56,6 +56,12 @@ iteration then runs without touching Python or pyscf's C code at all.
   MO-basis DF tensor, the XC kernel in one fused pass): 3.3 to 6.5x faster than pyscf's
   operators for benzene, ferrocene and a Cu(II) complex, with the same
   excitation energies.
+* **Analytical Hessians** (`mojoscf.hessian`): `mf.Hessian()` of
+  accelerated objects keeps pyscf's driver and computes the XC terms, the
+  density-fitted Coulomb/exchange second derivatives and the
+  coupled-perturbed equations with Mojo kernels in the MO basis:
+  4.3 to 7.2x faster than pyscf for benzene, ferrocene and a Cu(II) complex,
+  with the same Hessians to about 1e-8.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -437,6 +443,80 @@ orbitals (`tests/test_tdscf.py`), and the excitation energies to 1e-12
 Hartree.  Exact (non-DF) integrals, `wfnsym` restrictions, solvent models,
 short-range-only hybrids and tensors that do not fit in `max_memory` run
 pyscf's operator (Kohn-Sham objects still with the Mojo XC kernels).
+
+### Analytical Hessians
+
+pyscf's Kohn-Sham Hessian (`pyscf.hessian.rks`/`uks`, with density fitting
+`pyscf.df.hessian`) spends its time in three places: the exchange-correlation
+terms (`_get_vxc_diag`, `_get_vxc_deriv2`, `_get_vxc_deriv1`: Python loops
+over grid blocks with AO values up to third derivatives and one nao x nao
+matrix per atom and direction), the density-fitted Coulomb/exchange
+second-derivative terms (`_partial_hess_ejk`, `_gen_jk`: per-atom `einsum`s
+over six kinds of libcint derivative integrals, intermediates in temporary
+HDF5 files) and the coupled-perturbed equations for the 3N perturbations
+(AO first-order densities through `get_jk` and `nr_rks_fxc` in every
+iteration).  `mojoscf.hessian`, which `mf.Hessian()` of accelerated objects
+returns (`mojoscf.hessian.accelerate(h)` for any RKS/UKS Hessian object),
+keeps pyscf's driver, nuclear term and CPHF solver and replaces the rest:
+
+* **XC partial Hessian in one pass** (`xc_hess_core`): AO values up to third
+  derivatives per block, the second-derivative term per AO row, the
+  atom-pair terms as GEMMs over the rows of each atom and the kernel term,
+  contracted with the density on the spot: no nao x nao matrices.
+* **First-order Fock matrices in the MO basis.**  Only `C^T F^(A,x) C_o`
+  enters the CPHF and the Hessian; the XC kernel part is projected inside the
+  grid pass (`xc_h1_core`) and the Coulomb/exchange part comes from the
+  density-fitting pass below, so the 3N nao x nao matrices are never formed.
+* **Coupled-perturbed equations in the MO basis** with pyscf's solver: the
+  operator uses the DF tensor transformed once to the MO basis (Coulomb
+  through `(pi|Q)`, exchange as one `nmo x nmo x (nset nocc)` GEMM per
+  auxiliary function for all perturbations, `kernels.cphf_k`) and the fused
+  XC response kernel of the TDDFT section.
+* **Density-fitted Coulomb/exchange second derivatives** (`df_jk_terms`):
+  the second-derivative three-centre integrals (21 derivative components per
+  shell pair) are contracted with the fitted densities as they are produced
+  (`hess_df3c_core`); the first-derivative integrals come in blocks of
+  auxiliary functions (`int3c2e_ip1_core`), from which the Coulomb and
+  exchange response vectors `dB_a - V_a c` are built per perturbation,
+  whitened with the Cholesky factor of the metric and contracted with BLAS,
+  the auxiliary-centre derivatives following from translational invariance.
+  Range-separated hybrids add a long-range pass with every integral of
+  erf(omega r)/r.
+
+`benchmarks/bench_hessian.py`: pyscf versus `mojoscf.dft.accelerate`, each in
+its own process, density fitting (auxiliary-basis response included, pyscf's
+default), pyscf's default grids, SCF conv_tol 1e-10, on the 4-core machine of
+the TDDFT table:
+
+| system                                      | nao | Hessian pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dH\| | max \|dfreq\| [cm^-1] |
+|---------------------------------------------|----:|-------:|------:|-----:|------:|-----:|--------:|-----:|
+| benzene / def2-SVP B3LYP                    | 114 |  124.8 |  17.4 | 7.2x |   8.2 |  2.7 | 2.0e-08 | 0.00 |
+| ferrocene / def2-SVP PBE0                   | 221 | 1129.5 | 173.5 | 6.5x | 179.6 | 39.1 | 3.1e-06 | 0.00 |
+| ferrocene / def2-SVP PBE                    | 221 |  709.0 | 121.1 | 5.9x |  50.7 | 16.8 | 5.8e-07 | 0.00 |
+| ferrocene / def2-SVP CAM-B3LYP              | 221 | 1552.8 | 225.0 | 6.9x |  90.8 | 40.2 | 1.5e-06 | 0.04 |
+| [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  118.6 |  27.8 | 4.3x |  16.6 |  4.4 | 2.3e-08 | 0.00 |
+
+max |dH| is in Eh/bohr^2.  The ferrocene Hessians differ by up to 3e-6
+because the two independently converged SCFs do (conv_tol 1e-10); on the same SCF
+solution the ferrocene PBE0 Hessians agree to 1.6e-7 (the coupled-perturbed
+equations of both are converged to pyscf's tolerance, `conv_tol_cpscf` per
+atom), and the harmonic frequencies agree to 0.04 cm^-1 or better in all
+cases.  On the same SCF
+solution the Coulomb/exchange partial Hessian terms agree with pyscf's to
+1e-11 (relative) for water and 1e-9 for an open-shell Cu(II) complex, the
+projected Fock derivatives to 1e-13 and whole Hessians to 1e-8 or better,
+also for a Pd complex with def2 effective core potentials
+(`tests/test_hessian.py`); range-separated functionals to about 1e-9 (their
+long-range metric is numerically singular).  In the ferrocene PBE0 run about 60% of mojoscf's
+time is the XC response in the CPHF iterations, which, like the other XC
+kernels, is bound by the throughput of its per-block GEMMs.
+
+Meta-GGA functionals use pyscf's XC Hessian terms next to the native
+Coulomb/exchange ones; exact (non-DF) integrals keep pyscf's Coulomb/exchange
+terms (with the native XC terms and the accelerated J/K and XC kernels inside
+pyscf's CPHF operator); PCM/SMD solvent models, NLC, `auxbasis_response < 2`
+and short-range operators with omega < 0 run pyscf's code for the
+Coulomb/exchange part (pyscf's solvent terms included).
 
 ### QM/MM
 
@@ -837,6 +917,9 @@ mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="pbe0").density_fit()).run()
 td = mf.TDA(); td.nstates = 10; td.kernel()     # also mf.TDDFT(), mf.CasidaTDDFT(), UKS
 td = mojoscf.tdscf.TDDFT(scf.RHF(mol).density_fit().run())   # TDHF of any DF RHF/UHF object
 
+# Analytical Hessians (pyscf.hessian): XC, DF Coulomb/exchange and CPHF terms from the Mojo kernels
+hess = mf.Hessian().kernel()                    # (natm, natm, 3, 3), pyscf's driver and conventions
+
 # Use the individual kernels
 from mojoscf import kernels
 dm = kernels.make_rdm1(mf.mo_coeff, mf.mo_occ)
@@ -904,6 +987,7 @@ but slow for more than a few dozen orbitals.
 | Kohn-Sham XC (`NumInt.nr_rks`/`nr_uks`, LDA/GGA/meta-GGA), with `mojoscf.dft.accelerate` | Python loop over blocks: C AO values, NumPy/C GEMMs, libxc per block | Mojo (`_mojo/numint.mojo`): two passes over the grid (densities; potential matrix) around one libxc call; screened shells per block of 128 points, SIMD AO values, per-block GEMMs; pyscf's grids and libxc |
 | Kohn-Sham gradients (`grad.rks`/`uks`, DF or not) | pyscf `get_vxc` (C AO second derivatives, NumPy contractions) + J/K derivative matrices | Mojo: XC term contracted with the density inside one pass over AO second derivatives; Coulomb/exact-exchange term from `grad2e`/`grad2e_df` |
 | XC response kernels (`cache_xc_kernel`, `nr_rks_fxc`, `nr_uks_fxc`: TDDFT, CPHF) | Python loop over blocks per density: C AO values, NumPy GEMMs and `einsum` | Mojo (`xc_fxc_core`): one fused pass, response densities, kernel contraction and potential per block; for transition densities from their occupied-virtual factors |
+| Analytical Hessians (`pyscf.hessian.rks`/`uks`, DF or not): XC second-derivative terms, first-order Fock matrices, CPHF | Python loops over grid blocks (AO values up to third derivatives, one nao x nao matrix per atom and direction), per-atom `einsum`s over libcint derivative integrals with HDF5 intermediates (DF), AO first-order densities through `get_jk` and `nr_rks_fxc` per CPHF iteration | Mojo (`xc_hess_core`, `xc_h1_core`, `hess_df3c_core`, `int3c2e_ip1_core`, `cphf_k_core`) + BLAS: XC terms contracted inside one grid pass, Fock derivatives and CPHF in the MO basis, DF second-derivative integrals contracted as produced, response vectors whitened with the metric's Cholesky factor; pyscf's driver and CPHF solver |
 | TDA/TDDFT/TDHF response (`pyscf.tdscf` `gen_vind`), DF | AO transition densities through `get_jk` (DF with non-symmetric densities: Python loop, `einsum`) and the XC kernel | Mojo (`_mojo/dfmo.mojo`, `mojoscf.tdscf`): MO-basis DF tensors once, Coulomb and exchange of all trial vectors in the occupied-virtual space (per-Q GEMMs), XC response projected in the kernel; pyscf's Davidson solvers |
 | PCM/SMD solvation (`pyscf.solvent`): potential at the surface points, surface-charge matrix, S/D matrices, gradient | C (libcint `int3c2e`, `int3c2e_ip1/ip2` with the surface fakemol) + NumPy (einsum, (3, n, n) derivative arrays, two dense solves per cycle) | Mojo (`_mojo/qmmm.mojo`, `_mojo/pcm.mojo`): density-contracted potential pass, charge-lane potential matrix, S/D and their contracted derivatives (Boys-function erf); LU factorisation of K kept per build |
 | QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly (the gradient pass with density-contracted Hermite matrices gives the QM-atom term and all charge forces at once); nucleus-charge terms NumPy as in pyscf |
@@ -935,10 +1019,11 @@ mojoscf/
   dft.py               Kohn-Sham: NumInt (XC integration), XC gradient, accelerate() for pyscf RKS/UKS objects
   solvent.py           PCM/SMD (pyscf.solvent) with the Mojo kernels: attach()
   tdscf.py             TDA/TDDFT/TDHF (pyscf.tdscf) with the response in the occupied-virtual space
+  hessian.py           analytical Hessians (pyscf.hessian): XC terms, DF Coulomb/exchange terms, MO-basis CPHF
   qmmm.py              QM/MM (pyscf.qmmm) hooks: MM-charge Hamiltonian and gradient terms from the engine
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
-benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py, bench_dft.py, bench_solvent.py, bench_tddft.py
+benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py, bench_dft.py, bench_solvent.py, bench_tddft.py, bench_hessian.py
 tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quartet, batched kets) in _mojo/integrals.mojo
 ```
 
@@ -990,10 +1075,11 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   the final orbitals.
 * The integral engine handles contracted Gaussians up to l = 8 (spherical or
   Cartesian); it provides the overlap, kinetic, point-charge
-  nuclear-attraction, four-index and 3-/2-centre Coulomb integrals and the
-  first derivatives needed for HF gradients (no ECP integrals, second
-  derivatives or multipoles; of the range-separated operators only the
-  long-range erf(ωr)/r three- and two-centre integrals and their first
+  nuclear-attraction, four-index and 3-/2-centre Coulomb integrals, the
+  first derivatives needed for HF gradients and the second derivatives of
+  the three-centre integrals for density-fitted Hessians (no ECP integrals,
+  other second derivatives or multipoles; of the range-separated operators
+  only the long-range erf(ωr)/r three- and two-centre integrals and their
   derivatives).  Molecules with
   ECPs or finite nuclei use it for everything but the ECP / finite-nucleus
   terms.  `unsupported_reason(mol, two_electron=..., allow_ecp=..., allow_omega=...)` says why
@@ -1003,6 +1089,15 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   hybrids), with exact or density-fitted
   (in-core `pyscf.df.DF`, auxiliary-basis response included) two-electron
   integrals.
+* Analytical Hessians: `mf.Hessian()` of accelerated RKS/UKS objects keeps
+  pyscf's driver; the XC terms are native for LDA and GGA (meta-GGA uses
+  pyscf's XC Hessian terms), the Coulomb/exchange terms and the CPHF
+  operator for density-fitted references (in-core `pyscf.df.DF`,
+  `auxbasis_response = 2`, global and range-separated hybrids).  Exact
+  integrals keep pyscf's Coulomb/exchange Hessian terms (with the native
+  XC terms and the accelerated J/K and XC kernels inside pyscf's CPHF
+  operator); NLC, solvent models and short-range operators with omega < 0
+  run pyscf's code for the parts they touch.
 * QM/MM (`pyscf.qmmm.mm_charge`, point or Gaussian MM charges) runs on the
   native loop with the MM-charge terms of the Hamiltonian and of the
   gradients (QM atoms and MM charges) from the engine, for QM shells up to
