@@ -62,7 +62,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_df_jk]("df_jk", docstring="df_jk(cderi, dms, orbs_or_None, ms_or_None, signs_or_None, vj, vk, with_j, with_k, block_mb, fact_tol, path, prefix, seq_path, seq_prefix).")
         m.def_function[py_df_mo]("df_mo", docstring="df_mo(cderi, cl, cr, out, seq_path, seq_prefix): out[Q] = cl^T E_Q cr for the packed DF tensor (naux, npair), out (naux, nl, nr).")
         m.def_function[py_df_sandwich]("df_sandwich", docstring="df_sandwich(a, x, b, nvec, alpha, r, seq_path, seq_prefix): r (m*nvec, p) += alpha sum_Q reshape(a[Q] x, (m*nvec, k2)) b[Q] for a (nq, m, k1), x (k1, nvec*k2), b (nq, k2, p).")
-        m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)), the MO-basis exchange of the orbital-Hessian response.")
+        m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r (nmo, nset, nocc) += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)) with xs (nmo, nset, nocc), the MO-basis exchange of the orbital-Hessian response.")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k): J/K from 8-fold packed ERIs.")
         m.def_function[py_factorize_density]("factorize_density", docstring="factorize_density(dm, orb_out, sign_out, rel_tol, path, prefix) -> m.")
         m.def_function[scf_kernel]("scf_kernel", docstring="Native RHF/UHF SCF driver; see mojoscf.scf.kernel.")
@@ -412,7 +412,7 @@ def py_cphf_k(
 ) raises -> PythonObject:
     var blas_seq = _blas(seq_path, seq_prefix)
     cphf_k_core(
-        blas_seq, Int(py=lfull.shape[0]), Int(py=lfull.shape[1]), Int(py=loo.shape[1]), Int(py=xs.shape[0]),
+        blas_seq, Int(py=lfull.shape[0]), Int(py=lfull.shape[1]), Int(py=loo.shape[1]), Int(py=xs.shape[1]),
         f64ptr(lfull), f64ptr(lmo), f64ptr(loo), f64ptr(xs), f64ptr(xts), Float64(py=alpha), f64ptr(r),
     )
     return PythonObject(None)

@@ -335,7 +335,9 @@ def cphf_k(lfull, lmo, loo, x, alpha=1.0, out=None):
     The projected exchange ``C^T K[C x C_o^T + C_o x^T C^T] C_o`` of first-order
     orbitals ``x`` (nset, nmo, nocc) with the occupied orbitals first:
     ``lfull`` (naux, nmo, nmo) is the DF tensor in the MO basis, ``lmo`` and
-    ``loo`` its (naux, nmo, nocc) and (naux, nocc, nocc) blocks.
+    ``loo`` its (naux, nmo, nocc) and (naux, nocc, nocc) blocks.  The kernel
+    works on the vectors laid out (nmo, nset, nocc), in chunks of sets that
+    keep its per-thread buffers within about 32 MB.
     """
     lfull, lmo, loo, x = _c(lfull), _c(lmo), _c(loo), _c(x)
     nq, nmo, _ = lfull.shape
@@ -346,9 +348,17 @@ def cphf_k(lfull, lmo, loo, x, alpha=1.0, out=None):
         out = np.zeros((nset, nmo, nocc))
     elif out.shape != (nset, nmo, nocc) or out.dtype != np.float64 or not out.flags.c_contiguous:
         raise ValueError(f"out must be a C-contiguous float64 array of shape {(nset, nmo, nocc)}")
-    xts = np.ascontiguousarray(x.transpose(0, 2, 1))
+    if nset == 0 or nocc == 0:
+        return out
     seq_path, seq_prefix = worker_blas()
-    get_extension().cphf_k(lfull, lmo, loo, x, xts, float(alpha), out, seq_path, seq_prefix)
+    chunk = max(1, int(4e6 / max(nmo * nocc, 1)))
+    for s0 in range(0, nset, chunk):
+        s1 = min(nset, s0 + chunk)
+        xs = np.ascontiguousarray(x[s0:s1].transpose(1, 0, 2))
+        xts = np.ascontiguousarray(x[s0:s1].transpose(0, 2, 1))
+        r = np.zeros((nmo, s1 - s0, nocc))
+        get_extension().cphf_k(lfull, lmo, loo, xs, xts, float(alpha), r, seq_path, seq_prefix)
+        out[s0:s1] += r.transpose(1, 0, 2)
     return out
 
 

@@ -127,16 +127,18 @@ def cphf_k_core(
         T_Q = x (oo|Q) + E_o x^T (po|Q)
 
     (L_Q = (pq|Q) over all orbitals, E_o puts a nocc x nocc block into the
-    occupied rows): per auxiliary function two GEMMs over all vectors for T
-    and one nmo x nmo x nocc GEMM per vector, half the work of the two
-    separate exchange terms.  r (nset x nmo x nocc) += alpha * sum_Q L_Q T_Q.
+    occupied rows).  The vectors are laid out (p, n, i): per auxiliary
+    function T for all of them is one GEMM (nmo nset x nocc), the x^T (po|Q)
+    blocks another, and L_Q T one nmo x nmo x (nset nocc) GEMM, half the work
+    of the two separate exchange terms and in shapes that keep the BLAS busy.
+    r (nmo x nset x nocc) += alpha * sum_Q L_Q T_Q.
     lfull: nq x nmo x nmo, lmo: nq x nmo x nocc, loo: nq x nocc x nocc,
-    xs: nset x nmo x nocc, xts: nset x nocc x nmo (the transposes).
+    xs: nmo x nset x nocc, xts: nset x nocc x nmo (the transposes).
     """
     if nq == 0 or nset == 0 or nocc == 0 or nmo == 0:
         return
     var nwork = max(1, min(parallelism_level(), nq))
-    var tsize = nset * nmo * nocc
+    var tsize = nmo * nset * nocc
     var psize = nset * nocc * nocc
     var buf = List[Float64](length=nwork * (2 * tsize + psize), fill=0.0)
     var pb = list_ptr(buf)
@@ -148,13 +150,13 @@ def cphf_k_core(
         var q = c
         while q < nq:
             try:
-                # T = x (oo|Q) for all vectors ((n, p) rows), P_n = x_n^T (po|Q)
-                blas_seq.gemm(False, False, nset * nmo, nocc, nocc, 1.0, xs, loo.unsafe_offset(q * nocc * nocc), 0.0, t)
+                # T (p, n, i) = x (oo|Q) for all vectors, P (n, j, i) = x_n^T (po|Q)
+                blas_seq.gemm(False, False, nmo * nset, nocc, nocc, 1.0, xs, loo.unsafe_offset(q * nocc * nocc), 0.0, t)
                 blas_seq.gemm(False, False, nset * nocc, nocc, nmo, 1.0, xts, lmo.unsafe_offset(q * nmo * nocc), 0.0, p)
-                for n in range(nset):
-                    vaxpy(t.unsafe_offset(n * nmo * nocc), nocc * nocc, 1.0, p.unsafe_offset(n * nocc * nocc))
-                    blas_seq.gemm(False, False, nmo, nocc, nmo, 1.0, lfull.unsafe_offset(q * nmo * nmo),
-                                  t.unsafe_offset(n * nmo * nocc), 1.0, acc.unsafe_offset(n * nmo * nocc))
+                for j in range(nocc):
+                    for n in range(nset):
+                        vaxpy(t.unsafe_offset((j * nset + n) * nocc), nocc, 1.0, p.unsafe_offset((n * nocc + j) * nocc))
+                blas_seq.gemm(False, False, nmo, nset * nocc, nmo, 1.0, lfull.unsafe_offset(q * nmo * nmo), t, 1.0, acc)
             except:
                 pass
             q += nwork
