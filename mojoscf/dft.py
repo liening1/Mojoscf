@@ -70,12 +70,12 @@ def _passes_ok(ni, mol, xc_code, dms, hermi, max_kind=2) -> bool:
 
 
 def eval_ao(mol, coords, deriv=0):
-    """AO values (deriv 0, shape (ngrid, nao)) or values and derivatives up to order deriv (1 or 2:
-    (4, ngrid, nao) or (10, ngrid, nao)), as ``mol.eval_gto``."""
-    if deriv not in (0, 1, 2):
-        raise ValueError(f"deriv {deriv}: only 0, 1 and 2")
+    """AO values (deriv 0, shape (ngrid, nao)) or values and derivatives up to order deriv (1, 2 or 3:
+    (4, ngrid, nao), (10, ngrid, nao) or (20, ngrid, nao)), as ``mol.eval_gto``."""
+    if deriv not in (0, 1, 2, 3):
+        raise ValueError(f"deriv {deriv}: only 0 to 3")
     coords = np.ascontiguousarray(coords, dtype=np.float64).reshape(-1, 3)
-    out = np.empty(((1, 4, 10)[deriv], coords.shape[0], mol.nao_nr()))
+    out = np.empty(((1, 4, 10, 20)[deriv], coords.shape[0], mol.nao_nr()))
     get_extension().eval_ao(integrals.basis_tables(mol), coords, int(deriv), out)
     return out if deriv else out[0]
 
@@ -666,6 +666,12 @@ class _MojoKSHook:
         return _mojo_grad_method(self, _MojoKSHook)
 
     Gradients = nuc_grad_method
+
+    def Hessian(self):
+        """pyscf's analytical Hessian (DF or not) with the XC terms from the Mojo kernels (:mod:`mojoscf.hessian`)."""
+        from . import hessian
+
+        return hessian.accelerate(super().Hessian())
 
     def TDA(self, frozen=None):
         """pyscf's TDA with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""

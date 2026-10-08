@@ -22,7 +22,7 @@ def water_grid():
 def test_eval_ao_matches_pyscf(basis, cart):
     mol = gto.M(atom=WATER, basis=basis, cart=cart, verbose=0)
     coords = np.random.default_rng(0).uniform(-3, 3, (700, 3))
-    for deriv in (0, 1, 2):
+    for deriv in (0, 1, 2, 3):
         name = ("GTOval_cart" if cart else "GTOval_sph") + (f"_deriv{deriv}" if deriv else "")
         ref = np.asarray(mol.eval_gto(name, coords))
         assert abs(mdft.eval_ao(mol, coords, deriv) - ref).max() < 1e-12 * max(1.0, abs(ref).max())

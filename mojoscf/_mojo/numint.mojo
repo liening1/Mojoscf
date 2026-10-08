@@ -58,8 +58,8 @@ def vexp(x0: F64V) -> F64V:
 
 
 def _ncomp(nderiv: Int) -> Int:
-    """Number of AO components up to derivative order ``nderiv`` (1, 4, 10)."""
-    return 1 if nderiv == 0 else (4 if nderiv == 1 else 10)
+    """Number of AO components up to derivative order ``nderiv`` (1, 4, 10, 20)."""
+    return 1 if nderiv == 0 else (4 if nderiv == 1 else (10 if nderiv == 2 else 20))
 
 
 def shell_cutoff_radius(basis: Basis, b: Int, nderiv: Int) -> Float64:
@@ -88,9 +88,10 @@ def shell_cutoff_radius(basis: Basis, b: Int, nderiv: Int) -> Float64:
             var rl = 1.0
             for _ in range(l):
                 rl *= r
-            var g = 1.0 + Float64(l) / r + 2.0 * a * r
-            if nderiv > 1:
-                g *= g
+            var g1 = 1.0 + Float64(l) / r + 2.0 * a * r
+            var g = g1
+            for _ in range(1, max(nderiv, 1)):
+                g *= g1
             f += cm * rl * exp(-a * r * r) * g
         if s * f >= AO_CUT:
             rmax = r
@@ -188,7 +189,7 @@ struct AOWork(Movable):
         var n_y = 3 * nao * BLK
         var n_d = nao * nao
         var n_cart = ncomp * nc * W
-        var n_pw = (3 * (lmax + 3) + 3 * nctr_max) * W
+        var n_pw = (3 * (lmax + 4) + 4 * nctr_max) * W
         self.buf = List[Float64](length=n_ao + n_y + n_d + n_cart + n_pw + 8 * W, fill=0.0)
         var base = aligned_addr(self.buf)
         self.aoaddr = base
@@ -269,6 +270,9 @@ def eval_block(basis: Basis, grid: Grid, blk: Int, nderiv: Int, nshell: Int, nro
     d2/dx2 = (i(i-1) x^{i-2} R + (2i+1) x^i S + x^{i+2} T) y^j z^k,
     d2/dxdy = (a_x a_y R + (a_x b_y + b_x a_y) S + b_x b_y T) z^k with a_x = i x^{i-1}, b_x = x^{i+1}.
     """
+    if nderiv == 3:
+        _eval_block3(basis, grid, blk, nshell, nrow, ws)
+        return
     var p0 = blk * BLK
     var cstride = nrow * BLK
     var cart = F64Ptr(unsafe_from_address=ws.cartaddr)
@@ -395,6 +399,204 @@ def eval_block(basis: Basis, grid: Grid, blk: Int, nderiv: Int, nshell: Int, nro
                                     acc += cb.unsafe_load[width=W](cc * W) * t
                             dst.unsafe_store(m * BLK, acc)
         row += nc * nf
+
+
+def _d1(p: Int, n: Int, i: Int) -> Tuple[Float64, Int]:
+    """Term n of d^p/dx^p (x^i g_0) = sum_n c x^(i - p + 2n) g_n, g_{n+1} = (1/x) d g_n / dx: (c, power)."""
+    var fi = Float64(i)
+    var c = 0.0
+    if p == 0:
+        c = 1.0
+    elif p == 1:
+        c = fi if n == 0 else 1.0
+    elif p == 2:
+        c = fi * (fi - 1.0) if n == 0 else (2.0 * fi + 1.0 if n == 1 else 1.0)
+    else:
+        if n == 0:
+            c = fi * (fi - 1.0) * (fi - 2.0)
+        elif n == 1:
+            c = 3.0 * fi * fi
+        elif n == 2:
+            c = 3.0 * fi + 3.0
+        else:
+            c = 1.0
+    return (c, i - p + 2 * n)
+
+
+def _comp_powers(comp: Int) -> Tuple[Int, Int, Int]:
+    """Derivative orders (x, y, z) of AO component ``comp`` in pyscf's order up to third derivatives."""
+    var code = 0
+    if comp == 0:
+        code = 0
+    elif comp == 1:
+        code = 100
+    elif comp == 2:
+        code = 10
+    elif comp == 3:
+        code = 1
+    elif comp == 4:
+        code = 200
+    elif comp == 5:
+        code = 110
+    elif comp == 6:
+        code = 101
+    elif comp == 7:
+        code = 20
+    elif comp == 8:
+        code = 11
+    elif comp == 9:
+        code = 2
+    elif comp == 10:
+        code = 300
+    elif comp == 11:
+        code = 210
+    elif comp == 12:
+        code = 201
+    elif comp == 13:
+        code = 120
+    elif comp == 14:
+        code = 111
+    elif comp == 15:
+        code = 102
+    elif comp == 16:
+        code = 30
+    elif comp == 17:
+        code = 21
+    elif comp == 18:
+        code = 12
+    else:
+        code = 3
+    return (code // 100, (code // 10) % 10, code % 10)
+
+
+def _eval_block3(basis: Basis, grid: Grid, blk: Int, nshell: Int, nrow: Int, mut ws: AOWork):
+    """``eval_block`` with derivatives up to third order: 20 components in pyscf's order
+    (1, x, y, z, xx, xy, xz, yy, yz, zz, xxx, xxy, xxz, xyy, xyz, xzz, yyy, yyz, yzz, zzz).
+
+    A Cartesian function x^i y^j z^k R(r^2) with the radial sums
+    F_n = sum_p c_p (-2 a_p)^n e^{-a_p r^2} (d F_n / dx = x F_{n+1}) has
+    d^px d^py d^pz phi = sum_{nx,ny,nz} X_px,nx Y_py,ny Z_pz,nz F_{nx+ny+nz}, the
+    one-dimensional factors from ``_d1``.
+    """
+    var p0 = blk * BLK
+    var cstride = nrow * BLK
+    var cart = F64Ptr(unsafe_from_address=ws.cartaddr)
+    var pw = F64Ptr(unsafe_from_address=ws.pwaddr)
+    comptime NC3 = 20
+    var cpx = List[Int](length=NC3, fill=0)
+    var cpy = List[Int](length=NC3, fill=0)
+    var cpz = List[Int](length=NC3, fill=0)
+    for comp in range(NC3):
+        var t = _comp_powers(comp)
+        cpx[comp] = t[0]
+        cpy[comp] = t[1]
+        cpz[comp] = t[2]
+    # 1D factors for p = 0..3, n = 0..p: 10 per axis
+    var fac = List[Float64](length=3 * 10 * W, fill=0.0)
+    var pf = list_ptr(fac)
+    var row = 0
+    for si in range(nshell):
+        var b = ws.shells[si]
+        var l = basis.l[b]
+        var np = basis.nprim[b]
+        var nc = basis.nctr[b]
+        var nca = ncart(l)
+        var nf = basis.nf[l]
+        var coff = basis.cart_off[l]
+        var scal = basis.c2s_scale[l]
+        var c2s = list_ptr(basis.c2s).unsafe_offset(basis.c2s_off[l])
+        var ax = basis.shell_coord(b, 0)
+        var ay = basis.shell_coord(b, 1)
+        var az = basis.shell_coord(b, 2)
+        var npw = l + 4
+        var xp = pw                                 # dx^0 .. dx^(l+3)
+        var yp = pw.unsafe_offset(npw * W)
+        var zp = pw.unsafe_offset(2 * npw * W)
+        var fs = pw.unsafe_offset(3 * npw * W)      # F_n of contraction c at (c * 4 + n) * W
+        for v in range(NV):
+            var dx = grid.x().unsafe_load[width=W](p0 + v * W) - ax
+            var dy = grid.y().unsafe_load[width=W](p0 + v * W) - ay
+            var dz = grid.z().unsafe_load[width=W](p0 + v * W) - az
+            var r2 = dx * dx + dy * dy + dz * dz
+            for c in range(nc):
+                for n in range(4):
+                    fs.unsafe_store((c * 4 + n) * W, F64V(0.0))
+            for p in range(np):
+                var a = basis.env[basis.pexp[b] + p]
+                var e = vexp(r2 * (-a))
+                for c in range(nc):
+                    var t = e * basis.env[basis.pcoef[b] + c * np + p]
+                    for n in range(4):
+                        fs.unsafe_store((c * 4 + n) * W, fs.unsafe_load[width=W]((c * 4 + n) * W) + t)
+                        t *= -2.0 * a
+            var tx = F64V(1.0)
+            var ty = F64V(1.0)
+            var tz = F64V(1.0)
+            for k in range(npw):
+                xp.unsafe_store(k * W, tx)
+                yp.unsafe_store(k * W, ty)
+                zp.unsafe_store(k * W, tz)
+                tx *= dx
+                ty *= dy
+                tz *= dz
+            for c in range(nc):
+                var f = fs.unsafe_offset(c * 4 * W)
+                for cc in range(nca):
+                    var ii = basis.cx[coff + cc]
+                    var jj = basis.cy[coff + cc]
+                    var kk = basis.cz[coff + cc]
+                    # 1D factors of each axis: slot p (p + 1) / 2 + n
+                    for p in range(4):
+                        for n in range(p + 1):
+                            var slot = p * (p + 1) // 2 + n
+                            var tx_ = _d1(p, n, ii)
+                            var ty_ = _d1(p, n, jj)
+                            var tz_ = _d1(p, n, kk)
+                            var vx = F64V(0.0)
+                            if tx_[1] >= 0:
+                                vx = xp.unsafe_load[width=W](tx_[1] * W) * tx_[0]
+                            var vy = F64V(0.0)
+                            if ty_[1] >= 0:
+                                vy = yp.unsafe_load[width=W](ty_[1] * W) * ty_[0]
+                            var vz = F64V(0.0)
+                            if tz_[1] >= 0:
+                                vz = zp.unsafe_load[width=W](tz_[1] * W) * tz_[0]
+                            pf.unsafe_store(slot * W, vx)
+                            pf.unsafe_store((10 + slot) * W, vy)
+                            pf.unsafe_store((20 + slot) * W, vz)
+                    for comp in range(NC3):
+                        var px = cpx[comp]
+                        var py = cpy[comp]
+                        var pz = cpz[comp]
+                        var acc = F64V(0.0)
+                        for nx in range(px + 1):
+                            var fx = pf.unsafe_load[width=W]((px * (px + 1) // 2 + nx) * W)
+                            for ny in range(py + 1):
+                                var fxy = fx * pf.unsafe_load[width=W]((10 + py * (py + 1) // 2 + ny) * W)
+                                for nz in range(pz + 1):
+                                    var fz = pf.unsafe_load[width=W]((20 + pz * (pz + 1) // 2 + nz) * W)
+                                    acc += fxy * fz * f.unsafe_load[width=W]((nx + ny + nz) * W)
+                        cart.unsafe_store((comp * nca + cc) * W, acc)
+                var r0 = row + c * nf
+                for comp in range(NC3):
+                    var cb = cart.unsafe_offset(comp * nca * W)
+                    var dst = ws.ao().unsafe_offset(comp * cstride + r0 * BLK + v * W)
+                    if scal != 0.0:
+                        for m in range(nf):
+                            dst.unsafe_store(m * BLK, cb.unsafe_load[width=W](m * W) * scal)
+                    else:
+                        for m in range(nf):
+                            var acc = F64V(0.0)
+                            for cc in range(nca):
+                                var t = c2s[unsafe_offset=cc * nf + m]
+                                if t != 0.0:
+                                    acc += cb.unsafe_load[width=W](cc * W) * t
+                            dst.unsafe_store(m * BLK, acc)
+        row += nc * nf
+    _ = fac^
+    _ = cpx^
+    _ = cpy^
+    _ = cpz^
 
 
 def gather_block(dm: F64Ptr, nao: Int, nrow: Int, ws: AOWork):
@@ -1375,3 +1577,275 @@ def xc_fxc_core(
     _ = counter^
     _ = grid^
     _ = rcut^
+
+
+def _didx(px: Int, py: Int, pz: Int) -> Int:
+    """AO component index of the derivative d^px d^py d^pz (orders up to 3, pyscf's order)."""
+    var code = px * 100 + py * 10 + pz
+    for comp in range(20):
+        var t = _comp_powers(comp)
+        if t[0] * 100 + t[1] * 10 + t[2] == code:
+            return comp
+    return -1
+
+
+def xc_hess_core(
+    blas: Blas,
+    basis: Basis,
+    ngrid: Int,
+    coords: F64Ptr,
+    weights: F64Ptr,
+    kind: Int,
+    nspin: Int,
+    dms: F64Ptr,
+    vxc: F64Ptr,
+    fxc: F64Ptr,
+    aoatm: Pointer[Int64, MutAnyOrigin],
+    natm: Int,
+    de2_out: F64Ptr,
+) raises:
+    """XC part of the nuclear Hessian at fixed density matrix (pyscf's ``_get_vxc_diag`` and
+    ``_get_vxc_deriv2`` contracted with the density, no grid response), LDA (``kind`` 0) and GGA (1).
+
+    dms: nspin x nao x nao symmetric (RKS: the total density, UKS: alpha and beta);
+    vxc: (nspin nvar) x ngrid and fxc: (nspin nvar) x (nspin nvar) x ngrid, pyscf's
+    eval_xc_eff layout (unweighted); aoatm: atom of every AO.  With Y_c = D phi_c,
+    v = w vxc and rho1_{A,x} = -d rho / d R_{A,x} (2 sum_{q in A} (d_x phi_q Y_0,q) for
+    rho; GGA: 2 sum_{q in A} (d_x d_c phi_q Y_0,q + d_x phi_q Y_c,q) for d_c rho):
+
+        de2[A,A][x,y] += 2 sum_{p in A} int [d_x d_y phi_p (v_0 Y_0 + sum_c v_c Y_c)_p
+                                              + sum_c v_c d_x d_y d_c phi_p Y_0,p]
+        de2[A,B][x,y] += 2 sum_{s in A, r in B} D_sr int [d_x phi_s G_y,r + H_x,s d_y phi_r]
+                         G_y = v_0 d_y phi + sum_c v_c d_y d_c phi,  H_x = sum_c v_c d_x d_c phi
+        de2[A,B][x,y] += int w rho1_{A,x} . fxc . rho1_{B,y}
+
+    per spin (the fxc term over both).  The basis functions need derivatives up
+    to order 2 (LDA) or 3 (GGA).  For every atom B on a block one GEMM
+    (D_sub[:, B] [G | d phi]_B) gives the cross term; the fxc term is one
+    GEMM over the (atom, direction) pairs of the block.  de2_out: natm x natm x 3 x 3,
+    overwritten.
+    """
+    var gga = kind == 1
+    var nderiv = 3 if gga else 2
+    var nvar = 4 if gga else 1
+    var nv2 = nspin * nvar
+    var ncy = 4 if gga else 1                  # Y_c computed per spin
+    var ngb = 6 if gga else 3                  # [G_x G_y G_z (d_x d_y d_z phi)] per row
+    var grid = Grid(ngrid, coords)
+    var rcut = _rcuts(basis, nderiv)
+    var nao = basis.nao
+    var n2 = nao * nao
+    var ncomp = _ncomp(nderiv)
+    var nblk = grid.nblk
+    var nworkers = max(1, min(parallelism_level(), nblk))
+    var nde = natm * natm * 9
+    var accl = List[Float64](length=nworkers * nde + 1, fill=0.0)
+    var pacc = list_ptr(accl)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+    # derivative component tables
+    var d2t = List[Int](length=9, fill=0)
+    var d3t = List[Int](length=27, fill=0)
+    for x in range(3):
+        for y in range(3):
+            var px = (1 if x == 0 else 0) + (1 if y == 0 else 0)
+            var py = (1 if x == 1 else 0) + (1 if y == 1 else 0)
+            var pz = (1 if x == 2 else 0) + (1 if y == 2 else 0)
+            d2t[x * 3 + y] = _didx(px, py, pz)
+            for c in range(3):
+                d3t[(x * 3 + y) * 3 + c] = _didx(px + (1 if c == 0 else 0), py + (1 if c == 1 else 0), pz + (1 if c == 2 else 0))
+    var pd2 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d2t.unsafe_ptr()))
+    var pd3 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d3t.unsafe_ptr()))
+
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm nvar, imm nv2, imm ncy, imm ngb, imm nspin, imm dms, imm vxc, imm fxc, imm weights, imm aoatm, imm natm, imm pacc, imm nde, imm ngrid, imm pd2, imm pd3}:
+        var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
+        var acc = pacc.unsafe_offset(w * nde)
+        var n_y = nspin * ncy * nao * BLK
+        var n_gb = nao * ngb * BLK
+        var n_r1 = natm * 3 * nv2 * BLK
+        var n_h = 3 * nao * BLK
+        var scratch = List[Float64](length=n_y + 2 * n_gb + n_h + 2 * n_r1 + nv2 * BLK + 9 * natm * natm + 8 * W, fill=0.0)
+        var ybuf = F64Ptr(unsafe_from_address=aligned_addr(scratch))
+        var gbuf = ybuf.unsafe_offset(n_y)
+        var zbuf = gbuf.unsafe_offset(n_gb)
+        var hbuf = zbuf.unsafe_offset(n_gb)              # H_x per row (3 x BLK), GGA
+        var r1 = hbuf.unsafe_offset(n_h)
+        var ub = r1.unsafe_offset(n_r1)
+        var vb = ub.unsafe_offset(n_r1)                  # v = w vxc of the block (nv2 x BLK)
+        var mm = vb.unsafe_offset(nv2 * BLK)             # (3 na) x (3 na) pair matrix
+        var alist = List[Int](length=natm + 1, fill=0)   # atoms of the block
+        var a0l = List[Int](length=natm + 1, fill=0)     # their local row ranges
+        var a1l = List[Int](length=natm + 1, fill=0)
+        while True:
+            var blk = Int(pcount[].fetch_add(1))
+            if blk >= nblk:
+                break
+            var sel = select_shells(basis, grid, blk, rcut, ws)
+            var nrow = sel[1]
+            if nrow == 0:
+                continue
+            var p0 = blk * BLK
+            var npt = min(BLK, ngrid - p0)
+            eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            var cs = nrow * BLK
+            var ao = ws.ao()
+            # atoms on the block and their (contiguous) local rows
+            var na = 0
+            for r in range(nrow):
+                var a = Int(aoatm[unsafe_offset=ws.rows[r]])
+                if na == 0 or alist[na - 1] != a:
+                    alist[na] = a
+                    a0l[na] = r
+                    na += 1
+                a1l[na - 1] = r + 1
+            # weighted potential on the block
+            for i in range(nv2):
+                for v in range(NV):
+                    vb.unsafe_store(i * BLK + v * W, _load_w(vxc, i * ngrid + p0, v, npt) * _load_w(weights, p0, v, npt))
+            vfill(r1, na * 3 * nv2 * BLK, 0.0)
+            for s in range(nspin):
+                var vs = vb.unsafe_offset(s * nvar * BLK)
+                var ys = ybuf.unsafe_offset(s * ncy * nao * BLK)
+                gather_block(dms.unsafe_offset(s * n2), nao, nrow, ws)
+                for c in range(ncy):
+                    try:
+                        blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao.unsafe_offset(c * cs), 0.0, ys.unsafe_offset(c * nrow * BLK))
+                    except:
+                        pass
+                var y0 = ys
+                # ---- diagonal term and rho1 per row
+                for ia in range(na):
+                    var a = alist[ia]
+                    var dd = acc.unsafe_offset((a * natm + a) * 9)
+                    for p in range(a0l[ia], a1l[ia]):
+                        var o = p * BLK
+                        for x in range(3):
+                            for y in range(x, 3):
+                                var hxy = ao.unsafe_offset(pd2[unsafe_offset=x * 3 + y] * cs)
+                                var t = F64V(0.0)
+                                for v in range(NV):
+                                    var q = v * W
+                                    var tt = vs.unsafe_load[width=W](q) * y0.unsafe_load[width=W](o + q)
+                                    if gga:
+                                        for c in range(3):
+                                            tt += vs.unsafe_load[width=W]((c + 1) * BLK + q) * ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
+                                    var u = hxy.unsafe_load[width=W](o + q) * tt
+                                    if gga:
+                                        for c in range(3):
+                                            var h3 = ao.unsafe_offset(pd3[unsafe_offset=(x * 3 + y) * 3 + c] * cs)
+                                            u += vs.unsafe_load[width=W]((c + 1) * BLK + q) * h3.unsafe_load[width=W](o + q) * y0.unsafe_load[width=W](o + q)
+                                    t += u
+                                var sxy = 2.0 * t.reduce_add()
+                                dd[unsafe_offset=x * 3 + y] += sxy
+                                if y != x:
+                                    dd[unsafe_offset=y * 3 + x] += sxy
+                        # rho1_{A,x} (= -d rho / d R_{A,x}) of this spin
+                        for x in range(3):
+                            var dx = ao.unsafe_offset((1 + x) * cs)
+                            var rr = r1.unsafe_offset(((ia * 3 + x) * nv2 + s * nvar) * BLK)
+                            for v in range(NV):
+                                var q = v * W
+                                var dxp = dx.unsafe_load[width=W](o + q)
+                                var y0p = y0.unsafe_load[width=W](o + q)
+                                rr.unsafe_store(q, rr.unsafe_load[width=W](q) + dxp * y0p * 2.0)
+                                if gga:
+                                    for c in range(3):
+                                        var hxc = ao.unsafe_offset(pd2[unsafe_offset=x * 3 + c] * cs)
+                                        var t = hxc.unsafe_load[width=W](o + q) * y0p + dxp * ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
+                                        rr.unsafe_store((c + 1) * BLK + q, rr.unsafe_load[width=W]((c + 1) * BLK + q) + t * 2.0)
+                # ---- cross term: G_y (and d_y phi) per row
+                for r in range(nrow):
+                    var o = r * BLK
+                    var g = gbuf.unsafe_offset(r * ngb * BLK)
+                    for y in range(3):
+                        var dy = ao.unsafe_offset((1 + y) * cs)
+                        for v in range(NV):
+                            var q = v * W
+                            var t = vs.unsafe_load[width=W](q) * dy.unsafe_load[width=W](o + q)
+                            if gga:
+                                for c in range(3):
+                                    var hyc = ao.unsafe_offset(pd2[unsafe_offset=y * 3 + c] * cs)
+                                    t += vs.unsafe_load[width=W]((c + 1) * BLK + q) * hyc.unsafe_load[width=W](o + q)
+                            g.unsafe_store(y * BLK + q, t)
+                            if gga:
+                                g.unsafe_store((3 + y) * BLK + q, dy.unsafe_load[width=W](o + q))
+                    if gga:
+                        var h = hbuf.unsafe_offset(r * 3 * BLK)
+                        for x in range(3):
+                            for v in range(NV):
+                                var q = v * W
+                                var t = F64V(0.0)
+                                for c in range(3):
+                                    var hxc = ao.unsafe_offset(pd2[unsafe_offset=x * 3 + c] * cs)
+                                    t += vs.unsafe_load[width=W]((c + 1) * BLK + q) * hxc.unsafe_load[width=W](o + q)
+                                h.unsafe_store(x * BLK + q, t)
+                for ib in range(na):
+                    var b = alist[ib]
+                    var b0 = a0l[ib]
+                    var nb = a1l[ib] - b0
+                    # Z (nrow x ngb BLK) = D_sub[:, B] [G | d phi]_B  (D symmetric: rows B of D_sub, transposed)
+                    try:
+                        blas.gemm(True, False, nrow, ngb * BLK, nb, 1.0, ws.dsub().unsafe_offset(b0 * nrow), gbuf.unsafe_offset(b0 * ngb * BLK), 0.0, zbuf)
+                    except:
+                        pass
+                    for ia in range(na):
+                        var a = alist[ia]
+                        var dd = acc.unsafe_offset((a * natm + b) * 9)
+                        for x in range(3):
+                            var dx = ao.unsafe_offset((1 + x) * cs)
+                            for y in range(3):
+                                var t = F64V(0.0)
+                                for sr in range(a0l[ia], a1l[ia]):
+                                    var o = sr * BLK
+                                    var z = zbuf.unsafe_offset(sr * ngb * BLK)
+                                    var hx = hbuf.unsafe_offset((sr * 3 + x) * BLK)
+                                    for v in range(NV):
+                                        var q = v * W
+                                        t += dx.unsafe_load[width=W](o + q) * z.unsafe_load[width=W](y * BLK + q)
+                                        if gga:
+                                            t += hx.unsafe_load[width=W](q) * z.unsafe_load[width=W]((3 + y) * BLK + q)
+                                dd[unsafe_offset=x * 3 + y] += 2.0 * t.reduce_add()
+            # ---- fxc term: U = (w fxc) rho1, M = rho1 U^T over the (atom, direction) pairs
+            for k in range(na * 3):
+                var rk = r1.unsafe_offset(k * nv2 * BLK)
+                var uk = ub.unsafe_offset(k * nv2 * BLK)
+                for j in range(nv2):
+                    for v in range(NV):
+                        var q = v * W
+                        var t = F64V(0.0)
+                        for i in range(nv2):
+                            t += _load_w(fxc, (i * nv2 + j) * ngrid + p0, v, npt) * rk.unsafe_load[width=W](i * BLK + q)
+                        uk.unsafe_store(j * BLK + q, t * _load_w(weights, p0, v, npt))
+            try:
+                blas.gemm(False, True, na * 3, na * 3, nv2 * BLK, 1.0, r1, ub, 0.0, mm)
+            except:
+                pass
+            for ia in range(na):
+                for ib in range(na):
+                    var dd = acc.unsafe_offset((alist[ia] * natm + alist[ib]) * 9)
+                    for x in range(3):
+                        for y in range(3):
+                            dd[unsafe_offset=x * 3 + y] += mm[unsafe_offset=(ia * 3 + x) * (na * 3) + ib * 3 + y]
+        _ = ws^
+        _ = scratch^
+        _ = alist^
+        _ = a0l^
+        _ = a1l^
+
+    var nthr = blas.serial_begin()
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    blas.serial_end(nthr)
+    for i in range(nde):
+        var v = 0.0
+        for w2 in range(nworkers):
+            v += pacc[unsafe_offset=w2 * nde + i]
+        de2_out[unsafe_offset=i] = v
+    _ = accl^
+    _ = counter^
+    _ = grid^
+    _ = rcut^
+    _ = d2t^
+    _ = d3t^
