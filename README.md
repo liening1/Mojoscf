@@ -241,6 +241,16 @@ level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
   call NumPy's newer OpenBLAS pinned to one thread each (45 GFLOPS); that
   took this SCF from 1.6x to 3.5x faster than pyscf.  The gradients of the
   same systems are 2.4-11x faster.
+* **The exchange update of small and medium molecules.**  After the
+  transforms, `K += U^T U` over a block of auxiliary functions is a
+  tall-skinny product (nao x nao from naux_block x nocc rows) that a
+  threaded BLAS splits poorly: for nao = 170, 2x on 4 threads.  Up to about
+  2000 basis functions on 4 cores every worker now transforms a contiguous
+  range of auxiliary functions and accumulates its own K with one BLAS
+  thread, the partial matrices summed at the end: one UHF J/K build of the
+  [Cu2Cl6]2- dimer below went from 0.55 to 0.26 s (pyscf 0.74 s), its
+  broken-symmetry SCF from 7.9 to 3.7 s (2.8 GHz machine; the tables in this
+  README predate the change).
 * **Segmented basis sets** (def2) consist largely of single-primitive shells,
   where vectorising over the primitive quartets of one shell quartet leaves
   most SIMD lanes empty.  The drivers therefore batch kets as SIMD lanes

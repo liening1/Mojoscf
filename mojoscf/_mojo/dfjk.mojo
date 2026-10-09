@@ -234,11 +234,18 @@ def df_jk_core(
             for k in range(m):
                 dst[unsafe_offset=i * m + k] = src[unsafe_offset=i * nao + k]
 
-    var nwork = 2 * nthreads
+    # With few basis functions the update K += U^T U of a block (nao x nao from nb m rows) is a
+    # tall-skinny product that a threaded BLAS splits poorly (nao = 170: 2x on 4 threads); then every
+    # worker transforms a contiguous range of Q and accumulates its own K with one BLAS thread, and
+    # the partial K are summed at the end.
+    var split = nthreads > 1 and nthreads * nk * n2 * 8 <= 256 * 1024 * 1024
+    var nwork = nthreads if split else 2 * nthreads
     var ebuf = List[Float64](length=nwork * n2, fill=0.0)              # one unpacked E_Q per worker
     var ubuf = List[Float64](length=nk * blk * mmax * nao, fill=0.0)   # U rows (Q, k) per set
+    var kacc = List[Float64](length=(nwork * nk * n2 if split else 0) + 1, fill=0.0)
     var pe = list_ptr(ebuf)
     var pu = list_ptr(ubuf)
+    var pk = list_ptr(kacc)
     var pms = ms
     var ustride = blk * mmax * nao
 
@@ -246,11 +253,15 @@ def df_jk_core(
     while q0 < naux:
         var q1 = min(q0 + blk, naux)
         var nb = q1 - q0
+        var per = (nb + nwork - 1) // nwork
 
-        def work(c: Int) {imm blas_seq, imm cderi, imm pe, imm pu, imm pcorb, imm pms, imm nao, imm npair, imm n2, imm nk, imm mmax, imm ustride, imm q0, imm q1, imm nwork}:
+        def work(c: Int) {imm blas_seq, imm cderi, imm pe, imm pu, imm pk, imm pcorb, imm pms, imm signs, imm nao, imm npair, imm n2, imm nk, imm mmax, imm ustride, imm q0, imm q1, imm nwork, imm split, imm per}:
             var e = pe.unsafe_offset(c * n2)
-            var q = q0 + c
-            while q < q1:
+            var qa = q0 + c * per if split else q0 + c
+            var qb = min(qa + per, q1) if split else q1
+            var step = 1 if split else nwork
+            var q = qa
+            while q < qb:
                 unpack_row(cderi.unsafe_offset(q * npair), nao, e)
                 for s in range(nk):
                     var m = Int(pms[unsafe_offset=s])
@@ -263,33 +274,66 @@ def df_jk_core(
                             )
                         except:
                             pass
-                q += nwork
+                q += step
+            if not split or qb <= qa:
+                return
+            for s in range(nk):
+                var m = Int(pms[unsafe_offset=s])
+                if m == 0:
+                    continue
+                var rows = (qb - qa) * m
+                var u = pu.unsafe_offset(s * ustride + (qa - q0) * m * nao)
+                var kc = pk.unsafe_offset((c * nk + s) * n2)
+                var sg = signs.unsafe_offset(s * nao)
+                var negative = False
+                for k in range(m):
+                    if sg[unsafe_offset=k] < 0.0:
+                        negative = True
+                try:
+                    if negative:
+                        var a = List[Float64](length=rows * nao, fill=0.0)
+                        var pa = list_ptr(a)
+                        vcopy(pa, u, rows * nao)
+                        for r in range(rows):
+                            if sg[unsafe_offset=r % m] < 0.0:
+                                vscale(pa.unsafe_offset(r * nao), nao, -1.0)
+                        blas_seq.gemm(True, False, nao, nao, rows, 1.0, pa, u, 1.0, kc)
+                        _ = a^
+                    else:
+                        blas_seq.syrk_upper(nao, rows, 1.0, u, 1.0, kc)
+                except:
+                    pass
 
         var nthr = blas_seq.serial_begin()      # the per-Q GEMMs run concurrently, one BLAS thread each
         parallelize(work, nwork)
         blas_seq.serial_end(nthr)               # before the threaded update below (it may be the same library)
 
-        for s in range(nk):
-            var m = Int(ms[unsafe_offset=s])
-            if m == 0:
-                continue
-            var u = pu.unsafe_offset(s * ustride)
-            var kout = vk.unsafe_offset(s * n2)
-            if neg[s]:
-                # K += A^T U with the rows of A = U scaled by the signs
-                var a = List[Float64](length=nb * m * nao, fill=0.0)
-                var pa = list_ptr(a)
-                vcopy(pa, u, nb * m * nao)
-                var sg = signs.unsafe_offset(s * nao)
-                for q in range(nb):
-                    for k in range(m):
-                        if sg[unsafe_offset=k] < 0.0:
-                            vscale(pa.unsafe_offset((q * m + k) * nao), nao, -1.0)
-                blas.gemm(True, False, nao, nao, nb * m, 1.0, pa, u, 1.0, kout)
-                _ = a^
-            else:
-                blas.syrk_upper(nao, nb * m, 1.0, u, 1.0, kout)
+        if not split:
+            for s in range(nk):
+                var m = Int(ms[unsafe_offset=s])
+                if m == 0:
+                    continue
+                var u = pu.unsafe_offset(s * ustride)
+                var kout = vk.unsafe_offset(s * n2)
+                if neg[s]:
+                    # K += A^T U with the rows of A = U scaled by the signs
+                    var a = List[Float64](length=nb * m * nao, fill=0.0)
+                    var pa = list_ptr(a)
+                    vcopy(pa, u, nb * m * nao)
+                    var sg = signs.unsafe_offset(s * nao)
+                    for q in range(nb):
+                        for k in range(m):
+                            if sg[unsafe_offset=k] < 0.0:
+                                vscale(pa.unsafe_offset((q * m + k) * nao), nao, -1.0)
+                    blas.gemm(True, False, nao, nao, nb * m, 1.0, pa, u, 1.0, kout)
+                    _ = a^
+                else:
+                    blas.syrk_upper(nao, nb * m, 1.0, u, 1.0, kout)
         q0 = q1
+    if split:
+        for c in range(nwork):
+            for s in range(nk):
+                vaxpy(vk.unsafe_offset(s * n2), n2, 1.0, pk.unsafe_offset((c * nk + s) * n2))
     for s in range(nk):
         if not neg[s]:
             symmetrize_upper(vk.unsafe_offset(s * n2), nao)
@@ -297,3 +341,4 @@ def df_jk_core(
     _ = corb^
     _ = ebuf^
     _ = ubuf^
+    _ = kacc^
