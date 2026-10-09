@@ -194,3 +194,70 @@ def test_backend_info():
     assert info["kernels_version"] == mojoscf.__version__
     assert info["parallelism_level"] >= 1
     assert info["simd_width_f64"] >= 1
+
+
+WATER = "O 0 0 0.1173; H 0 0.7572 -0.4692; H 0 -0.7572 -0.4692"
+
+
+@pytest.mark.parametrize("mode", ["incore", "direct", "df"])
+@pytest.mark.parametrize("unrestricted", [False, True])
+def test_get_jk_outside_the_loop(mode, unrestricted, monkeypatch):
+    """get_jk/get_j/get_k of the Mojo classes and accelerated objects (get_fock, response equations, CASSCF
+    call them after the SCF) come from the Mojo kernels and equal pyscf's."""
+    import mojoscf.dft as mdft
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=int(unrestricted), spin=int(unrestricted), verbose=0)
+    pyscf_cls = scf.UHF if unrestricted else scf.RHF
+
+    def make(mf):
+        if mode == "direct":
+            mf.max_memory = 0
+        return mf.density_fit() if mode == "df" else mf
+
+    ref = make(pyscf_cls(mol))
+    dm = ref.get_init_guess()
+    rng = np.random.default_rng(7)
+    x = rng.normal(size=(3,) + dm.shape) * 0.1
+    x = x + x.swapaxes(-1, -2)
+    routed = []
+    orig = mdft.hooked_jk
+    monkeypatch.setattr(mdft, "hooked_jk", lambda *a: routed.append(orig(*a)) or routed[-1])
+    for mf in (make((mojoscf.UHF if unrestricted else mojoscf.RHF)(mol)), mojoscf.accelerate(make(pyscf_cls(mol)))):
+        for d in (dm, x):
+            del routed[:]
+            j1, k1 = mf.get_jk(mol, d)
+            assert routed and routed[-1] is not None
+            j0, k0 = ref.get_jk(mol, d)
+            assert abs(j1 - j0).max() < 1e-10 and abs(k1 - k0).max() < 1e-10
+            assert abs(mf.get_j(mol, d) - j0).max() < 1e-10 and abs(mf.get_k(mol, d) - k0).max() < 1e-10
+        omega = 0.4
+        assert abs(mf.get_k(mol, dm, omega=omega) - ref.get_k(mol, dm, omega=omega)).max() < 1e-10
+        if mode != "df":     # non-symmetric densities (pyscf's DF falls back for those)
+            y = rng.normal(size=dm.shape)
+            j0, k0 = ref.get_jk(mol, y, hermi=0)
+            j1, k1 = mf.get_jk(mol, y, hermi=0)
+            assert abs(j1 - j0).max() < 1e-10 and abs(k1 - k0).max() < 1e-10
+        f0 = ref.get_fock(dm=dm)
+        assert abs(mf.get_fock(dm=dm) - f0).max() < 1e-10
+
+
+def test_own_get_jk_is_kept(h2o_dz):
+    """A subclass with its own get_jk keeps it, inside the SCF (pyscf's get_veff route) and outside."""
+
+    class CountingRHF(scf.hf.RHF):
+        calls = 0
+
+        def get_jk(self, *args, **kwargs):
+            CountingRHF.calls += 1
+            return super().get_jk(*args, **kwargs)
+
+    mf = mojoscf.accelerate(CountingRHF(h2o_dz))
+    mf.kernel()
+    assert mf.scf_summary["mojoscf_veff_mode"] == 0 and CountingRHF.calls > 0
+    assert abs(mf.e_tot - scf.RHF(h2o_dz).run().e_tot) < 1e-9
+    n = CountingRHF.calls
+    mf.get_jk(h2o_dz, mf.make_rdm1())
+    assert CountingRHF.calls == n + 1
+    mf = mojoscf.RHF(h2o_dz)
+    mf.kernel()
+    assert mf.scf_summary["mojoscf_veff_mode"] == 2

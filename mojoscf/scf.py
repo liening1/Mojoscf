@@ -90,13 +90,32 @@ _STANDARD_JK_MODULES = ("pyscf.scf.hf", "pyscf.scf.uhf", "pyscf.df.df_jk", "mojo
 
 
 def _standard_method(mf, name) -> bool:
-    """True if ``mf.<name>`` is pyscf's (or mojoscf's) own implementation."""
+    """True if ``mf.<name>`` is pyscf's (or mojoscf's) own implementation.
+
+    mojoscf's routing ``get_jk`` (:func:`_routed_jk`) only stands in for the
+    implementation behind it, so that one is what counts.
+    """
     if name in vars(mf):
         return False
     for klass in type(mf).__mro__:
         if name in klass.__dict__:
+            if getattr(klass.__dict__[name], "_mojoscf_routes", False):
+                continue
             return klass.__module__.startswith(_STANDARD_JK_MODULES)
     return True
+
+
+def _routed_jk(mf, hook, mol, dm, hermi, with_j, with_k, omega):
+    """``get_jk`` of the Mojo classes: :func:`mojoscf.dft.hooked_jk` (the Mojo kernels in place of pyscf's
+    DF or exact ``get_jk`` behind ``hook``), else the next implementation."""
+    from .dft import hooked_jk
+
+    if dm is None:
+        dm = mf.make_rdm1()
+    jk = hooked_jk(mf, hook, mol, dm, hermi, with_j, with_k, omega)
+    if jk is not None:
+        return jk
+    return super(hook, mf).get_jk(mol, dm, hermi, with_j, with_k, omega)
 
 
 def native_veff(mf):
@@ -406,6 +425,13 @@ class _MojoDFHook:
 
     __name_mixin__ = "Mojo"
 
+    def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True, omega=None):
+        """pyscf's density-fitted J/K (outside the native SCF loop: ``get_fock``, response equations,
+        CASSCF, ...) from :func:`mojoscf.kernels.df_jk` on the in-core DF tensor."""
+        return _routed_jk(self, _MojoDFHook, mol, dm, hermi, with_j, with_k, omega)
+
+    get_jk._mojoscf_routes = True
+
     def nuc_grad_method(self):
         """Density-fitted nuclear gradients with Mojo derivative integrals (:mod:`mojoscf.grad`)."""
         return _mojo_grad_method(self, _MojoDFHook)
@@ -468,6 +494,13 @@ class _MojoGlueMixin:
         if not isinstance(mf, _MojoDFHook):
             lib.set_class(mf, (_MojoDFHook, type(mf)))
         return mf
+
+    def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True, omega=None):
+        """pyscf's J/K (outside the native SCF loop: ``get_fock``, response equations, CASSCF, ...) from the
+        Mojo kernels: the in-core DF tensor, in-core ERIs or integral-direct (:func:`mojoscf.dft.hooked_jk`)."""
+        return _routed_jk(self, _MojoGlueMixin, mol, dm, hermi, with_j, with_k, omega)
+
+    get_jk._mojoscf_routes = True
 
     def _eigh(self, h, s, overwrite=False, x=None):
         if not _is_real(h, s, x):

@@ -106,3 +106,29 @@ def test_accelerated_ks_stability_and_fallbacks():
     mf = mojoscf.dft.accelerate(dft.RKS(sym, xc="pbe")).run()
     assert mstab.internal_hessian(mf) is None
     assert mf.stability(return_status=True)[2]
+
+
+def test_davidson_follows_every_start_vector():
+    """The unit vectors of the starting space must not crowd out pyscf's vector: here they are exact
+    eigenvectors (0.20 to 0.24) while the lowest root (0.18) lies along a delocalised direction that only
+    pyscf's 1/hdiag vector overlaps.  Following just the lowest three Ritz pairs stops at 0.20."""
+    from pyscf import lib
+
+    rng = np.random.default_rng(3)
+    n = 120
+    d = np.full(n, 0.5)
+    d[:5] = [0.20, 0.21, 0.22, 0.23, 0.24]
+    w = np.zeros(n)
+    w[5:] = rng.uniform(0.5, 1.5, n - 5) * rng.choice([-1.0, 1.0], n - 5)
+    w /= np.linalg.norm(w)
+    a = np.diag(d) - 0.32 * np.outer(w, w)
+
+    def precond(dx, e, x0):
+        dd = d - e
+        dd[abs(dd) < 1e-8] = 1e-8
+        return dx / dd
+
+    xs = mstab._guesses(1.0 / d, d, np.ones(n, dtype=bool), 3)
+    e, _ = mstab._davidson(lambda vs: [a @ v for v in vs], xs, precond, 1e-8, lib.logger.new_logger(verbose=0), 3)
+    assert abs(np.asarray(e) - np.linalg.eigvalsh(a)[:3]).max() < 1e-6
+    assert abs(e[0] - 0.18) < 1e-3

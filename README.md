@@ -535,11 +535,16 @@ blocks, preconditioner, thresholds and orbital rotation; the products agree
 with pyscf's to 1e-9 (relative) for RHF/RKS/UHF/UKS with global and
 range-separated hybrids, DF or exact (`tests/test_stability.py`).  The
 starting space adds unit vectors on the lowest diagonal elements to pyscf's
-single vector: from that vector alone Davidson reaches the symmetry sectors
-it does not span only through rounding noise, and for the octahedral
-[Fe(H2O)6]2+ quintet (UKS B3LYP) pyscf's analysis stopped at the second
-root (0.0294) in one of two runs on the same SCF solution, the lowest being
-0.0148.
+single vector, and Davidson follows as many roots as there are starting
+vectors (the lowest `nroots` are reported).  From pyscf's vector alone
+Davidson reaches the symmetry sectors it does not span only through
+rounding noise: for the octahedral [Fe(H2O)6]2+ quintet (UKS B3LYP) pyscf's
+analysis stopped at the second root (0.0294) in one of two runs on the same
+SCF solution, the lowest being 0.0148.  Following only the lowest `nroots`
+Ritz pairs, on the other hand, lets the pairs of the unit vectors converge
+to higher roots before pyscf's vector has developed the lowest one: for the
+[Cu(NH3)4]2+ doublet an earlier version reported 0.1989 where pyscf finds
+0.1876.
 
 ### Analytical Hessians
 
@@ -1108,6 +1113,7 @@ but slow for more than a few dozen orbitals.
 | J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q GEMMs in worker threads (one BLAS thread each), threaded `dsyrk` |
 | J/K, in-core 8-fold ERIs (`_vhf.incore`)    | C (`libcvhf`, OpenMP)     | Mojo (`_mojo/erijk.mojo`), 1.6-1.8x faster |
 | J/K, direct SCF (integrals every cycle)     | C (libcint + `libcvhf`)   | Mojo (`_mojo/directjk.mojo`): Mojo integrals, libcvhf's screening, incremental build |
+| J/K outside the SCF loop (`mf.get_jk`/`get_j`/`get_k`, hence `get_veff`, `get_fock`: CASSCF core Fock, `pyscf.prop` response equations, `newton()`) | as in the loop, pyscf's | the same Mojo kernels as in the loop (DF tensor, in-core ERIs, integral-direct) for the RHF/UHF and RKS/UKS objects of mojoscf; a `get_jk` of a subclass is kept |
 | two-electron integrals (3-index DF tensor, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
 | one-electron integrals (`get_hcore`, `get_ovlp`) | C (libcint)          | unchanged (`attach(mf)` uses the Mojo engine) |
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |

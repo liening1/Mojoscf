@@ -52,6 +52,39 @@ def test_nr_uks_matches_pyscf(water_grid, xc):
     n1, e1, v1 = mdft.NumInt().nr_uks(mol, grids, xc, dms)
     assert abs(n0 - n1).max() < 1e-10 and abs(e0 - e1) < 1e-10
     assert abs(v0 - v1).max() < 1e-10
+    # two sets of (alpha, beta) densities
+    dms2 = np.array([[0.55 * dm, 0.6 * dm], [0.45 * dm, 0.3 * dm]])
+    n2, e2, v2 = mdft.NumInt().nr_uks(mol, grids, xc, dms2)
+    for i in range(2):
+        n0, e0, v0 = numint.NumInt().nr_uks(mol, grids, xc, dms2[:, i])
+        assert abs(n2[:, i] - n0).max() < 1e-10 and abs(e2[i] - e0) < 1e-10 and abs(v2[:, i] - v0).max() < 1e-10
+
+
+@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "b3lyp", "tpss", "r2scan"])
+def test_potential_weights_match_eval_xc_eff(water_grid, xc):
+    """The first-order XC weights formed from eval_xc1 equal pyscf's eval_xc_eff route (and an own
+    eval_xc_eff is used as such)."""
+    mol, grids = water_grid
+    ni = mdft.NumInt()
+    kind, xctype = mdft._kind(ni, xc), ni._xc_type(xc)
+    dm = scf.hf.init_guess_by_minao(mol)
+    coords, weights = mdft._grid(grids)
+    rho = mdft._rho(mol, coords, kind, np.array([0.55 * dm, 0.45 * dm]))
+    for spin, r in ((0, rho[0]), (1, rho)):
+        r = r[..., 0, :] if kind == 0 else r
+        exc0, vxc = ni.eval_xc_eff(xc, r, deriv=1, xctype=xctype, spin=spin)[:2]
+        wv0 = weights * np.asarray(vxc).reshape(r.shape if kind else r.shape[:-1] + (1, r.shape[-1]))
+        for w in [wv0] if spin == 0 else wv0:
+            mdft._halve(w)
+        for own in (False, True):
+            if own:
+                ni.eval_xc_eff = lambda *a, **k: numint.NumInt.eval_xc_eff(ni, *a, **k)
+                assert not mdft._stock_eval_xc_eff(ni)
+            exc, wv = mdft._potential_weights(ni, xc, xctype, kind, r, weights, spin)
+            assert abs(exc - exc0).max() < 1e-12 * abs(exc0).max()
+            assert abs(wv - wv0).max() < 1e-12 * abs(wv0).max()
+            assert wv.shape == wv0.shape
+        del ni.eval_xc_eff
 
 
 @pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "b3lyp", "tpss", "r2scan"])

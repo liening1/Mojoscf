@@ -6,8 +6,8 @@ potential matrix.  :class:`NumInt` here keeps pyscf's grids and libxc and
 replaces the rest for LDA, GGA and meta-GGA functionals (``_mojo/numint.mojo``;
 not those using the laplacian): one Mojo pass computes the densities (with
 gradients and kinetic-energy densities) on all grid points, pyscf's
-``eval_xc_eff`` evaluates the functional on the whole grid at once, and a
-second Mojo pass assembles the potential matrix.  Both passes evaluate only
+``eval_xc1`` (libxc) evaluates the functional on the whole grid at once, and
+a second Mojo pass assembles the potential matrix.  Both passes evaluate only
 the shells significant on each block of 128 points and do the contractions
 as per-block GEMMs.  The XC part of the nuclear gradient (pyscf's
 ``grad.rks.get_vxc``/``grad.uks.get_vxc``, used by every RKS/UKS gradient
@@ -157,6 +157,69 @@ def _halve(w):
         w[4] *= 0.25
 
 
+def _stock_eval_xc_eff(ni) -> bool:
+    """True if ``ni.eval_xc_eff`` is pyscf's (``eval_xc1`` and the derivative transform), which
+    :func:`_potential_weights` reproduces to first order."""
+    return (type(ni).eval_xc_eff is pyscf_numint.LibXCMixin.eval_xc_eff
+            and "eval_xc_eff" not in getattr(ni, "__dict__", {}))
+
+
+def _potential_weights(ni, xc_code, xctype, kind, rho, weights, spin):
+    """The functional on the whole grid and the weights of the potential matrix: ``(exc, wv)``.
+
+    ``rho`` is (nvar, ngrid) for ``spin`` 0 and (2, nvar, ngrid) for 1 (LDA:
+    (ngrid,) and (2, ngrid)); ``wv`` = weights * v, v pyscf's first-order
+    derivative tensor (``eval_xc_eff``; (nvar, ngrid) or (2, nvar, ngrid)),
+    with w_0 halved and w_tau quartered (:func:`_halve`).  pyscf's
+    ``eval_xc_eff`` evaluates ``eval_xc1`` and then transforms the derivatives
+    with respect to sigma by a general tensor routine; the first-order terms
+    are formed here directly (2 v_sigma grad rho, or 2 v_aa grad rho_a +
+    v_ab grad rho_b), which saves passes over the grid and copies of the
+    densities.
+    """
+    ngrid = weights.size
+    nvar = (1, 4, 5)[kind]
+    if not _stock_eval_xc_eff(ni):
+        exc, vxc = ni.eval_xc_eff(xc_code, rho, deriv=1, xctype=xctype, spin=spin)[:2]
+        wv = weights * np.asarray(vxc).reshape((nvar, ngrid) if spin == 0 else (2, nvar, ngrid))
+        for w in [wv] if spin == 0 else wv:
+            _halve(w)
+        return exc, wv
+    out = ni.eval_xc1(xc_code, rho, spin, 1, ni.omega)
+    if spin == 0:
+        wv = np.empty((nvar, ngrid))
+        np.multiply(out[1], weights, out=wv[0])
+        wv[0] *= 0.5
+        if kind > 0:
+            g = out[2] * weights
+            g *= 2.0
+            np.multiply(rho[1:4], g, out=wv[1:4])
+        if kind == 2:
+            np.multiply(out[3], weights, out=wv[4])
+            wv[4] *= 0.25
+        return out[0], wv
+    wv = np.empty((2, nvar, ngrid))
+    for s in range(2):
+        np.multiply(out[1 + s], weights, out=wv[s, 0])
+        wv[s, 0] *= 0.5
+    if kind > 0:
+        ga, gb = rho[0, 1:4], rho[1, 1:4]
+        waa = out[3] * weights
+        waa *= 2.0
+        wab = out[4] * weights
+        wbb = out[5] * weights
+        wbb *= 2.0
+        np.multiply(ga, waa, out=wv[0, 1:4])
+        wv[0, 1:4] += gb * wab
+        np.multiply(gb, wbb, out=wv[1, 1:4])
+        wv[1, 1:4] += ga * wab
+    if kind == 2:
+        for s in range(2):
+            np.multiply(out[6 + s], weights, out=wv[s, 4])
+            wv[s, 4] *= 0.25
+    return out[0], wv
+
+
 def _grid(grids):
     if grids.coords is None:
         grids.build()
@@ -180,16 +243,14 @@ class NumInt(pyscf_numint.NumInt):
         rho = _rho(mol, coords, kind, dm, _orbitals(dms, nset, nao))
         nelec = np.zeros(nset)
         excsum = np.zeros(nset)
-        wv = np.empty_like(rho)
+        wvs = []
         for i in range(nset):
-            r = rho[i, 0] if kind == 0 else rho[i]
-            exc, vxc = self.eval_xc_eff(xc_code, r, deriv=1, xctype=xctype, spin=0)[:2]
+            exc, w = _potential_weights(self, xc_code, xctype, kind, rho[i, 0] if kind == 0 else rho[i], weights, 0)
             den = rho[i, 0] * weights
             nelec[i] = den.sum()
             excsum[i] = _wsum(den, exc)
-            wv[i] = weights * np.asarray(vxc).reshape(-1, weights.size)
-            _halve(wv[i])
-        vmat = _vmat(mol, coords, kind, wv)
+            wvs.append(w)
+        vmat = _vmat(mol, coords, kind, wvs[0][np.newaxis] if nset == 1 else np.array(wvs))
         if single:
             return nelec[0], excsum[0], vmat[0]
         return nelec, excsum, vmat
@@ -210,21 +271,17 @@ class NumInt(pyscf_numint.NumInt):
         rho = _rho(mol, coords, kind, np.ascontiguousarray(np.concatenate([dma, dmb])), orbitals)
         nelec = np.zeros((2, nset))
         excsum = np.zeros(nset)
-        wv = np.empty_like(rho)
+        wvs = []
         for i in range(nset):
-            ra, rb = rho[i], rho[nset + i]
-            r = (ra[0], rb[0]) if kind == 0 else (ra, rb)
-            exc, vxc = self.eval_xc_eff(xc_code, r, deriv=1, xctype=xctype, spin=1)[:2]
-            den_a = ra[0] * weights
-            den_b = rb[0] * weights
+            r = rho if nset == 1 else rho[[i, nset + i]]           # (2, nvar, ngrid): alpha, beta
+            exc, w = _potential_weights(self, xc_code, xctype, kind, r[:, 0] if kind == 0 else r, weights, 1)
+            den_a = r[0, 0] * weights
+            den_b = r[1, 0] * weights
             nelec[0, i] = den_a.sum()
             nelec[1, i] = den_b.sum()
             excsum[i] = _wsum(den_a + den_b, exc)
-            vxc = np.asarray(vxc).reshape(2, -1, weights.size)
-            wv[i] = weights * vxc[0]
-            wv[nset + i] = weights * vxc[1]
-            _halve(wv[i])
-            _halve(wv[nset + i])
+            wvs.append(w)
+        wv = wvs[0] if nset == 1 else np.array(wvs).transpose(1, 0, 2, 3).reshape(2 * nset, -1, weights.size)
         vmat = _vmat(mol, coords, kind, wv).reshape(2, nset, nao, nao)
         if single:
             return nelec[:, 0], excsum[0], vmat[:, 0]
@@ -239,7 +296,6 @@ class NumInt(pyscf_numint.NumInt):
             return super().cache_xc_kernel(mol, grids, xc_code, mo_coeff, mo_occ, spin, max_memory)
         kind = _kind(self, xc_code)
         coords, _ = _grid(grids)
-        nao = mol.nao_nr()
         if mo_coeff.ndim == 2:          # RKS
             rho = _rho_orbitals(mol, coords, kind, [mo_coeff], [np.asarray(mo_occ)])[0]
             if kind == 0:
@@ -570,6 +626,46 @@ def _incore_cderi(mf, mol, dm, hermi, omega):
     return _df_tensor(mf, omega or 0.0)
 
 
+def _df_jk(cderi, dm, with_j, with_k):
+    """:func:`mojoscf.kernels.df_jk` for ``dm``, through its orbitals when it carries pyscf's tags."""
+    from . import kernels
+
+    mo_coeff = getattr(dm, "mo_coeff", None)
+    mo_occ = getattr(dm, "mo_occ", None)
+    if mo_coeff is None or mo_occ is None or np.asarray(mo_coeff).ndim != np.asarray(dm).ndim:
+        mo_coeff = mo_occ = None
+    return kernels.df_jk(cderi, np.asarray(dm), mo_coeff, mo_occ, with_j, with_k)
+
+
+def hooked_jk(mf, hook, mol, dm, hermi, with_j, with_k, omega):
+    """J/K from the Mojo kernels for ``mf.get_jk`` when ``hook`` (a class of ``type(mf).__mro__``) sits in
+    front of pyscf's own ``get_jk``; None when that does not apply (pyscf's then runs).
+
+    The implementation behind ``hook`` (the next class in the MRO defining
+    ``get_jk``) decides what is computed: pyscf's density-fitting one
+    (``_DFHF``) gets :func:`mojoscf.kernels.df_jk` on the in-core DF tensor
+    (:func:`_df_tensor`), pyscf's exact one (``RHF``/``UHF``) gets
+    :func:`exact_jk` (in-core ERIs or integral-direct); anything else,
+    including a ``get_jk`` set on the instance, is left alone.
+    """
+    from pyscf.df import df_jk
+
+    if "get_jk" in vars(mf) or (mol is not None and mol is not mf.mol) or not np.isrealobj(dm):
+        return None
+    mro = type(mf).__mro__
+    nxt = next((c for c in mro[mro.index(hook) + 1:] if "get_jk" in c.__dict__), None)
+    if nxt is df_jk._DFHF:
+        cderi = _incore_cderi(mf, mol, dm, hermi, omega)
+        return None if cderi is None else _df_jk(cderi, dm, with_j, with_k)
+    if nxt is None or nxt.__module__ not in ("pyscf.scf.hf", "pyscf.scf.uhf"):
+        return None
+    if (omega or 0) < 0 or hermi not in (0, 1):
+        return None
+    if integrals.engine() != "mojo" or not integrals.available(mf.mol, two_electron=True):
+        return None
+    return exact_jk(mf, dm, hermi, with_j, with_k, omega)
+
+
 def _exact_jk(mf, mol, dm, hermi, with_j, with_k, omega):
     """J/K with exact integrals from mojoscf (:func:`exact_jk`) for a non-DF object whose ``get_jk`` behind
     :class:`_MojoKSHook` is pyscf's ``SCF.get_jk``; None when that does not apply."""
@@ -590,13 +686,14 @@ def _exact_jk(mf, mol, dm, hermi, with_j, with_k, omega):
 
 def exact_jk_applies(mf) -> bool:
     """Whether ``mf.get_jk`` is pyscf's exact-integral ``SCF.get_jk`` (``RHF``/``UHF``, with at most
-    :class:`_MojoKSHook` in front) and the Mojo engine handles the molecule, so that :func:`exact_jk`
-    returns the same matrices."""
+    mojoscf's routing hooks in front, which compute the same) and the Mojo engine handles the molecule,
+    so that :func:`exact_jk` returns the same matrices."""
     from pyscf.df import df_jk
 
     if isinstance(mf, df_jk._DFHF) or "get_jk" in vars(mf):
         return False
-    nxt = next((c for c in type(mf).__mro__ if "get_jk" in c.__dict__ and c is not _MojoKSHook), None)
+    nxt = next((c for c in type(mf).__mro__
+                if "get_jk" in c.__dict__ and not getattr(c.__dict__["get_jk"], "_mojoscf_routes", False)), None)
     if nxt is None or nxt.__module__ not in ("pyscf.scf.hf", "pyscf.scf.uhf"):
         return False
     if integrals.engine() != "mojo" or not integrals.available(mf.mol, two_electron=True):
@@ -646,19 +743,12 @@ class _MojoKSHook:
     def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True, omega=None):
         if dm is None:
             dm = self.make_rdm1()
-        cderi = _incore_cderi(self, mol, dm, hermi, omega)
-        if cderi is None:
-            jk = _exact_jk(self, mol, dm, hermi, with_j, with_k, omega)
-            if jk is not None:
-                return jk
-            return super().get_jk(mol, dm, hermi, with_j, with_k, omega)
-        from . import kernels
+        jk = hooked_jk(self, _MojoKSHook, mol, dm, hermi, with_j, with_k, omega)
+        if jk is not None:
+            return jk
+        return super().get_jk(mol, dm, hermi, with_j, with_k, omega)
 
-        mo_coeff = getattr(dm, "mo_coeff", None)
-        mo_occ = getattr(dm, "mo_occ", None)
-        if mo_coeff is None or mo_occ is None or np.asarray(mo_coeff).ndim != np.asarray(dm).ndim:
-            mo_coeff = mo_occ = None
-        return kernels.df_jk(cderi, np.asarray(dm), mo_coeff, mo_occ, with_j, with_k)
+    get_jk._mojoscf_routes = True
 
     def get_j(self, mol=None, dm=None, hermi=1, omega=None):
         return self.get_jk(mol, dm, hermi, True, False, omega)[0]

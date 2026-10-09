@@ -108,8 +108,16 @@ def _fock_blocks(mf, chans):
 
 
 def _davidson(aop, x0, precond, tol, log, nroots):
-    """pyscf's ``lib.davidson`` (same solver and return values) with a batched operator."""
-    e, x = lib.davidson1(aop, x0, precond, tol=tol, verbose=log, nroots=nroots)[1:]
+    """pyscf's ``lib.davidson`` (same solver and return values) with a batched operator.
+
+    As many roots as starting vectors are followed and the lowest ``nroots``
+    returned: following only ``nroots``, the Ritz pairs of the added unit
+    vectors (:func:`_guesses`) can converge to higher roots before pyscf's own
+    vector has developed the lowest one ([Cu(NH3)4]2+ doublet, UKS B3LYP:
+    0.1989 instead of 0.1876).
+    """
+    e, x = lib.davidson1(aop, x0, precond, tol=tol, verbose=log, nroots=max(nroots, len(x0)))[1:]
+    e, x = e[:nroots], x[:nroots]
     if nroots == 1:
         return e[0], x[0]
     return e, x
