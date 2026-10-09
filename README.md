@@ -57,7 +57,7 @@ iteration then runs without touching Python or pyscf's C code at all.
   integrals, the XC kernel in one fused pass): 3.3 to 8.6x faster than
   pyscf's operators for benzene, ferrocene and Cu(II) complexes, with the
   same excitation energies; excited-state gradients 3.9 to 4.5x faster, and
-  the SCF stability analysis on the same operators 5.4 to 8.1x.
+  the SCF stability analysis on the same operators 8 to 24x.
 * **Analytical Hessians** (`mojoscf.hessian`): `mf.Hessian()` of
   accelerated Kohn-Sham objects (LDA, GGA, meta-GGA) and of the mojoscf
   Hartree-Fock classes keeps pyscf's driver and computes the XC terms, the
@@ -559,6 +559,21 @@ Ritz pairs, on the other hand, lets the pairs of the unit vectors converge
 to higher roots before pyscf's vector has developed the lowest one: for the
 [Cu(NH3)4]2+ doublet an earlier version reported 0.1989 where pyscf finds
 0.1876.
+
+`benchmarks/bench_stability.py`: pyscf's default analysis (internal; for
+benzene also the external ones) of the converged SCF of each code, pyscf's
+default grids, conv_tol 1e-9, 4 cores of the 2.1 GHz Xeon.
+
+| system                                        | ints  | nao | stability pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | lowest eigenvalue (pyscf / mojoscf) |
+|-----------------------------------------------|-------|----:|------:|-----:|------:|------:|-----:|-----------------------------------|
+| benzene / def2-SVP B3LYP (RKS), with external | exact | 114 |  80.1 |  9.8 |  8.2x |   7.3 |  2.6 | internal 0.777848 / 0.777837, real -> complex 0.19589 / 0.19589, RHF -> UHF 0.092476 / 0.092434 |
+| ferrocene / def2-SVP PBE0 (RKS)               | DF    | 221 | 400.3 | 16.6 | 24.2x | 232.9 | 35.7 | 0.334362 / 0.334367 |
+| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP (UKS)   | DF    | 147 | 213.1 | 10.7 | 19.9x |  35.5 |  7.1 | 0.187447 / 0.187456 |
+| [Fe(H2O)6]2+ quintet / def2-SVP B3LYP (UKS)   | DF    | 175 | 349.3 | 27.4 | 12.8x |  85.2 | 17.1 | 0.029346 / 0.014790 |
+
+The eigenvalues agree to the solver's tolerance (1e-4 on the eigenvalue),
+except for [Fe(H2O)6]2+, where pyscf's single starting vector converged to
+the second root, as described above.
 
 ### Analytical Hessians
 
