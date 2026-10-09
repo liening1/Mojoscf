@@ -996,6 +996,10 @@ mf = scf.RHF(mol).density_fit()
 mojoscf.accelerate(mf)
 mf.kernel()
 
+# ROHF, point-group symmetry, solvent models, newton(): pyscf's loop with the Mojo kernels
+mf = mojoscf.accelerate(scf.ROHF(mol).density_fit())
+mf.kernel()
+
 # Open shell and broken symmetry (UHF)
 from mojoscf.guess import mix_homo_lumo_guess, afm_guess_by_atom, flip_spin_on_atoms
 mol = gto.M(atom="H 0 0 0; H 0 0 3.0", basis="cc-pvdz")
@@ -1113,7 +1117,7 @@ but slow for more than a few dozen orbitals.
 | J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q GEMMs in worker threads (one BLAS thread each), threaded `dsyrk` |
 | J/K, in-core 8-fold ERIs (`_vhf.incore`)    | C (`libcvhf`, OpenMP)     | Mojo (`_mojo/erijk.mojo`), 1.6-1.8x faster |
 | J/K, direct SCF (integrals every cycle)     | C (libcint + `libcvhf`)   | Mojo (`_mojo/directjk.mojo`): Mojo integrals, libcvhf's screening, incremental build |
-| J/K outside the SCF loop (`mf.get_jk`/`get_j`/`get_k`, hence `get_veff`, `get_fock`: CASSCF core Fock, `pyscf.prop` response equations, `newton()`) | as in the loop, pyscf's | the same Mojo kernels as in the loop (DF tensor, in-core ERIs, integral-direct) for the RHF/UHF and RKS/UKS objects of mojoscf; a `get_jk` of a subclass is kept |
+| J/K outside the SCF loop (`mf.get_jk`/`get_j`/`get_k`, hence `get_veff`, `get_fock`: CASSCF core Fock, `pyscf.prop` response equations, `newton()`) | as in the loop, pyscf's | the same Mojo kernels as in the loop (DF tensor, in-core ERIs, integral-direct) for the objects mojoscf accelerates (also ROHF/ROKS and symmetry-adapted ones); a `get_jk` of a subclass is kept |
 | two-electron integrals (3-index DF tensor, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
 | one-electron integrals (`get_hcore`, `get_ovlp`) | C (libcint)          | unchanged (`attach(mf)` uses the Mojo engine) |
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |
@@ -1168,10 +1172,17 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
 ## Scope and limitations
 
 * Closed-shell **RHF** and **UHF** with real orbitals, with or without density
-  fitting, X2C or other decorations that only change `get_jk`/`get_hcore`.
-  ROHF, GHF, Kohn-Sham DFT, symmetry-adapted and second-order (Newton) SCF
-  objects are rejected by `accelerate` (the native loop) and are not
-  provided as classes yet.
+  fitting, X2C or other decorations that only change `get_jk`/`get_hcore`,
+  run in the native loop.  Other Hartree-Fock objects (ROHF, point-group
+  symmetry, solvent models, second-order SCF, smearing, constrained UHF and
+  other overridden glue methods) keep pyscf's SCF loop when accelerated,
+  with the Mojo J/K (DF tensor, in-core ERIs or integral-direct), eigensolver
+  and DIIS (pyscf's DIIS with point-group symmetry, whose error vectors it
+  masks by irrep) and the Mojo gradients, stability analysis and excited
+  states where pyscf's plain methods would run; a decoration's own (a
+  solvent model's TD wrapper and stability set-up) is kept.  `accelerate`
+  hands Kohn-Sham objects to `mojoscf.dft.accelerate` and rejects GHF and
+  Dirac-HF; `mojoscf.is_supported(mf)` tells whether the native loop runs.
 * **Kohn-Sham** RKS/UKS objects get the Mojo kernels with
   `mojoscf.dft.accelerate` but keep pyscf's SCF loop.  The XC integration
   covers LDA, GGA and meta-GGA functionals (not those using the laplacian

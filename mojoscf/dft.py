@@ -763,25 +763,23 @@ class _MojoKSHook:
         pyscf's CDIIS takes overlaps of error vectors with NumPy, whose
         threaded ``ddot`` leaves OpenBLAS threads spinning while the next Mojo
         pass runs (about 6% of a ferrocene SCF).  A DIIS class set on the
-        object, another scheme (EDIIS, ADIIS), ``diis_space_rollback`` and
-        ``diis_file`` keep pyscf's.
+        object, another scheme (EDIIS, ADIIS), ``diis_space_rollback``,
+        ``diis_file`` and point-group symmetry (whose error vectors pyscf masks
+        by irrep) keep pyscf's.
         """
-        own = self.__dict__.get("DIIS")
-        if own is not None:
-            return own
-        from pyscf.scf import diis as scf_diis
+        from .scf import _hook_diis
 
-        mro = type(self).__mro__
-        cls = next(c.__dict__["DIIS"] for c in mro[mro.index(_MojoKSHook) + 1:] if "DIIS" in c.__dict__)
-        if cls is scf_diis.CDIIS and not self.diis_space_rollback and not self.diis_file:
-            from .diis import CDIIS
-
-            return CDIIS
-        return cls
+        return _hook_diis(self, _MojoKSHook)
 
     @DIIS.setter
     def DIIS(self, value):
         self.__dict__["DIIS"] = value
+
+    def density_fit(self, auxbasis=None, with_df=None, only_dfj=False):
+        """pyscf's ``density_fit()``, the Mojo J/K and gradients in front of its density fitting."""
+        from .scf import _hook_density_fit
+
+        return _hook_density_fit(self, _MojoKSHook, auxbasis, with_df, only_dfj)
 
     def nuc_grad_method(self):
         """Nuclear gradients with Mojo derivative integrals and XC kernels (``mojoscf.grad.KSGradients`` ...)."""
@@ -798,40 +796,54 @@ class _MojoKSHook:
 
         return hessian.accelerate(super().Hessian())
 
-    def stability(self, internal=True, external=False, verbose=None, return_status=False, **kwargs):
+    # The response methods below are mojoscf's where pyscf's plain RKS/UKS ones would run; a decoration's
+    # own (a solvent model wraps the TD object and sets up the solvent response) is kept.
+
+    def stability(self, *args, **kwargs):
         """pyscf's stability analysis with the orbital Hessian of :mod:`mojoscf.stability`."""
+        from .scf import _plain_next
+
+        if not _plain_next(self, _MojoKSHook, "stability"):
+            return super().stability(*args, **kwargs)
         from . import stability
 
-        return stability.stability(self, internal, external, verbose, return_status, **kwargs)
+        return stability.stability(self, *args, **kwargs)
 
-    def TDA(self, frozen=None):
+    def TDA(self, *args, **kwargs):
         """pyscf's TDA with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
+        from .scf import _plain_next
+
+        if not _plain_next(self, _MojoKSHook, "TDA"):
+            return super().TDA(*args, **kwargs)
         from . import tdscf
 
-        return tdscf.TDA(self, frozen)
+        return tdscf.TDA(self, *args, **kwargs)
 
-    def TDDFT(self, frozen=None):
+    def TDDFT(self, *args, **kwargs):
         """pyscf's ``TDDFT`` (full TDDFT for hybrids, the Casida form otherwise) with :mod:`mojoscf.tdscf`."""
+        from .scf import _plain_next
+
+        if not _plain_next(self, _MojoKSHook, "TDDFT"):
+            return super().TDDFT(*args, **kwargs)
         from . import tdscf
 
-        return tdscf.TDDFT(self, frozen)
+        return tdscf.TDDFT(self, *args, **kwargs)
 
-    def CasidaTDDFT(self, frozen=None):
+    def CasidaTDDFT(self, *args, **kwargs):
+        from .scf import _plain_next
+
+        if not _plain_next(self, _MojoKSHook, "CasidaTDDFT"):
+            return super().CasidaTDDFT(*args, **kwargs)
         from . import tdscf
 
-        return tdscf.CasidaTDDFT(self, frozen)
+        return tdscf.CasidaTDDFT(self, *args, **kwargs)
 
     TDDFTNoHybrid = CasidaTDDFT
 
     def _eigh(self, h, s, overwrite=False, x=None):
-        from . import kernels
-        from .scf import _is_real
+        from .scf import _hook_eigh
 
-        if not _is_real(h, s, x):
-            return super()._eigh(h, s, overwrite, x)
-        if x is None:
-            return kernels.eigh(h, s)
-        return kernels.eigh(h, x=x)
+        return _hook_eigh(self, _MojoKSHook, h, s, overwrite, x)
 
 
 def accelerate(mf):

@@ -118,6 +118,53 @@ def _routed_jk(mf, hook, mol, dm, hermi, with_j, with_k, omega):
     return super(hook, mf).get_jk(mol, dm, hermi, with_j, with_k, omega)
 
 
+# pyscf's plain SCF classes: a method inherited from one of these (and not from a decoration such as a
+# solvent model, which wraps the result of the plain method) may be replaced by the mojoscf version.
+_BASE_SCF_MODULES = (
+    "pyscf.scf.hf", "pyscf.scf.uhf", "pyscf.scf.rohf", "pyscf.scf.hf_symm", "pyscf.scf.uhf_symm",
+    "pyscf.dft.rks", "pyscf.dft.uks", "pyscf.dft.roks", "pyscf.dft.rks_symm", "pyscf.dft.uks_symm",
+)
+
+
+def _plain_next(mf, hook, name) -> bool:
+    """True if the ``name`` that ``mf`` inherits past ``hook`` is that of one of pyscf's plain SCF classes."""
+    mro = type(mf).__mro__
+    for cls in mro[mro.index(hook) + 1:]:
+        if name in cls.__dict__:
+            return cls.__module__ in _BASE_SCF_MODULES
+    return False
+
+
+def _hook_diis(mf, hook):
+    """``DIIS`` of a hooked object: :class:`mojoscf.CDIIS` where pyscf's default CDIIS would run (no
+    point-group symmetry, whose error vectors pyscf masks by irrep, no rollback or DIIS file)."""
+    own = mf.__dict__.get("DIIS")
+    if own is not None:
+        return own
+    mro = type(mf).__mro__
+    cls = next(c.__dict__["DIIS"] for c in mro[mro.index(hook) + 1:] if "DIIS" in c.__dict__)
+    if (cls is pyscf_diis.CDIIS and not mf.diis_space_rollback and not mf.diis_file
+            and not getattr(mf.mol, "symmetry", False)):
+        return CDIIS
+    return cls
+
+
+def _hook_eigh(mf, hook, h, s, overwrite=False, x=None):
+    if not _is_real(h, s, x):
+        return super(hook, mf)._eigh(h, s, overwrite, x)
+    if x is None:
+        return kernels.eigh(h, s)
+    return kernels.eigh(h, x=x)
+
+
+def _hook_density_fit(mf, hook, auxbasis, with_df, only_dfj):
+    """``density_fit()`` of a hooked object: pyscf's, with :class:`_MojoDFHook` in front of its ``_DFHF``."""
+    dfmf = super(hook, mf).density_fit(auxbasis, with_df, only_dfj)
+    if not isinstance(dfmf, _MojoDFHook):
+        lib.set_class(dfmf, (_MojoDFHook, type(dfmf)))
+    return dfmf
+
+
 def native_veff(mf):
     """How the Mojo driver can build J and K itself: ``(mode, data, reason)``.
 
@@ -534,6 +581,74 @@ class _MojoGlueMixin:
         return tdscf.TDHF(self, frozen)
 
 
+class _MojoHFHook:
+    """In front of a pyscf Hartree-Fock class whose SCF the native loop cannot run (:func:`accelerate`:
+    ROHF, point-group symmetry, solvent models, second-order SCF, overridden glue methods, ...).
+
+    pyscf's SCF loop stays.  J/K come from the Mojo kernels (:func:`mojoscf.dft.hooked_jk`: the in-core
+    DF tensor, in-core ERIs or integral-direct), the eigensolver from :func:`mojoscf.kernels.eigh`, DIIS
+    from :class:`mojoscf.CDIIS` (where pyscf's default CDIIS would run), and the gradient, Hessian,
+    stability and excited-state methods from mojoscf where the plain pyscf ones would run (a
+    decoration's own, such as a solvent model's, is kept).
+    """
+
+    __name_mixin__ = "Mojo"
+
+    def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True, omega=None):
+        return _routed_jk(self, _MojoHFHook, mol, dm, hermi, with_j, with_k, omega)
+
+    get_jk._mojoscf_routes = True
+
+    @property
+    def DIIS(self):
+        return _hook_diis(self, _MojoHFHook)
+
+    @DIIS.setter
+    def DIIS(self, value):
+        self.__dict__["DIIS"] = value
+
+    def _eigh(self, h, s, overwrite=False, x=None):
+        return _hook_eigh(self, _MojoHFHook, h, s, overwrite, x)
+
+    def density_fit(self, auxbasis=None, with_df=None, only_dfj=False):
+        return _hook_density_fit(self, _MojoHFHook, auxbasis, with_df, only_dfj)
+
+    def nuc_grad_method(self):
+        """Nuclear gradients with Mojo derivative integrals (:mod:`mojoscf.grad`) where they apply."""
+        return _mojo_grad_method(self, _MojoHFHook)
+
+    Gradients = nuc_grad_method
+
+    def Hessian(self):
+        from . import hessian
+
+        return hessian.accelerate(super().Hessian())
+
+    def stability(self, *args, **kwargs):
+        """pyscf's stability analysis with the orbital Hessian of :mod:`mojoscf.stability`."""
+        if not _plain_next(self, _MojoHFHook, "stability"):
+            return super().stability(*args, **kwargs)
+        from . import stability
+
+        return stability.stability(self, *args, **kwargs)
+
+    def TDA(self, *args, **kwargs):
+        """pyscf's TDA with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
+        if not (_is_hf(self) and _plain_next(self, _MojoHFHook, "TDA")):
+            return super().TDA(*args, **kwargs)
+        from . import tdscf
+
+        return tdscf.TDA(self, *args, **kwargs)
+
+    def TDHF(self, *args, **kwargs):
+        """pyscf's TDHF (RPA) with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
+        if not (_is_hf(self) and _plain_next(self, _MojoHFHook, "TDHF")):
+            return super().TDHF(*args, **kwargs)
+        from . import tdscf
+
+        return tdscf.TDHF(self, *args, **kwargs)
+
+
 class _MojoRHFMixin(_MojoGlueMixin):
     """Mojo implementations of the RHF glue; mixed in front of a pyscf RHF class."""
 
@@ -734,21 +849,40 @@ def is_supported(mf) -> bool:
 
 
 def accelerate(mf):
-    """Replace the SCF loop and glue methods of an RHF/UHF object with Mojo versions.
+    """Give a pyscf SCF object the Mojo kernels, in place; returns ``mf``.
 
-    The object is modified in place (its class becomes a subclass of the
-    original one with the Mojo mixin in front) and returned.  Density fitting,
-    X2C and other decorations that only change ``get_jk``/``get_hcore`` are
-    preserved; QM/MM objects (``pyscf.qmmm``) get their MM-charge terms from
-    the Mojo engine (:mod:`mojoscf.qmmm`).  ROHF, Kohn-Sham, symmetry-adapted, second-order SCF objects and
-    objects that override the glue methods (smearing, constrained UHF, ...) are
+    RHF and UHF objects the native loop runs (:func:`is_supported`) get the
+    SCF loop and glue methods in Mojo: the class becomes a subclass of the
+    original one with the Mojo mixin in front.  Density fitting, X2C and other
+    decorations that only change ``get_jk``/``get_hcore`` are preserved;
+    QM/MM objects (``pyscf.qmmm``) get their MM-charge terms from the Mojo
+    engine (:mod:`mojoscf.qmmm`).  Other Hartree-Fock objects (ROHF,
+    point-group symmetry, solvent models, second-order SCF, smearing,
+    constrained UHF and other overridden glue methods) keep pyscf's SCF loop
+    with the Mojo J/K, eigensolver, DIIS and post-SCF methods
+    (:class:`_MojoHFHook`); Kohn-Sham objects go to
+    :func:`mojoscf.dft.accelerate`.  Other classes (GHF, Dirac-HF, ...) are
     rejected with ``TypeError``.
     """
-    if isinstance(mf, (_MojoRHFMixin, _MojoUHFMixin)):
+    if isinstance(mf, (_MojoRHFMixin, _MojoUHFMixin, _MojoHFHook)):
         return mf
+    from pyscf.dft.rks import KohnShamDFT
+
+    if isinstance(mf, KohnShamDFT):
+        from . import dft
+
+        return dft.accelerate(mf)
     reason = unsupported_reason(mf)
     if reason is not None:
-        raise TypeError(f"mojoscf.accelerate cannot accelerate {type(mf).__name__}: {reason}")
+        if not isinstance(mf, (pyscf_hf.RHF, pyscf_uhf.UHF)):
+            raise TypeError(f"mojoscf.accelerate cannot accelerate {type(mf).__name__}: {reason}")
+        logger.info(mf, "mojoscf.accelerate: pyscf's SCF loop with the Mojo kernels (%s)", reason)
+        lib.set_class(mf, (_MojoHFHook, type(mf)))
+        _add_qmmm_hook(mf)
+        from . import solvent
+
+        solvent.attach(mf)
+        return mf
     mixin = _MojoUHFMixin if _is_uhf(mf) else _MojoRHFMixin
     cls = type(mf)
     new_cls = _accelerated_classes.get(cls)

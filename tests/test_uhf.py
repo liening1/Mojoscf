@@ -302,17 +302,29 @@ def test_flip_spin_guess_two_centre_antiferromagnet():
 def test_accelerate_rejections(h2o):
     from pyscf import dft
 
-    for obj in (scf.ROHF(h2o), dft.RKS(h2o), dft.UKS(h2o), scf.GHF(h2o), scf.UHF(h2o).newton()):
-        with pytest.raises(TypeError):
-            mojoscf.accelerate(obj)
+    import mojoscf.dft as mdft
+
+    for obj in (scf.ROHF(h2o), scf.UHF(h2o).newton()):          # pyscf's loop with the Mojo kernels
+        assert not mojoscf.is_supported(obj)
+        assert isinstance(mojoscf.accelerate(obj), mojoscf.scf._MojoHFHook)
+    for obj in (dft.RKS(h2o), dft.UKS(h2o)):
+        assert isinstance(mojoscf.accelerate(obj), mdft._MojoKSHook)
+    with pytest.raises(TypeError):
+        mojoscf.accelerate(scf.GHF(h2o))
     assert mojoscf.is_supported(scf.UHF(h2o)) and mojoscf.is_supported(scf.RHF(h2o))
 
 
 def test_overridden_glue_is_detected(oh):
-    # Fermi smearing replaces get_occ & friends; the native loop would ignore it.
+    # Fermi smearing replaces get_occ & friends; the native loop would ignore it, so pyscf's loop runs with
+    # the Mojo kernels
     smeared = scf.addons.smearing_(scf.UHF(oh), sigma=0.01, method="fermi")
-    with pytest.raises(TypeError, match="get_occ"):
-        mojoscf.accelerate(smeared)
+    assert "get_occ" in mojoscf.scf.unsupported_reason(smeared)
+    smeared = mojoscf.accelerate(smeared)
+    assert isinstance(smeared, mojoscf.scf._MojoHFHook)
+    smeared.verbose = 0
+    ref = scf.addons.smearing_(scf.UHF(oh), sigma=0.01, method="fermi")
+    ref.verbose = 0
+    assert abs(smeared.kernel() - ref.kernel()) < 1e-9
     # ... and one installed *after* accelerate() makes kernel() fall back to pyscf's loop
     mf = mojoscf.accelerate(scf.UHF(oh))
     mf.verbose = 0

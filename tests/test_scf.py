@@ -129,13 +129,19 @@ def test_accelerate_density_fitting(h2o_dz):
     _compare(mf, ref)
 
 
-def test_accelerate_rejects_unsupported(h2o):
+def test_accelerate_dispatch(h2o):
+    """Native loop where it applies; pyscf's loop with hooks for other Hartree-Fock objects; Kohn-Sham objects
+    through mojoscf.dft.accelerate; other classes rejected."""
     from pyscf import dft
 
-    with pytest.raises(TypeError, match="ROHF"):
-        mojoscf.accelerate(scf.ROHF(h2o))
-    with pytest.raises(TypeError, match="Kohn-Sham"):
-        mojoscf.accelerate(dft.RKS(h2o))
+    import mojoscf.dft as mdft
+
+    assert isinstance(mojoscf.accelerate(scf.RHF(h2o)), mojoscf.scf._MojoRHFMixin)
+    for mf in (scf.ROHF(h2o), scf.hf.RHF(h2o).newton(), scf.addons.smearing_(scf.hf.RHF(h2o), sigma=0.01)):
+        assert not mojoscf.is_supported(mf)
+        mf = mojoscf.accelerate(mf)
+        assert isinstance(mf, mojoscf.scf._MojoHFHook) and mojoscf.accelerate(mf) is mf
+    assert isinstance(mojoscf.accelerate(dft.RKS(h2o)), mdft._MojoKSHook)
     with pytest.raises(TypeError):
         mojoscf.accelerate(scf.GHF(h2o))
     assert not mojoscf.is_supported(scf.GHF(h2o))
@@ -261,3 +267,82 @@ def test_own_get_jk_is_kept(h2o_dz):
     mf = mojoscf.RHF(h2o_dz)
     mf.kernel()
     assert mf.scf_summary["mojoscf_veff_mode"] == 2
+
+
+@pytest.mark.parametrize("mode", ["incore", "direct", "df"])
+def test_accelerate_rohf_hook_mode(mode, monkeypatch):
+    """ROHF keeps pyscf's loop with the Mojo J/K, eigensolver and DIIS: same iterations and results."""
+    import mojoscf.dft as mdft
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=1, spin=1, verbose=0)
+
+    def make():
+        mf = scf.rohf.ROHF(mol)
+        if mode == "direct":
+            mf.max_memory = 0
+        return mf.density_fit() if mode == "df" else mf
+
+    ref = make().run(conv_tol=1e-10)
+    routed = []
+    orig = mdft.hooked_jk
+    monkeypatch.setattr(mdft, "hooked_jk", lambda *a: routed.append(orig(*a)) or routed[-1])
+    mf = mojoscf.accelerate(make())
+    assert isinstance(mf, mojoscf.scf._MojoHFHook) and mf.DIIS is mojoscf.CDIIS
+    mf.run(conv_tol=1e-10)
+    assert routed and all(r is not None for r in routed)
+    assert abs(mf.e_tot - ref.e_tot) < 1e-9 and mf.cycles == ref.cycles
+    assert abs(mf.mo_energy - ref.mo_energy).max() < 1e-7
+    assert abs(mf.nuc_grad_method().kernel() - ref.nuc_grad_method().kernel()).max() < 1e-7
+
+
+@pytest.mark.parametrize("spin", [0, 2])
+def test_accelerate_symmetry_hook_mode(spin):
+    """Point-group symmetry: pyscf's symmetry-adapted loop (irreps, occupations, its CDIIS) with the Mojo J/K
+    and eigensolver; the Mojo gradients."""
+    mol = gto.M(atom=WATER, basis="def2-svp", spin=spin, symmetry=True, verbose=0)
+    make = scf.RHF if spin == 0 else scf.UHF
+    ref = make(mol).run(conv_tol=1e-10)
+    mf = mojoscf.accelerate(make(mol))
+    assert isinstance(mf, mojoscf.scf._MojoHFHook) and mf.DIIS is not mojoscf.CDIIS
+    mf.run(conv_tol=1e-10)
+    assert abs(mf.e_tot - ref.e_tot) < 1e-9 and mf.cycles == ref.cycles
+    assert mf.get_irrep_nelec() == ref.get_irrep_nelec()
+    g = mf.nuc_grad_method()
+    assert isinstance(g, (mojoscf.grad.Gradients, mojoscf.grad.UGradients))
+    assert abs(g.kernel() - ref.nuc_grad_method().kernel()).max() < 1e-7
+
+
+def test_density_fit_after_accelerate():
+    """density_fit() of a hooked object keeps the Mojo J/K in front of pyscf's density fitting."""
+    from pyscf import dft
+
+    import mojoscf.dft as mdft
+
+    mol = gto.M(atom=WATER, basis="def2-svp", verbose=0)
+    for mf, ref in ((mojoscf.accelerate(dft.RKS(mol, xc="pbe")), dft.RKS(mol, xc="pbe").density_fit()),
+                    (mojoscf.accelerate(scf.rohf.ROHF(mol)), scf.rohf.ROHF(mol).density_fit())):
+        dfmf = mf.density_fit()
+        assert isinstance(dfmf, mojoscf.scf._MojoDFHook)
+        dm = ref.get_init_guess()
+        assert mdft.hooked_jk(dfmf, mojoscf.scf._MojoDFHook, None, dm, 1, True, True, None) is not None
+        j0, k0 = ref.get_jk(mol, dm)
+        j1, k1 = dfmf.get_jk(mol, dm)
+        assert abs(j1 - j0).max() < 1e-10 and abs(k1 - k0).max() < 1e-10
+        assert abs(dfmf.run(conv_tol=1e-10).e_tot - ref.run(conv_tol=1e-10).e_tot) < 1e-9
+
+
+def test_solvent_response_methods_are_kept():
+    """A solvent model's own TDA (the TD wrapper with the solvent response) is not bypassed by the hooks."""
+    from pyscf import dft
+    from pyscf.solvent import _attach_solvent
+
+    mol = gto.M(atom=WATER, basis="6-31g", verbose=0)
+    for make in (lambda: scf.hf.RHF(mol).PCM(), lambda: dft.RKS(mol, xc="b3lyp").PCM()):
+        ref = make().run(conv_tol=1e-10)
+        mf = mojoscf.accelerate(make()).run(conv_tol=1e-10)
+        assert abs(mf.e_tot - ref.e_tot) < 1e-9
+        for eq in (False, True):
+            td = mf.TDA(equilibrium_solvation=eq)
+            assert isinstance(td, _attach_solvent.TDSCFWithSolvent)
+            td0 = ref.TDA(equilibrium_solvation=eq)
+            assert abs(td.kernel(nstates=3)[0] - td0.kernel(nstates=3)[0]).max() < 1e-6

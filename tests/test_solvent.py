@@ -81,14 +81,17 @@ def test_uks_and_hf_attach():
     mf = mojoscf.dft.accelerate(_make(mol, "IEF-PCM", spin=1)).run()
     assert abs(mf.e_tot - ref.e_tot) < 1e-9
     assert abs(mf.nuc_grad_method().kernel() - ref.nuc_grad_method().kernel()).max() < 1e-7
-    # Hartree-Fock: the native loop rejects solvent objects, attach gives the solvent the kernels
+    # Hartree-Fock: the native loop does not run solvent objects; accelerate keeps pyscf's loop with the Mojo
+    # J/K and solvent kernels, attach gives the solvent alone the kernels
     mol = gto.M(atom=WATER, basis="def2-svp", verbose=0)
-    with pytest.raises(TypeError, match="solvent"):
-        mojoscf.accelerate(scf.RHF(mol).PCM())
     ref = scf.RHF(mol).PCM().run(conv_tol=1e-11)
-    mf = solvent.attach(scf.RHF(mol).PCM()).run(conv_tol=1e-11)
-    assert abs(mf.e_tot - ref.e_tot) < 1e-9
-    assert abs(mf.nuc_grad_method().kernel() - ref.nuc_grad_method().kernel()).max() < 1e-8
+    g0 = ref.nuc_grad_method().kernel()
+    mf = mojoscf.accelerate(scf.RHF(mol).PCM())
+    assert isinstance(mf, mojoscf.scf._MojoHFHook) and isinstance(mf.with_solvent, solvent._MojoPCMMixin)
+    for mf in (mf, solvent.attach(scf.RHF(mol).PCM())):
+        mf.run(conv_tol=1e-11)
+        assert abs(mf.e_tot - ref.e_tot) < 1e-9
+        assert abs(mf.nuc_grad_method().kernel() - g0).max() < 1e-8
 
 
 def test_unattached_solvent_keeps_pyscf():
