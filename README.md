@@ -49,8 +49,9 @@ iteration then runs without touching Python or pyscf's C code at all.
   pyscf RKS/UKS object the Mojo exchange-correlation integration (LDA, GGA
   and meta-GGA such as r2SCAN), J/K (including the long-range exchange of
   range-separated hybrids such as ωB97X), eigensolver and nuclear gradients
-  while pyscf's loop drives the SCF: 3.4 to 5.6x faster SCF and 5 to 13x
-  faster gradients than pyscf, with energies agreeing to 1e-10 Eh or better.
+  while pyscf's loop drives the SCF: 3.5 to 5.7x faster SCF cycles and 4.5
+  to 14x faster gradients than pyscf, with energies agreeing to 1e-10 Eh or
+  better.
 * **Excited states** (`mojoscf.tdscf`, `mojoscf.tdgrad`): `mf.TDA()`/`mf.TDDFT()`
   of accelerated objects build the linear response in the occupied-virtual
   space (Coulomb and exchange through MO-basis DF tensors or exact
@@ -288,28 +289,34 @@ a 2.1 GHz Xeon.
 
 | system                                          | nao | grid points | cycles | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | \|dE\| [Eh] |
 |-------------------------------------------------|----:|-------:|------:|------:|------:|-----:|------:|-----:|-----:|--------:|
-| benzene / def2-SVP B3LYP (DF)                   | 114 | 143560 |   7/7 |   7.9 |   2.3 | 3.4x |   3.0 |  0.5 | 6.5x | 1.1e-12 |
-| benzene+ / def2-SVP B3LYP (DF, UKS)             | 114 | 143560 |   9/9 |  14.4 |   3.7 | 3.9x |   4.6 |  0.5 | 9.1x | 1.1e-13 |
-| C8H18 / def2-TZVP PBE (DF)                      | 356 | 289488 | 10/10 |  47.6 |  11.3 | 4.2x |  19.3 |  2.5 | 7.9x | 2.0e-12 |
-| ferrocene / def2-SVP PBE (DF)                   | 221 | 260168 | 20/20 |  57.6 |  12.6 | 4.6x |   9.4 |  1.5 | 6.3x | 1.4e-10 |
-| ferrocene / def2-SVP B3LYP (DF)                 | 221 | 260168 | 51/44 | 155.2 |  30.5 | 5.1x |  15.1 |  1.9 | 7.8x | 2.6e-10 |
-| ferrocene / def2-TZVP PBE (DF)                  | 415 | 260168 | 20/20 | 118.8 |  25.9 | 4.6x |  25.6 |  4.4 | 5.8x | 7.3e-12 |
-| [Fe(H2O)6]2+ quintet / def2-TZVP PBE0 (DF, UKS) | 303 | 223096 | 41/43 | 230.8 |  52.2 | 4.4x |  28.0 |  2.9 | 9.5x | 3.9e-10 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP B3LYP (DF, UKS) | 241 | 193944 | 12/12 |  52.1 |  11.5 | 4.5x |  17.4 |  1.8 | 9.9x | 4.5e-13 |
-| ferrocene / def2-SVP r2SCAN (DF)                | 221 | 260168 | 76/99 | 377.1 |  90.9 | 4.1x |  16.6 |  1.8 | 9.4x | 4.0e-09 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP r2SCAN (DF, UKS) | 241 | 193944 | 12/12 |  97.4 |  17.4 | 5.6x |  21.1 |  1.6 | 12.9x | 6.8e-12 |
-| (H2O)5 / def2-TZVP PBE (in-core)                | 215 | 168496 | 12/12 |  24.0 |   6.7 | 3.6x |  16.3 |  3.3 | 5.0x | 4.5e-13 |
-| C8H18 / 6-31G* B3LYP (direct)                   | 148 | 289488 |   9/9 |  30.4 |   7.9 | 3.9x |  15.7 |  2.2 | 7.0x | 9.1e-13 |
+| benzene / def2-SVP B3LYP (DF)                   | 114 | 143560 |   7/7 |   8.7 |   2.3 | 3.8x |   3.3 |  0.5 | 6.6x | 6.8e-13 |
+| benzene+ / def2-SVP B3LYP (DF, UKS)             | 114 | 143560 |   9/9 |  16.1 |   3.9 | 4.1x |   5.1 |  0.6 | 9.0x | 5.1e-13 |
+| C8H18 / def2-TZVP PBE (DF)                      | 356 | 289488 | 10/10 |  55.2 |  12.3 | 4.5x |  23.3 |  2.8 | 8.4x | 1.8e-12 |
+| ferrocene / def2-SVP PBE (DF)                   | 221 | 260168 | 20/20 |  60.5 |  13.9 | 4.4x |  11.6 |  1.6 | 7.1x | 1.1e-10 |
+| ferrocene / def2-SVP B3LYP (DF)                 | 221 | 260168 | 72/41 | 233.6 |  32.1 | 7.3x |  17.0 |  2.7 | 6.3x | 2.1e-09 |
+| ferrocene / def2-TZVP PBE (DF)                  | 415 | 260168 | 20/20 | 138.0 |  28.1 | 4.9x |  27.4 |  5.1 | 5.4x | 1.1e-11 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP PBE0 (DF, UKS) | 303 | 223096 | 41/41 | 253.5 |  48.8 | 5.2x |  32.5 |  3.4 | 9.6x | 4.5e-12 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP B3LYP (DF, UKS) | 241 | 193944 | 12/12 |  60.4 |  11.9 | 5.1x |  21.1 |  2.1 | 10.2x | 4.5e-13 |
+| ferrocene / def2-SVP r2SCAN (DF)                | 221 | 260168 | 42/85 | 211.5 |  79.1 | 2.7x |  18.4 |  2.0 | 9.3x | 5.8e-09 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP r2SCAN (DF, UKS) | 241 | 193944 | 12/12 |  96.5 |  16.8 | 5.7x |  26.0 |  1.8 | 14.3x | 3.2e-12 |
+| ferrocene / def2-SVP ωB97X (DF)                 | 221 | 260168 | 38/38 | 130.0 |  31.9 | 4.1x |  22.8 |  3.7 | 6.1x | 4.3e-11 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP CAM-B3LYP (DF, UKS) | 241 | 193944 | 12/12 |  61.4 |  13.5 | 4.6x |  26.1 |  3.0 | 8.8x | 9.1e-13 |
+| (H2O)5 / def2-TZVP PBE (in-core)                | 215 | 168496 | 12/12 |  25.0 |   7.1 | 3.5x |  16.3 |  3.6 | 4.5x | 3.4e-13 |
+| C8H18 / 6-31G* B3LYP (direct)                   | 148 | 289488 |   9/9 |  32.4 |   9.1 | 3.6x |  15.1 |  2.7 | 5.7x | 2.3e-13 |
+| Fe(II) porphine triplet / def2-SVP B3LYP (DF, UKS) | 427 | 476568 | 40/42 | 1044.0 | 178.1 | 5.9x | 196.9 | 15.5 | 12.7x | 9.9e-10 |
 
-Energies agree to 4e-10 Eh or better, except for ferrocene/r2SCAN, whose
-SCF converges slowly and along different DIIS paths in the two runs (76 and
-99 cycles; per cycle mojoscf is 5.4x faster) to energies 4e-9 Eh apart.
-The gradients of the independently converged SCFs differ by up to 4e-6
-Eh/Bohr for the slowly converging ferrocene/B3LYP, ferrocene/r2SCAN and
-[Fe(H2O)6]2+/PBE0 runs (conv_tol 1e-9 leaves the density uncertain at
-about 3e-5, and the runs take different DIIS paths); on the same SCF solution
-pyscf's and mojoscf's gradients agree to 9e-12 and the energies to 4e-12 for
-ferrocene/PBE, ferrocene/B3LYP and [Fe(H2O)6]2+/PBE0.
+Energies agree to 1e-10 Eh or better, except for ferrocene with B3LYP and
+r2SCAN, whose SCFs converge slowly and along different DIIS paths in the two
+runs (72 and 41, 42 and 85 cycles; per cycle mojoscf is 4.1x and 5.4x
+faster) to energies 2e-9 and 6e-9 Eh apart.  The gradients of the
+independently converged SCFs differ by up to 6e-6 Eh/Bohr for these slowly
+converging ferrocene runs and Fe(II) porphine, and by up to 8e-7 for the
+others (conv_tol 1e-9
+leaves the density uncertain at about 3e-5, and the runs take different DIIS
+paths); on the same SCF solution pyscf's and mojoscf's gradients agree to
+9e-12 and the energies to 4e-12 for ferrocene/PBE, ferrocene/B3LYP and
+[Fe(H2O)6]2+/PBE0.  On the 2.8 GHz Cascade Lake VM the same benchmark ran
+2.3-3.4x (SCF cycles) and 3.4-7.3x (gradients) faster than pyscf.
 
 * **XC integration.**  pyscf's `NumInt` loops in Python over blocks of grid
   points: basis functions (C), density and potential matrix (GEMMs with
@@ -352,11 +359,8 @@ ferrocene/PBE, ferrocene/B3LYP and [Fe(H2O)6]2+/PBE0.
   J/K agree with libcint to 1e-11).  Same-SCF
   gradients agree with pyscf to about 1e-9, the noise level of the nearly
   singular long-range metric (reciprocal condition number ~1e-22 for water
-  with ωB97X), confirmed against finite differences.  On the 2.8 GHz
-  machine of the excited-state table: ferrocene/def2-SVP ωB97X SCF 89.9 s
-  (pyscf) against 41.3 s (2.2x), gradient 21.9 s against 6.4 s (3.4x);
-  [Cu(NH3)4]2+ doublet/def2-TZVP CAM-B3LYP (UKS) SCF 49.1 s against 19.1 s
-  (2.6x), gradient 24.0 s against 5.1 s (4.7x).  (pyscf's
+  with ωB97X), confirmed against finite differences; see the ωB97X and
+  CAM-B3LYP rows of the table for timings.  (pyscf's
   `range_coulomb(ω)` is a context manager; until this was handled, the
   long-range exchange silently fell back to pyscf's code.)
 * **Meta-GGA** functionals add the kinetic-energy density
