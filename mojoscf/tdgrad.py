@@ -50,14 +50,14 @@ def tdrks_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True, with_kxc=T
     if not isinstance(ni, dft.NumInt):
         return None
     kind = dft._kind(ni, xc_code)
-    if kind not in (0, 1) or not dft._fxc_ok(ni, mol, xc_code) or mf.do_nlc():
+    if kind is None or not dft._fxc_ok(ni, mol, xc_code) or mf.do_nlc():
         return None
     mo_coeff, mo_occ = np.asarray(mf.mo_coeff), np.asarray(mf.mo_occ)
     if mo_coeff.ndim != 2 or not np.isrealobj(mo_coeff):
         return None
     xctype = ni._xc_type(xc_code)
     coords, weights = dft._grid(mf.grids)
-    nvar = (1, 4)[kind]
+    nvar = (1, 4, 5)[kind]
     dmvo = 0.5 * (np.asarray(dmvo) + np.asarray(dmvo).T)
     deriv = 3 if with_kxc else 2
     rho0 = dft._rho_orbitals(mol, coords, kind, [mo_coeff], [mo_occ])[0]           # (nvar, ngrid)
@@ -102,15 +102,21 @@ def tdrks_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True, with_kxc=T
 
 def _xc_matrices(mol, coords, kind, wvs):
     """[(4, nao, nao)] per weight set (nvar, ngrid): the XC matrix and minus the gradient matrices, as pyscf's
-    ``_lda_eval_mat_``/``_gga_eval_mat_`` accumulate them (with the final sign flip), from one pass each."""
+    ``_lda_eval_mat_``/``_gga_eval_mat_``/``_mgga_eval_mat_`` accumulate them (with the final sign flip), from
+    one pass each."""
     from . import dft
 
     nao = mol.nao_nr()
     wv = np.ascontiguousarray(np.array(wvs, dtype=np.float64))               # (nset, nvar, ngrid)
     half = wv.copy()
     half[:, 0] *= 0.5
-    v0 = dft._vmat(mol, coords, kind, half)                                      # symmetrised XC matrices
-    vg = dft._xc_grad(mol, coords, kind == 1, half if kind == 1 else wv)        # gradient matrices
+    vm = half
+    if kind == 2:
+        vm = half.copy()
+        vm[:, 4] *= 0.25                    # _vmat symmetrises: sum_c d_c phi (w_4 / 2) d_c phi^T in all
+        half[:, 4] *= 0.5                   # pyscf's _tau_grad_dot_ weight (the 1/2 of tau)
+    v0 = dft._vmat(mol, coords, kind, vm)                                        # symmetrised XC matrices
+    vg = dft._xc_grad(mol, coords, kind, wv if kind == 0 else half)             # gradient matrices
     out = []
     for v, g in zip(v0, vg):
         m = np.empty((4, nao, nao))
@@ -134,14 +140,14 @@ def tduks_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True, with_kxc=T
     if not isinstance(ni, dft.NumInt):
         return None
     kind = dft._kind(ni, xc_code)
-    if kind not in (0, 1) or not dft._fxc_ok(ni, mol, xc_code) or mf.do_nlc():
+    if kind is None or not dft._fxc_ok(ni, mol, xc_code) or mf.do_nlc():
         return None
     mo_coeff, mo_occ = np.asarray(mf.mo_coeff), np.asarray(mf.mo_occ)
     if mo_coeff.ndim != 3 or not np.isrealobj(mo_coeff):
         return None
     xctype = ni._xc_type(xc_code)
     coords, weights = dft._grid(mf.grids)
-    nvar = (1, 4)[kind]
+    nvar = (1, 4, 5)[kind]
     deriv = 3 if with_kxc else 2
     rho0 = dft._rho_orbitals(mol, coords, kind, list(mo_coeff), list(mo_occ))          # (2, nvar, ngrid)
     r = (rho0[0, 0], rho0[1, 0]) if kind == 0 else (rho0[0], rho0[1])

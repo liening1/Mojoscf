@@ -971,23 +971,34 @@ def xc_vmat_core(
     _ = rcut^
 
 
+def _d2c(x: Int, y: Int) -> Int:
+    """AO component index of d_x d_y phi (pyscf's order: xx 4, xy 5, xz 6, yy 7, yz 8, zz 9)."""
+    var a = min(x, y)
+    var b = max(x, y)
+    return 4 + (b if a == 0 else (b + 2 if a == 1 else 5))
+
+
 def xc_grad_core(
-    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, gga: Bool, nset: Int, wv: F64Ptr, vmat_out: F64Ptr
+    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, kind: Int, nset: Int, wv: F64Ptr, vmat_out: F64Ptr
 ) raises:
     """XC gradient matrices vmat_out[s][x] (nao x nao) of pyscf's ``grad.rks.get_vxc`` (before its sign flip).
 
-    LDA (wv[s] = w v_rho): V_x = sum_p d_x phi(p) [w0(p) phi(p)]^T.
-    GGA (wv[s][0..3] with w0 halved, as pyscf):
+    LDA (``kind`` 0, wv[s] = w v_rho): V_x = sum_p d_x phi(p) [w0(p) phi(p)]^T.
+    GGA (1, wv[s][0..3] with w0 halved, as pyscf):
     V_x = sum_p d_x phi(p) Z(p)^T + Y_x(p) phi(p)^T with Z = sum_c w_c phi_c and
-    Y_x = w0 d_x phi + sum_i w_i d_i d_x phi.  Overwritten.
+    Y_x = w0 d_x phi + sum_i w_i d_i d_x phi.  Meta-GGA (2, wv[s][4] the tau
+    weight halved as in pyscf) adds sum_c d_x d_c phi (w_4 d_c phi)^T (pyscf's
+    ``_tau_grad_dot_``).  Overwritten.
     """
+    var gga = kind >= 1
+    var mgga = kind == 2
     var grid = Grid(ngrid, coords)
     var nderiv = 2 if gga else 1
     var rcut = _rcuts(basis, nderiv)
     var nao = basis.nao
     var n2 = nao * nao
     var ncomp = _ncomp(nderiv)
-    var nw = 4 if gga else 1
+    var nw = _nrho(kind)
     var nblk = grid.nblk
     var nworkers = max(1, min(parallelism_level(), nblk))
     var accl = List[Float64](length=nworkers * nset * 3 * n2 + 1, fill=0.0)
@@ -995,9 +1006,12 @@ def xc_grad_core(
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm nset, imm wv, imm pacc, imm ngrid}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm mgga, imm nset, imm wv, imm pacc, imm ngrid}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nset * 3 * n2)
+        # meta-GGA: w_4 d_c phi for c = x, y, z (3 x nao x BLK)
+        var tl = List[Float64](length=(3 * nao * BLK if mgga else 0) + 2 * W, fill=0.0)
+        var tb = F64Ptr(unsafe_from_address=aligned_addr(tl))
         while True:
             var blk = Int(pcount[].fetch_add(1))
             if blk >= nblk:
@@ -1030,6 +1044,14 @@ def xc_grad_core(
                             var z = ao.unsafe_load[width=W](o) * w0 + ao.unsafe_load[width=W](cs + o) * w1
                             z += ao.unsafe_load[width=W](2 * cs + o) * w2 + ao.unsafe_load[width=W](3 * cs + o) * w3
                             zb.unsafe_store(o, z)
+                    if mgga:
+                        var w4 = _load_w(wv, off + 4 * ngrid, v, npt)
+                        for c in range(3):
+                            var src = ao.unsafe_offset((1 + c) * cs)
+                            var dst = tb.unsafe_offset(c * nrow * BLK)
+                            for i in range(nrow):
+                                var o = i * BLK + v * W
+                                dst.unsafe_store(o, src.unsafe_load[width=W](o) * w4)
                 for x in range(3):
                     var dx_ao = ao.unsafe_offset((1 + x) * cs)
                     try:
@@ -1055,8 +1077,16 @@ def xc_grad_core(
                             blas.gemm(False, True, nrow, nrow, BLK, 1.0, yb, ao, 1.0, ws.dsub())
                         except:
                             pass
+                    if mgga:
+                        for c in range(3):
+                            try:
+                                blas.gemm(False, True, nrow, nrow, BLK, 1.0, ao.unsafe_offset(_d2c(x, c) * cs),
+                                          tb.unsafe_offset(c * nrow * BLK), 1.0, ws.dsub())
+                            except:
+                                pass
                     scatter_add_block(acc.unsafe_offset((s * 3 + x) * n2), nao, nrow, ws)
         _ = ws^
+        _ = tl^
 
     var nthr = blas.serial_begin()
     if nworkers == 1:
@@ -1605,7 +1635,8 @@ def xc_hess_core(
     de2_out: F64Ptr,
 ) raises:
     """XC part of the nuclear Hessian at fixed density matrix (pyscf's ``_get_vxc_diag`` and
-    ``_get_vxc_deriv2`` contracted with the density, no grid response), LDA (``kind`` 0) and GGA (1).
+    ``_get_vxc_deriv2`` contracted with the density, no grid response), LDA (``kind`` 0), GGA (1)
+    and meta-GGA (2).
 
     dms: nspin x nao x nao symmetric (RKS: the total density, UKS: alpha and beta);
     vxc: (nspin nvar) x ngrid and fxc: (nspin nvar) x (nspin nvar) x ngrid, pyscf's
@@ -1619,18 +1650,23 @@ def xc_hess_core(
                          G_y = v_0 d_y phi + sum_c v_c d_y d_c phi,  H_x = sum_c v_c d_x d_c phi
         de2[A,B][x,y] += int w rho1_{A,x} . fxc . rho1_{B,y}
 
-    per spin (the fxc term over both).  The basis functions need derivatives up
-    to order 2 (LDA) or 3 (GGA).  For every atom B on a block one GEMM
-    (D_sub[:, B] [G | d phi]_B) gives the cross term; the fxc term is one
-    GEMM over the (atom, direction) pairs of the block.  de2_out: natm x natm x 3 x 3,
-    overwritten.
+    per spin (the fxc term over both).  Meta-GGA (tau = 1/2 sum_c d_c phi D d_c phi,
+    v_4 its potential) adds v_4 sum_c d_x d_y d_c phi_p Y_c,p / 2 to the diagonal
+    integrand, v_4 sum_c d_x d_c phi_s d_y d_c phi_r / 2 to the cross one, and
+    rho1_{A,x} gets the tau component sum_{q in A} sum_c d_x d_c phi_q Y_c,q.
+    The basis functions need derivatives up to order 2 (LDA) or 3 (GGA, meta-GGA).
+    For every atom B on a block one GEMM (D_sub[:, B] [G | d phi | d d phi]_B)
+    gives the cross term; the fxc term is one GEMM over the (atom, direction)
+    pairs of the block.  de2_out: natm x natm x 3 x 3, overwritten.
     """
-    var gga = kind == 1
+    var gga = kind >= 1
+    var mgga = kind == 2
     var nderiv = 3 if gga else 2
-    var nvar = 4 if gga else 1
+    var nvar = _nrho(kind)
     var nv2 = nspin * nvar
     var ncy = 4 if gga else 1                  # Y_c computed per spin
-    var ngb = 6 if gga else 3                  # [G_x G_y G_z (d_x d_y d_z phi)] per row
+    # [G_x G_y G_z (d_x d_y d_z phi) (xx xy xz yy yz zz second derivatives, meta-GGA)] per row
+    var ngb = 12 if mgga else (6 if gga else 3)
     var grid = Grid(ngrid, coords)
     var rcut = _rcuts(basis, nderiv)
     var nao = basis.nao
@@ -1657,7 +1693,7 @@ def xc_hess_core(
     var pd2 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d2t.unsafe_ptr()))
     var pd3 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d3t.unsafe_ptr()))
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm nvar, imm nv2, imm ncy, imm ngb, imm nspin, imm dms, imm vxc, imm fxc, imm weights, imm aoatm, imm natm, imm pacc, imm nde, imm ngrid, imm pd2, imm pd3}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm mgga, imm nvar, imm nv2, imm ncy, imm ngb, imm nspin, imm dms, imm vxc, imm fxc, imm weights, imm aoatm, imm natm, imm pacc, imm nde, imm ngrid, imm pd2, imm pd3}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nde)
         var n_y = nspin * ncy * nao * BLK
@@ -1731,9 +1767,15 @@ def xc_hess_core(
                                             tt += vs.unsafe_load[width=W]((c + 1) * BLK + q) * ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
                                     var u = hxy.unsafe_load[width=W](o + q) * tt
                                     if gga:
+                                        var ut = F64V(0.0)
                                         for c in range(3):
                                             var h3 = ao.unsafe_offset(pd3[unsafe_offset=(x * 3 + y) * 3 + c] * cs)
-                                            u += vs.unsafe_load[width=W]((c + 1) * BLK + q) * h3.unsafe_load[width=W](o + q) * y0.unsafe_load[width=W](o + q)
+                                            var h3p = h3.unsafe_load[width=W](o + q)
+                                            u += vs.unsafe_load[width=W]((c + 1) * BLK + q) * h3p * y0.unsafe_load[width=W](o + q)
+                                            if mgga:
+                                                ut += h3p * ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
+                                        if mgga:
+                                            u += vs.unsafe_load[width=W](4 * BLK + q) * 0.5 * ut
                                     t += u
                                 var sxy = 2.0 * t.reduce_add()
                                 dd[unsafe_offset=x * 3 + y] += sxy
@@ -1749,11 +1791,17 @@ def xc_hess_core(
                                 var y0p = y0.unsafe_load[width=W](o + q)
                                 rr.unsafe_store(q, rr.unsafe_load[width=W](q) + dxp * y0p * 2.0)
                                 if gga:
+                                    var t4 = F64V(0.0)
                                     for c in range(3):
                                         var hxc = ao.unsafe_offset(pd2[unsafe_offset=x * 3 + c] * cs)
-                                        var t = hxc.unsafe_load[width=W](o + q) * y0p + dxp * ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
+                                        var hxcp = hxc.unsafe_load[width=W](o + q)
+                                        var ycp = ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
+                                        var t = hxcp * y0p + dxp * ycp
                                         rr.unsafe_store((c + 1) * BLK + q, rr.unsafe_load[width=W]((c + 1) * BLK + q) + t * 2.0)
-                # ---- cross term: G_y (and d_y phi) per row
+                                        t4 += hxcp * ycp
+                                    if mgga:
+                                        rr.unsafe_store(4 * BLK + q, rr.unsafe_load[width=W](4 * BLK + q) + t4)
+                # ---- cross term: G_y (and d_y phi, the second derivatives for meta-GGA) per row
                 for r in range(nrow):
                     var o = r * BLK
                     var g = gbuf.unsafe_offset(r * ngb * BLK)
@@ -1769,6 +1817,9 @@ def xc_hess_core(
                             g.unsafe_store(y * BLK + q, t)
                             if gga:
                                 g.unsafe_store((3 + y) * BLK + q, dy.unsafe_load[width=W](o + q))
+                    if mgga:
+                        for k in range(6):
+                            vcopy(g.unsafe_offset((6 + k) * BLK), ao.unsafe_offset((4 + k) * cs + o), BLK)
                     if gga:
                         var h = hbuf.unsafe_offset(r * 3 * BLK)
                         for x in range(3):
@@ -1804,6 +1855,13 @@ def xc_hess_core(
                                         t += dx.unsafe_load[width=W](o + q) * z.unsafe_load[width=W](y * BLK + q)
                                         if gga:
                                             t += hx.unsafe_load[width=W](q) * z.unsafe_load[width=W]((3 + y) * BLK + q)
+                                        if mgga:
+                                            # Z rows 6..11 hold d_y d_c phi of B in the order of components 4..9
+                                            var tm = F64V(0.0)
+                                            for c in range(3):
+                                                var hxc = ao.unsafe_offset(pd2[unsafe_offset=x * 3 + c] * cs)
+                                                tm += hxc.unsafe_load[width=W](o + q) * z.unsafe_load[width=W]((pd2[unsafe_offset=y * 3 + c] + 2) * BLK + q)
+                                            t += vs.unsafe_load[width=W](4 * BLK + q) * 0.5 * tm
                                 dd[unsafe_offset=x * 3 + y] += 2.0 * t.reduce_add()
             # ---- fxc term: U = (w fxc) rho1, M = rho1 U^T over the (atom, direction) pairs
             for k in range(na * 3):
@@ -1884,11 +1942,15 @@ def xc_h1_core(
     cmo: nspin x nao x nmo (occupied first); h1_out: nspin x natm x 3 x nmo x nocc
     with nocc the largest occupied count (a spin with fewer occupied orbitals
     uses its first columns), overwritten (the gradient-matrix part and the
-    overall sign are the caller's).  LDA (``kind`` 0) and GGA (1).
+    overall sign are the caller's).  LDA (``kind`` 0), GGA (1) and meta-GGA (2:
+    rho1 with the tau component of ``xc_hess_core``, and the symmetric tau
+    matrix sum_c d_c phi u_4 d_c phi^T / 2 projected as sum_c Phi_c u_4 Phi_c,o^T / 2).
     """
-    var gga = kind == 1
+    var gga = kind >= 1
+    var mgga = kind == 2
     var nderiv = 2 if gga else 1
-    var nvar = 4 if gga else 1
+    var nvar = _nrho(kind)
+    var nphi = 4 if gga else 1                 # AO components projected to the MO basis
     var nv2 = nspin * nvar
     var ncy = 4 if gga else 1
     var grid = Grid(ngrid, coords)
@@ -1910,13 +1972,13 @@ def xc_h1_core(
                                    (1 if x == 2 else 0) + (1 if y == 2 else 0))
     var pd2 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d2t.unsafe_ptr()))
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm nvar, imm nv2, imm ncy, imm nspin, imm dms, imm fxc, imm weights, imm aoatm, imm natm, imm cmo, imm nmo, imm nocc, imm pacc, imm nh, imm ngrid, imm pd2}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm mgga, imm nvar, imm nphi, imm nv2, imm ncy, imm nspin, imm dms, imm fxc, imm weights, imm aoatm, imm natm, imm cmo, imm nmo, imm nocc, imm pacc, imm nh, imm ngrid, imm pd2}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nh)
         var kmax = 3 * natm
         var n_y = nspin * ncy * nao * BLK
         var n_r1 = kmax * nv2 * BLK
-        var n_phi = nvar * nmo * BLK
+        var n_phi = nphi * nmo * BLK
         var n_z = kmax * nmo * BLK
         var n_zo = kmax * nocc * BLK
         var n_o1 = kmax * nmo * nocc
@@ -1977,10 +2039,16 @@ def xc_h1_core(
                                 var y0p = ys.unsafe_load[width=W](o + q)
                                 rr.unsafe_store(q, rr.unsafe_load[width=W](q) + dxp * y0p * 2.0)
                                 if gga:
+                                    var t4 = F64V(0.0)
                                     for c in range(3):
                                         var hxc = ao.unsafe_offset(pd2[unsafe_offset=x * 3 + c] * cs)
-                                        var t = hxc.unsafe_load[width=W](o + q) * y0p + dxp * ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
+                                        var hxcp = hxc.unsafe_load[width=W](o + q)
+                                        var ycp = ys.unsafe_load[width=W]((c + 1) * nrow * BLK + o + q)
+                                        var t = hxcp * y0p + dxp * ycp
                                         rr.unsafe_store((c + 1) * BLK + q, rr.unsafe_load[width=W]((c + 1) * BLK + q) + t * 2.0)
+                                        t4 += hxcp * ycp
+                                    if mgga:
+                                        rr.unsafe_store(4 * BLK + q, rr.unsafe_load[width=W](4 * BLK + q) + t4)
             # ---- u = w fxc rho1 (density component halved)
             for k in range(nk):
                 var rk = r1.unsafe_offset(k * nv2 * BLK)
@@ -1996,7 +2064,7 @@ def xc_h1_core(
             # ---- projected matrices per output spin
             for t in range(nspin):
                 gather_rows_to(cmo.unsafe_offset(t * nao * nmo), nmo, ws, csub)
-                for c in range(nvar):
+                for c in range(nphi):
                     try:
                         blas.gemm(True, False, nmo, BLK, nrow, 1.0, csub, ao.unsafe_offset(c * cs), 0.0, phi.unsafe_offset(c * nmo * BLK))
                     except:
@@ -2019,6 +2087,21 @@ def xc_h1_core(
                     blas.gemm(False, True, nmo, nk * nocc, BLK, 1.0, phi, zo, 0.0, o2)
                 except:
                     pass
+                if mgga:
+                    # o1 += sum_c (u_4 Phi_c / 2) Phi_c,o^T (Z buffer reused)
+                    for c in range(1, 4):
+                        var pc = phi.unsafe_offset(c * nmo * BLK)
+                        for k in range(nk):
+                            var u4 = ub.unsafe_offset((k * nv2 + t * nvar + 4) * BLK)
+                            var zk = zb.unsafe_offset(k * nmo * BLK)
+                            for m in range(nmo):
+                                for v in range(NV):
+                                    var q = v * W
+                                    zk.unsafe_store(m * BLK + q, u4.unsafe_load[width=W](q) * pc.unsafe_load[width=W](m * BLK + q) * 0.5)
+                        try:
+                            blas.gemm(False, True, nk * nmo, nocc, BLK, 1.0, zb, pc, 1.0, o1)
+                        except:
+                            pass
                 for ia in range(na):
                     for x in range(3):
                         var k = ia * 3 + x

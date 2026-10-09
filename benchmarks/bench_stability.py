@@ -7,7 +7,7 @@ internal analysis, for the cases marked so also the external one (real ->
 complex and RHF -> UHF).  Reported: the time of ``mf.stability``, the SCF
 time and the lowest eigenvalue of each analysis from the log.  Usage:
 
-    python benchmarks/bench_stability.py [--cases a,b,...] [--list]
+    python benchmarks/bench_stability.py [--cases a,b,...] [--list] [--cache FILE]
 """
 from __future__ import annotations
 
@@ -78,7 +78,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", default=",".join(CASES))
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--cache", default=None, help="JSON file keeping pyscf's results between runs")
     args = ap.parse_args()
+    cache = {}
+    if args.cache and os.path.exists(args.cache):
+        with open(args.cache) as f:
+            cache = json.load(f)
+
+    def result(key, driver):
+        tag = f"{key}/{driver}"
+        if driver != "pyscf" or tag not in cache:
+            cache[tag] = run(key, driver, bench_dir)
+            if args.cache and driver == "pyscf":
+                with open(args.cache, "w") as f:
+                    json.dump(cache, f)
+        return cache[tag]
+
     if args.list:
         print("\n".join(f"{k:12s} {v[0]}{'' if v[6] else ', exact integrals'}" for k, v in CASES.items()))
         return
@@ -87,8 +102,8 @@ def main():
           f"{'SCF pyscf':>9s} {'mojoscf':>8s} | lowest eigenvalues (pyscf / mojoscf)")
     for key in args.cases.split(","):
         name, df = CASES[key][0], CASES[key][6]
-        ref = run(key, "pyscf", bench_dir)
-        moj = run(key, "mojoscf", bench_dir)
+        ref = result(key, "pyscf")
+        moj = result(key, "mojoscf")
         eigs = "  ".join(f"{k} {ref['eigs'].get(k, ['-'])[0]:.6g} / {moj['eigs'].get(k, ['-'])[0]:.6g}"
                          for k in sorted(set(ref["eigs"]) | set(moj["eigs"])))
         flag = "" if ref["stable"] == moj["stable"] else f"  STABILITY DIFFERS {ref['stable']} {moj['stable']}"

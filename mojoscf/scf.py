@@ -410,6 +410,14 @@ class _MojoDFHook:
         """Density-fitted nuclear gradients with Mojo derivative integrals (:mod:`mojoscf.grad`)."""
         return _mojo_grad_method(self, _MojoDFHook)
 
+    Gradients = nuc_grad_method
+
+    def Hessian(self):
+        """pyscf's density-fitted Hessian with the Mojo kernels (:mod:`mojoscf.hessian`)."""
+        from . import hessian
+
+        return hessian.accelerate(super().Hessian())
+
 
 def _add_qmmm_hook(mf):
     """Put ``mojoscf.qmmm._MojoQMMMHook`` in front of a QM/MM object (pyscf.qmmm) that lacks it.
@@ -473,6 +481,24 @@ class _MojoGlueMixin:
         from . import stability
 
         return stability.stability(self, internal, external, verbose, return_status, **kwargs)
+
+    def Hessian(self):
+        """pyscf's analytical Hessian (DF or not) with the Mojo kernels (:mod:`mojoscf.hessian`)."""
+        from . import hessian
+
+        return hessian.accelerate(super().Hessian())
+
+    def TDA(self, frozen=None):
+        """pyscf's TDA with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
+        from . import tdscf
+
+        return tdscf.TDA(self, frozen)
+
+    def TDHF(self, frozen=None):
+        """pyscf's TDHF (RPA) with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
+        from . import tdscf
+
+        return tdscf.TDHF(self, frozen)
 
 
 class _MojoRHFMixin(_MojoGlueMixin):
@@ -547,6 +573,8 @@ class _MojoRHFMixin(_MojoGlueMixin):
         """Nuclear gradients with Mojo derivative integrals (:mod:`mojoscf.grad`)."""
         return _mojo_grad_method(self, _MojoRHFMixin)
 
+    Gradients = nuc_grad_method
+
 
 class _MojoUHFMixin(_MojoGlueMixin):
     """Mojo implementations of the UHF glue; mixed in front of a pyscf UHF class.
@@ -605,6 +633,8 @@ class _MojoUHFMixin(_MojoGlueMixin):
     def nuc_grad_method(self):
         """Nuclear gradients with Mojo derivative integrals (:mod:`mojoscf.grad`)."""
         return _mojo_grad_method(self, _MojoUHFMixin)
+
+    Gradients = nuc_grad_method
 
 
 class RHF(_MojoRHFMixin, pyscf_hf.RHF):

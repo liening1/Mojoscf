@@ -340,3 +340,18 @@ def test_df_gradient_scanner_follows_geometry():
         e0, g0 = ref_scanner(geom)
         assert abs(e - e0) < 1e-9
         assert abs(g - g0).max() < 1e-8
+
+
+def test_gradients_hooks_of_all_classes():
+    """mf.Gradients() and mf.nuc_grad_method() give the Mojo gradients (pyscf binds Gradients to its own
+    classes, the DF one included)."""
+    from pyscf import dft
+
+    from mojoscf import grad as mgrad
+
+    mol = gto.M(atom="H 0 0 0; F 0 0 1", basis="sto-3g", verbose=0)
+    objs = [mojoscf.RHF(mol), mojoscf.UHF(mol), mojoscf.RHF(mol).density_fit(), mojoscf.UHF(mol).density_fit(),
+            mojoscf.dft.accelerate(dft.RKS(mol)), mojoscf.dft.accelerate(dft.UKS(mol).density_fit())]
+    for mf in objs:
+        for g in (mf.Gradients(), mf.nuc_grad_method()):
+            assert type(g).__module__ == mgrad.__name__, type(mf).__name__

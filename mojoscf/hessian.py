@@ -27,39 +27,20 @@ def xc_partial_hess(ni, mol, grids, xc_code, mo_coeff, mo_occ):
 
     The sum pyscf's ``partial_hess_elec`` forms from ``_get_vxc_diag`` and
     ``_get_vxc_deriv2`` (contracted with the density, no grid response),
-    computed in one pass over the grid (``xc_hess_core``) for LDA and GGA,
-    restricted (``mo_coeff`` (nao, nmo)) or unrestricted ((2, nao, nmo)).
+    computed in one pass over the grid (``xc_hess_core``) for LDA, GGA and
+    meta-GGA (without the laplacian), restricted (``mo_coeff`` (nao, nmo)) or
+    unrestricted ((2, nao, nmo)).
     """
     from . import dft
 
     kind = dft._kind(ni, xc_code)
-    if kind not in (0, 1) or not dft._fxc_ok(ni, mol, xc_code):
+    if kind is None or not dft._fxc_ok(ni, mol, xc_code):
         return None
-    mo_coeff = np.asarray(mo_coeff)
-    coords, weights = dft._grid(grids)
-    if mo_coeff.ndim == 2:
-        occ = np.asarray(mo_occ)
-        rho = dft._rho_orbitals(mol, coords, kind, [mo_coeff], [occ])[0]
-        vxc, fxc = ni.eval_xc_eff(xc_code, rho[0] if kind == 0 else rho, deriv=2, xctype=ni._xc_type(xc_code))[1:3]
-        c = mo_coeff[:, occ > 0]
-        dms = ((c * occ[occ > 0]) @ c.T)[None]
-        nspin = 1
-    else:
-        occs = [np.asarray(o) for o in mo_occ]
-        rho = dft._rho_orbitals(mol, coords, kind, list(mo_coeff), occs)
-        r = (rho[0, 0], rho[1, 0]) if kind == 0 else (rho[0], rho[1])
-        vxc, fxc = ni.eval_xc_eff(xc_code, r, deriv=2, xctype=ni._xc_type(xc_code), spin=1)[1:3]
-        dms = np.array([(c[:, o > 0] * o[o > 0]) @ c[:, o > 0].T for c, o in zip(mo_coeff, occs)])
-        nspin = 2
-    nvar = (1, 4)[kind]
-    ngrid = coords.shape[0]
-    vxc = np.ascontiguousarray(np.asarray(vxc, dtype=np.float64).reshape(nspin * nvar, ngrid))
-    fxc = np.ascontiguousarray(np.asarray(fxc, dtype=np.float64).reshape(nspin * nvar, nspin * nvar, ngrid))
+    coords, weights, dms, vxc, fxc = _xc_inputs(ni, mol, grids, xc_code, mo_coeff, mo_occ, kind)
     de2 = np.empty((mol.natm, mol.natm, 3, 3))
     path, prefix = worker_blas()
-    get_extension().xc_hess(integrals.basis_tables(mol), coords, np.ascontiguousarray(weights, dtype=np.float64),
-                            int(kind), np.ascontiguousarray(dms, dtype=np.float64), vxc, fxc, _ao_atoms(mol), de2,
-                            path, prefix)
+    get_extension().xc_hess(integrals.basis_tables(mol), coords, weights, int(kind), dms, vxc, fxc, _ao_atoms(mol),
+                            de2, path, prefix)
     return de2
 
 
@@ -82,7 +63,7 @@ def _xc_inputs(ni, mol, grids, xc_code, mo_coeff, mo_occ, kind):
         vxc, fxc = ni.eval_xc_eff(xc_code, r, deriv=2, xctype=ni._xc_type(xc_code), spin=1)[1:3]
         dms = np.array([(c[:, o > 0] * o[o > 0]) @ c[:, o > 0].T for c, o in zip(mo_coeff, occs)])
     nspin = dms.shape[0]
-    nvar = (1, 4)[kind]
+    nvar = (1, 4, 5)[kind]
     ngrid = coords.shape[0]
     vxc = np.ascontiguousarray(np.asarray(vxc, dtype=np.float64).reshape(nspin * nvar, ngrid))
     fxc = np.ascontiguousarray(np.asarray(fxc, dtype=np.float64).reshape(nspin * nvar, nspin * nvar, ngrid))
@@ -101,15 +82,17 @@ def xc_h1mo(ni, mol, grids, xc_code, mo_coeff, mo_occ):
     from . import dft
 
     kind = dft._kind(ni, xc_code)
-    if kind not in (0, 1) or not dft._fxc_ok(ni, mol, xc_code):
+    if kind is None or not dft._fxc_ok(ni, mol, xc_code):
         return None
     coords, weights, dms, vxc, fxc = _xc_inputs(ni, mol, grids, xc_code, mo_coeff, mo_occ, kind)
     nspin = dms.shape[0]
-    nvar = (1, 4)[kind]
+    nvar = (1, 4, 5)[kind]
     wv = (vxc * weights).reshape(nspin, nvar, -1)
-    if kind == 1:
+    if kind >= 1:
         wv[:, 0] *= 0.5
-    vgrad = dft._xc_grad(mol, coords, kind == 1, np.ascontiguousarray(wv))        # (nspin, 3, nao, nao)
+    if kind == 2:
+        wv[:, 4] *= 0.5                                                          # the 1/2 of tau
+    vgrad = dft._xc_grad(mol, coords, kind, np.ascontiguousarray(wv))            # (nspin, 3, nao, nao)
     cs = [np.asarray(mo_coeff)] if nspin == 1 else [np.asarray(c) for c in mo_coeff]
     occs = [np.asarray(mo_occ)] if nspin == 1 else [np.asarray(o) for o in mo_occ]
     perms = [np.concatenate((np.flatnonzero(o > 0), np.flatnonzero(o == 0))) for o in occs]
@@ -592,7 +575,6 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
     from pyscf.lib import logger
 
     mf = hessobj.base
-    mol = hessobj.mol
     if mo_coeff is None:
         mo_coeff = mf.mo_coeff
     if mo_occ is None:
@@ -1057,9 +1039,16 @@ class _ZeroXC1:
         return False
 
 
+def _is_ks(mf):
+    from pyscf.scf import hf
+
+    return isinstance(mf, hf.KohnShamDFT)
+
+
 class _MojoHessMixin:
-    """In front of pyscf's RKS/UKS Hessian classes (DF or not): the XC terms from the Mojo kernels and,
-    for density-fitted references, the Coulomb/exchange terms from :func:`df_jk_terms`."""
+    """In front of pyscf's RHF/UHF/RKS/UKS Hessian classes (DF or not): the XC terms from the Mojo kernels,
+    the Coulomb/exchange terms from :func:`df_jk_terms` (density fitting) or :func:`exact_jk_partial` and
+    :func:`exact_h1mo` (exact integrals), the coupled-perturbed equations in the MO basis."""
 
     __name_mixin__ = "Mojo"
 
@@ -1067,10 +1056,23 @@ class _MojoHessMixin:
         return self.grids if getattr(self, "grids", None) is not None else self.base.grids
 
     def _xc_partial(self, mo_coeff, mo_occ):
-        """XC part of the partial Hessian (all atoms): the Mojo kernel, else pyscf's terms."""
+        """XC part of the partial Hessian (all atoms): the Mojo kernel, else pyscf's terms; zero for HF."""
         mf = self.base
+        if not _is_ks(mf):
+            return np.zeros((self.mol.natm, self.mol.natm, 3, 3))
         xc = xc_partial_hess(mf._numint, self.mol, self._grids(), mf.xc, mo_coeff, mo_occ)
         return xc if xc is not None else _pyscf_xc_partial(self, mo_coeff, mo_occ)
+
+    def _xc_h1mo(self, mo_coeff, mo_occ):
+        """The XC part of the projected Fock derivatives (:func:`xc_h1mo`; zeros for HF), or None."""
+        mf = self.base
+        if _is_ks(mf):
+            return xc_h1mo(mf._numint, self.mol, self._grids(), mf.xc, mo_coeff, mo_occ)
+        unrestricted = np.asarray(mo_coeff).ndim == 3
+        cs = list(mo_coeff) if unrestricted else [mo_coeff]
+        occs = list(mo_occ) if unrestricted else [mo_occ]
+        return [np.zeros((self.mol.natm, 3, np.asarray(c).shape[1], int((np.asarray(o) > 0).sum())))
+                for c, o in zip(cs, occs)]
 
     def partial_hess_elec(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None, max_memory=4000,
                           verbose=None):
@@ -1092,6 +1094,8 @@ class _MojoHessMixin:
         if jk is not None:
             de2 = _hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
             return de2[np.ix_(atm, atm)]
+        if not _is_ks(mf):
+            return super().partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, verbose)
         xc = xc_partial_hess(mf._numint, mol, self._grids(), mf.xc, mo_coeff, mo_occ)
         if xc is None:
             return super().partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, verbose)
@@ -1119,7 +1123,7 @@ class _MojoHessMixin:
             return super().hess_elec(mo_energy, mo_coeff, mo_occ, mo1, mo_e1, h1ao, atmlst, max_memory, verbose)
         log = logger.new_logger(self, verbose)
         t0 = (logger.process_clock(), logger.perf_counter())
-        xch1 = xc_h1mo(mf._numint, mol, self._grids(), mf.xc, mo_coeff, mo_occ)
+        xch1 = self._xc_h1mo(mo_coeff, mo_occ)
         jk = df_jk_terms(self, mo_coeff, mo_occ, with_h1=True)
         if xch1 is None and jk is None:
             return super().hess_elec(mo_energy, mo_coeff, mo_occ, mo1, mo_e1, h1ao, atmlst, max_memory, verbose)
@@ -1208,7 +1212,6 @@ class _MojoHessMixin:
         fx = cphf_operator(mf, mo_coeff, mo_occ)
         if fx is None:
             fx = (uhf_hess if unrestricted else rhf_hess).gen_vind(mf, mo_coeff, mo_occ)
-        nao = mol.nao_nr()
         nmo, nocc = hmo[0].shape[2], sum(h.shape[3] for h in hmo)
         mem_now = lib.current_memory()[0]
         max_memory = max(2000, max_memory * 0.9 - mem_now)

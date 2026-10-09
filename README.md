@@ -51,17 +51,19 @@ iteration then runs without touching Python or pyscf's C code at all.
   range-separated hybrids such as ωB97X), eigensolver and nuclear gradients
   while pyscf's loop drives the SCF: 3.4 to 5.6x faster SCF and 5 to 13x
   faster gradients than pyscf, with energies agreeing to 1e-10 Eh or better.
-* **Excited states** (`mojoscf.tdscf`): `mf.TDA()`/`mf.TDDFT()` of
-  accelerated objects build the linear response of density-fitted
-  references in the occupied-virtual space (Coulomb and exchange through the
-  MO-basis DF tensor, the XC kernel in one fused pass): 3.3 to 6.5x faster than pyscf's
-  operators for benzene, ferrocene and a Cu(II) complex, with the same
-  excitation energies.
+* **Excited states** (`mojoscf.tdscf`, `mojoscf.tdgrad`): `mf.TDA()`/`mf.TDDFT()`
+  of accelerated objects build the linear response in the occupied-virtual
+  space (Coulomb and exchange through MO-basis DF tensors or exact
+  integrals, the XC kernel in one fused pass): 3.3 to 8.6x faster than
+  pyscf's operators for benzene, ferrocene and Cu(II) complexes, with the
+  same excitation energies; excited-state gradients 3.9 to 4.5x faster, and
+  the SCF stability analysis on the same operators 5.4 to 8.1x.
 * **Analytical Hessians** (`mojoscf.hessian`): `mf.Hessian()` of
-  accelerated objects keeps pyscf's driver and computes the XC terms, the
-  density-fitted Coulomb/exchange second derivatives and the
+  accelerated Kohn-Sham objects (LDA, GGA, meta-GGA) and of the mojoscf
+  Hartree-Fock classes keeps pyscf's driver and computes the XC terms, the
+  Coulomb/exchange second derivatives (DF or exact integrals) and the
   coupled-perturbed equations with Mojo kernels in the MO basis:
-  4.3 to 7.2x faster than pyscf for benzene, ferrocene and a Cu(II) complex,
+  4.3 to 8.3x faster than pyscf for benzene, ferrocene and Cu(II) complexes,
   with the same Hessians to about 1e-8.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
@@ -175,24 +177,24 @@ benchmarks/bench_bs.py [--heavy]`, 4 cores, direct SCF unless marked DF).
 
 | system                              | nao | E_RHF-E_BS [mEh] | <S^2>  | cycles | pyscf [s] | mojoscf [s] | speed-up | &#124;ΔE&#124; [Eh] |
 |-------------------------------------|----:|-----------------:|-------:|-------:|----------:|------------:|---------:|-------:|
-| H2, R = 2.0 Å / cc-pVDZ             |  10 |             80.9 |  0.904 |    7/7 |      0.02 |        0.01 |    1.9x  | 1e-15 |
-| H2, R = 3.0 Å / cc-pVDZ             |  10 |            172.3 |  0.995 |    6/6 |      0.02 |        0.01 |    2.0x  | 2e-15 |
-| H10 chain, AFM / 6-31G              |  20 |            298.3 |  3.693 |    8/8 |      0.03 |        0.02 |    1.8x  | 4e-14 |
-| H20 chain, AFM / 6-31G              |  40 |            595.3 |  7.266 |    8/8 |      0.05 |        0.03 |    1.7x  | 4e-14 |
-| H30 chain, AFM / 6-31G              |  60 |            892.3 | 10.840 |    8/8 |      0.12 |        0.09 |    1.3x  | 9e-14 |
-| H40 chain, AFM / 6-31G              |  80 |           1189.3 | 14.413 |    8/8 |      1.13 |        0.28 |    4.0x  | 1e-13 |
-| N2, R = 2.2 Å / cc-pVDZ             |  28 |            346.1 |  1.993 |  15/15 |      0.07 |        0.03 |    2.6x  | 1e-14 |
-| F2, R = 2.6 Å / cc-pVDZ             |  28 |            304.6 |  1.001 |    8/8 |      0.04 |        0.02 |    2.1x  | 6e-14 |
-| twisted C2H4 (90°) / cc-pVDZ        |  48 |             98.3 |  1.035 |  10/10 |      0.08 |        0.06 |    1.5x  | 1e-13 |
-| [Cu2Cl6]2-, AFM / def2-SVP (DF)     | 170 |                  |  1.009 |  10/10 |     18.09 |       16.01 |    1.1x  | 3e-11 |
-| [Fe2S2(SH)4]2-, AFM / def2-SVP (DF) | 190 |                  |  4.988 |  39/39 |     68.35 |       47.28 |    1.4x  | 1e-11 |
+| H2, R = 2.0 Å / cc-pVDZ             |  10 |             80.9 |  0.904 |    7/7 |      0.02 |        0.01 |    2.0x  | 3e-15 |
+| H2, R = 3.0 Å / cc-pVDZ             |  10 |            172.3 |  0.995 |    6/6 |      0.02 |        0.01 |    1.7x  | 2e-15 |
+| H10 chain, AFM / 6-31G              |  20 |            298.3 |  3.693 |    8/8 |      0.03 |        0.01 |    2.2x  | 3e-14 |
+| H20 chain, AFM / 6-31G              |  40 |            595.3 |  7.266 |    8/8 |      0.04 |        0.03 |    1.4x  | 6e-14 |
+| H30 chain, AFM / 6-31G              |  60 |            892.3 | 10.840 |    8/8 |      0.09 |        0.06 |    1.5x  | 1e-13 |
+| H40 chain, AFM / 6-31G              |  80 |           1189.3 | 14.413 |    8/8 |      1.20 |        0.20 |    6.2x  | 1e-13 |
+| N2, R = 2.2 Å / cc-pVDZ             |  28 |            346.1 |  1.993 |  13/13 |      0.05 |        0.02 |    2.2x  | 1e-14 |
+| F2, R = 2.6 Å / cc-pVDZ             |  28 |            304.6 |  1.001 |    8/8 |      0.03 |        0.02 |    2.0x  | 0     |
+| twisted C2H4 (90°) / cc-pVDZ        |  48 |             98.3 |  1.035 |  10/10 |      0.08 |        0.04 |    1.8x  | 1e-14 |
+| [Cu2Cl6]2-, AFM / def2-SVP (DF)     | 170 |                  |  1.009 |  10/10 |     15.92 |        9.19 |    1.7x  | 2e-11 |
+| [Fe2S2(SH)4]2-, AFM / def2-SVP (DF) | 190 |                  |  4.988 |  40/40 |     66.49 |       34.04 |    2.0x  | 6e-12 |
 
 The two metal dimers are antiferromagnetically coupled singlets prepared by
 flipping the spin of one metal centre in the converged high-spin density
 (`flip_spin_on_atoms`): Cu(II)/Cu(II) (Mulliken spin +0.842 / -0.842, BS 0.18 mEh
 above the triplet) and Fe(III)/Fe(III) with five unpaired electrons per iron
 (Mulliken spin +3.88 / -4.54, BS 16.5 mEh below the S = 5 state), the latter
-needing 39 cycles with a 0.3 Eh level shift.  The N2 row is one of two
+needing 40 cycles with a 0.3 Eh level shift.  The N2 row is one of two
 broken-symmetry states the mix guess can reach (on the previous machine both
 codes reached the other one, 190.6 mEh, <S^2> = 1.018), and the RHF reference
 of twisted ethylene has degenerate pi orbitals; see the degenerate-shell caveat
@@ -338,8 +340,10 @@ ferrocene/PBE, ferrocene/B3LYP and [Fe(H2O)6]2+/PBE0.
   orbitals: `C^T grad phi`, three more GEMMs), `sum_c d_c phi (w_tau d_c phi)^T`
   to the potential matrix and the corresponding second-derivative term to
   the gradient kernel; r2SCAN, SCAN, TPSS and M06-L agree with pyscf to
-  about 1e-14.  Functionals that need the laplacian of the density (BR89,
-  ...) are rejected by pyscf as well.
+  about 1e-14.  The response kernels, the Hessian terms and the
+  excited-state gradient contractions carry tau as well.  Functionals that
+  need the laplacian of the density (BR89, ...) are rejected by pyscf as
+  well.
 * **Thread pools.**  With pyscf's loop around the kernels, NumPy calls
   (DIIS, `make_rdm1`) alternate with Mojo passes, and every threaded OpenBLAS
   call leaves its worker threads spinning for about 0.13 s.  mojoscf now uses
@@ -452,9 +456,8 @@ initial guesses and analysis and replaces the operator:
   without forming the matrices.  The XC-kernel contractions
   (`_contract_xc_kernel`: second and third functional derivatives with the
   transition and relaxed densities on the grid) run in Mojo passes and the
-  Z-vector equations through the Mojo J/K and XC kernels.  pyscf has no
-  density-fitted TDDFT gradients; meta-GGA kernels keep pyscf's XC
-  contraction.
+  Z-vector equations through the Mojo J/K and XC kernels (meta-GGA
+  included).  pyscf has no density-fitted TDDFT gradients.
 
 `benchmarks/bench_tddft.py`: pyscf versus `mojoscf.dft.accelerate`, each in
 its own process, density fitting, pyscf's default grids, conv_tol 1e-9 for
@@ -487,6 +490,24 @@ with pyscf's on the same TD solution to 1e-11 (`tests/test_tdgrad.py`).
 tensors that do not fit in `max_memory` run pyscf's operator (Kohn-Sham
 objects still with the Mojo XC kernels).
 
+With exact integrals (pyscf's default) and the nuclear gradient of the first
+excited state (`td.nuc_grad_method()`, `bench_tddft.py --grad`), on the
+2.1 GHz machine of the SCF tables:
+
+| system                                              | nao | states | TD pyscf [s] | mojoscf [s] | x | gradient pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dE\| [eV] |
+|-----------------------------------------------------|----:|---:|------:|-----:|-----:|------:|-----:|-----:|------:|-----:|--------:|
+| benzene / def2-SVP B3LYP, TDDFT                     | 114 | 10 |  64.3 |  9.0 | 7.2x |  13.8 |  3.4 | 4.1x |   7.0 |  2.2 | 5.5e-12 |
+| benzene / def2-SVP CAM-B3LYP, TDA                   | 114 | 10 |  53.5 |  6.2 | 8.6x |  22.2 |  5.0 | 4.5x |  11.2 |  3.0 | 3.3e-12 |
+| ferrocene / def2-SVP PBE0, TDA                      | 221 | 10 | 536.4 | 78.7 | 6.8x | 101.9 | 22.6 | 4.5x | 109.5 | 31.0 | 1.0e-04 |
+| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP, TDA (UKS)    | 147 |  8 | 183.3 | 26.2 | 7.0x |  58.5 | 14.9 | 3.9x |  23.4 |  6.5 | 6.5e-12 |
+
+The gradients agree with pyscf's to 5e-10 Eh/bohr for benzene and the Cu(II)
+complex.  The first excited state of (eclipsed, D5h) ferrocene is one of a
+degenerate pair (2.32 eV, as are the next ones), so its gradient depends on
+the combination of the pair each Davidson run ends with: the two codes'
+gradients differ by up to 9e-4 Eh/bohr here, while on the same TD solution
+they agree to 1e-11 (`tests/test_tdgrad.py`).
+
 ### SCF stability analysis
 
 `mf.stability()` (`pyscf.scf.stability`) looks for the lowest eigenvalues of
@@ -500,9 +521,15 @@ mojoscf classes runs, takes them from the `mojoscf.tdscf` operators (DF
 tensors, MO-basis ERIs or integral-direct J/K, the projected XC kernel)
 for all vectors of an iteration at once (`lib.davidson1` with a batched
 operator in place of pyscf's per-vector `lib.davidson`), with pyscf's Fock
-blocks, initial guess, preconditioner, thresholds and orbital rotation; the
-products agree with pyscf's to 1e-9 (relative) for RHF/RKS/UHF/UKS with
-global and range-separated hybrids, DF or exact (`tests/test_stability.py`).
+blocks, preconditioner, thresholds and orbital rotation; the products agree
+with pyscf's to 1e-9 (relative) for RHF/RKS/UHF/UKS with global and
+range-separated hybrids, DF or exact (`tests/test_stability.py`).  The
+starting space adds unit vectors on the lowest diagonal elements to pyscf's
+single vector: from that vector alone Davidson reaches the symmetry sectors
+it does not span only through rounding noise, and for the octahedral
+[Fe(H2O)6]2+ quintet (UKS B3LYP) pyscf's analysis stopped at the second
+root (0.0294) in one of two runs on the same SCF solution, the lowest being
+0.0148.
 
 ### Analytical Hessians
 
@@ -515,14 +542,17 @@ second-derivative terms (`_partial_hess_ejk`, `_gen_jk`: per-atom `einsum`s
 over six kinds of libcint derivative integrals, intermediates in temporary
 HDF5 files) and the coupled-perturbed equations for the 3N perturbations
 (AO first-order densities through `get_jk` and `nr_rks_fxc` in every
-iteration).  `mojoscf.hessian`, which `mf.Hessian()` of accelerated objects
-returns (`mojoscf.hessian.accelerate(h)` for any RKS/UKS Hessian object),
+iteration).  `mojoscf.hessian`, which `mf.Hessian()` of accelerated Kohn-Sham
+objects and of the mojoscf Hartree-Fock classes returns
+(`mojoscf.hessian.accelerate(h)` for any RHF/UHF/RKS/UKS Hessian object),
 keeps pyscf's driver, nuclear term and CPHF solver and replaces the rest:
 
 * **XC partial Hessian in one pass** (`xc_hess_core`): AO values up to third
   derivatives per block, the second-derivative term per AO row, the
   atom-pair terms as GEMMs over the rows of each atom and the kernel term,
-  contracted with the density on the spot: no nao x nao matrices.
+  contracted with the density on the spot: no nao x nao matrices.  LDA, GGA
+  and meta-GGA (the kinetic-energy density in the response densities, its
+  potential with the third and second AO derivatives).
 * **First-order Fock matrices in the MO basis.**  Only `C^T F^(A,x) C_o`
   enters the CPHF and the Hessian; the XC kernel part is projected inside the
   grid pass (`xc_h1_core`) and the Coulomb/exchange part comes from the
@@ -567,6 +597,15 @@ the TDDFT table:
 | ferrocene / def2-SVP CAM-B3LYP              | 221 | 1552.8 | 225.0 | 6.9x |  90.8 | 40.2 | 1.5e-06 | 0.04 |
 | [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  118.6 |  27.8 | 4.3x |  16.6 |  4.4 | 2.3e-08 | 0.00 |
 
+With exact integrals (pyscf's default), on the 2.1 GHz machine of the SCF
+tables:
+
+| system                                      | nao | Hessian pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dH\| | max \|dfreq\| [cm^-1] |
+|---------------------------------------------|----:|-------:|------:|-----:|------:|-----:|--------:|-----:|
+| benzene / def2-SVP B3LYP                    | 114 |  125.1 |  15.1 | 8.3x |   7.2 |  2.3 | 4.6e-12 | 0.00 |
+| benzene / def2-SVP CAM-B3LYP                | 114 |  187.2 |  27.5 | 6.8x |  14.1 |  3.6 | 4.0e-12 | 0.00 |
+| [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  101.4 |  17.1 | 5.9x |  14.0 |  3.3 | 1.1e-09 | 0.00 |
+
 max |dH| is in Eh/bohr^2.  The ferrocene Hessians differ by up to 3e-6
 because the two independently converged SCFs do (conv_tol 1e-10); on the same SCF
 solution the ferrocene PBE0 Hessians agree to 1.6e-7 (the coupled-perturbed
@@ -580,13 +619,13 @@ also for a Pd complex with def2 effective core potentials
 (`tests/test_hessian.py`); range-separated functionals to about 1e-9 (their
 long-range metric is numerically singular).  In the ferrocene PBE0 run about 60% of mojoscf's
 time is the XC response in the CPHF iterations, which, like the other XC
-kernels, is bound by the throughput of its per-block GEMMs.
+kernels, is bound by the throughput of its per-block GEMMs (stacking the
+response vectors of a block into larger GEMMs made it 18% slower: the
+per-vector GEMMs, rows x 128 points x rows, are already of medium size).
 
-Meta-GGA functionals use pyscf's XC Hessian terms next to the native
-Coulomb/exchange ones; PCM/SMD solvent models, NLC, `auxbasis_response < 2`,
-objects with a `get_jk` of their own and short-range operators with
-omega < 0 run pyscf's code for the Coulomb/exchange part (pyscf's solvent
-terms included).
+PCM/SMD solvent models, NLC, `auxbasis_response < 2`, objects with a
+`get_jk` of their own and short-range operators with omega < 0 run pyscf's
+code for the Coulomb/exchange part (pyscf's solvent terms included).
 
 ### QM/MM
 
@@ -994,8 +1033,9 @@ de = td.nuc_grad_method().kernel(state=1)        # excited-state gradient (mojos
 # SCF stability analysis (pyscf.scf.stability) with the same response operators
 mo_i, mo_e, stable_i, stable_e = mf.stability(external=True, return_status=True)
 
-# Analytical Hessians (pyscf.hessian): XC, DF Coulomb/exchange and CPHF terms from the Mojo kernels
+# Analytical Hessians (pyscf.hessian): XC, Coulomb/exchange (DF or exact) and CPHF terms from the Mojo kernels
 hess = mf.Hessian().kernel()                    # (natm, natm, 3, 3), pyscf's driver and conventions
+hess = mojoscf.RHF(mol).run().Hessian().kernel()   # Hartree-Fock too (mf.TDA(), mf.TDHF() likewise)
 
 # Use the individual kernels
 from mojoscf import kernels
@@ -1132,9 +1172,8 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   that do not fit in `max_memory` and objects with a `get_jk` of their own
   keep pyscf's operator (with the Mojo XC response kernels for Kohn-Sham).
   Excited-state gradients (exact integrals; pyscf has no DF version) run
-  pyscf's driver with the Mojo kernels (`mojoscf.tdgrad`); meta-GGA kernels
-  keep pyscf's XC contraction there.  ROKS/GHF and spin-flip TDDFT stay
-  pyscf's.
+  pyscf's driver with the Mojo kernels (`mojoscf.tdgrad`).  ROKS/GHF and
+  spin-flip TDDFT stay pyscf's.
 * **Stability analysis**: `mf.stability()` of the mojoscf classes runs the
   internal (RHF/RKS, UHF/UKS) and external RHF/RKS analyses with the
   occupied-virtual operators; ROHF, GHF, the UHF -> GHF analysis,
@@ -1178,9 +1217,9 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   range-separated hybrids), with exact or density-fitted
   (in-core `pyscf.df.DF`, auxiliary-basis response included) two-electron
   integrals.
-* Analytical Hessians: `mf.Hessian()` of accelerated RKS/UKS objects keeps
-  pyscf's driver; the XC terms are native for LDA and GGA (meta-GGA uses
-  pyscf's XC Hessian terms), the Coulomb/exchange terms and the CPHF
+* Analytical Hessians: `mf.Hessian()` of accelerated RKS/UKS objects and of
+  the mojoscf RHF/UHF classes keeps pyscf's driver; the XC terms are native
+  for LDA, GGA and meta-GGA, the Coulomb/exchange terms and the CPHF
   operator for density-fitted references (in-core `pyscf.df.DF`,
   `auxbasis_response = 2`) and exact integrals (in-core or
   integral-direct), global and range-separated hybrids; NLC, solvent

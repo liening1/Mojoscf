@@ -132,12 +132,13 @@ def _vmat(mol, coords, kind, wv):
     return v + v.transpose(0, 2, 1)
 
 
-def _xc_grad(mol, coords, gga, wv):
-    """(nset, 3, nao, nao) XC gradient matrices of pyscf's ``grad.rks.get_vxc`` before its sign flip."""
+def _xc_grad(mol, coords, kind, wv):
+    """(nset, 3, nao, nao) XC gradient matrices of pyscf's ``grad.rks.get_vxc`` before its sign flip
+    (``kind`` 0 LDA, 1 GGA, 2 meta-GGA; ``wv`` in pyscf's convention, see :func:`_grad_weights`)."""
     nao = mol.nao_nr()
     v = np.empty((wv.shape[0], 3, nao, nao))
     path, prefix = worker_blas()
-    get_extension().xc_grad(integrals.basis_tables(mol), coords, int(gga), np.ascontiguousarray(wv), v,
+    get_extension().xc_grad(integrals.basis_tables(mol), coords, int(kind), np.ascontiguousarray(wv), v,
                             path, prefix)
     return v
 
@@ -426,28 +427,28 @@ def _grad_weights(ni, xc_code, rho, weights, spin):
 
 
 def grad_rks_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1, max_memory=2000, verbose=None):
-    """``pyscf.grad.rks.get_vxc`` (no grid response) for LDA and GGA, from the Mojo kernels: (None, -vmat)."""
-    xctype = ni._xc_type(xc_code)
-    gga = xctype == "GGA"
+    """``pyscf.grad.rks.get_vxc`` (no grid response) for LDA, GGA and meta-GGA, from the Mojo kernels:
+    (None, -vmat)."""
+    kind = _kind(ni, xc_code)
     nao = mol.nao_nr()
     dm = np.ascontiguousarray(np.asarray(dms, dtype=np.float64).reshape(-1, nao, nao))
     coords, weights = _grid(grids)
-    rho = _rho(mol, coords, int(gga), dm, _orbitals(dms, dm.shape[0], nao))
-    vmat = _xc_grad(mol, coords, gga, _grad_weights(ni, xc_code, rho, weights, 0))
+    rho = _rho(mol, coords, kind, dm, _orbitals(dms, dm.shape[0], nao))
+    vmat = _xc_grad(mol, coords, kind, _grad_weights(ni, xc_code, rho, weights, 0))
     if vmat.shape[0] == 1:
         vmat = vmat[0]
     return None, -vmat
 
 
 def grad_uks_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1, max_memory=2000, verbose=None):
-    """``pyscf.grad.uks.get_vxc`` (no grid response) for LDA and GGA, from the Mojo kernels: (None, -vmat)."""
-    xctype = ni._xc_type(xc_code)
-    gga = xctype == "GGA"
+    """``pyscf.grad.uks.get_vxc`` (no grid response) for LDA, GGA and meta-GGA, from the Mojo kernels:
+    (None, -vmat)."""
+    kind = _kind(ni, xc_code)
     nao = mol.nao_nr()
     dm = np.ascontiguousarray(np.asarray(dms, dtype=np.float64).reshape(2, nao, nao))
     coords, weights = _grid(grids)
-    rho = _rho(mol, coords, int(gga), dm, _orbitals(dms, 2, nao))
-    vmat = _xc_grad(mol, coords, gga, _grad_weights(ni, xc_code, rho, weights, 1))
+    rho = _rho(mol, coords, kind, dm, _orbitals(dms, 2, nao))
+    vmat = _xc_grad(mol, coords, kind, _grad_weights(ni, xc_code, rho, weights, 1))
     return None, -vmat
 
 
@@ -507,7 +508,7 @@ def _install_grad_vxc():
 
         def get_vxc(ni, mol, grids, xc_code, dms, relativity=0, hermi=1, max_memory=2000, verbose=None):
             if (isinstance(ni, NumInt) and relativity == 0 and nset_ok(mol, dms)
-                    and _passes_ok(ni, mol, xc_code, dms, hermi, max_kind=1)):
+                    and _passes_ok(ni, mol, xc_code, dms, hermi)):
                 return mojo_fn(ni, mol, grids, xc_code, dms, relativity, hermi, max_memory, verbose)
             return orig(ni, mol, grids, xc_code, dms, relativity, hermi, max_memory, verbose)
 

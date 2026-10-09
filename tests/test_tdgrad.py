@@ -102,10 +102,24 @@ def test_tdhf_gradients_match_pyscf():
     assert abs(g.kernel(state=1) - tduhf.Gradients(td).kernel(state=1)).max() < 1e-11
 
 
-def test_meta_gga_keeps_pyscf_xc_contraction():
-    mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
-    mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="tpss")).run()
-    td = _td(mf, "TDA", nstates=2)
+@pytest.mark.parametrize("xc, method, spin, singlet", [("tpss", "TDA", 0, True), ("tpss", "TDDFT", 0, False),
+                                                       ("tpssh", "TDDFT", 0, True), ("m06l", "TDA", 1, True)])
+def test_meta_gga_td_gradients_match_pyscf(xc, method, spin, singlet):
+    """Meta-GGA kernels (tau in the response densities and the XC matrices) in the native contraction.
+
+    (r2SCAN is left out: libxc's third derivative of it is NaN at grid points of
+    density ~1e-15, and pyscf's own gradient fails in the Z-vector equations.)"""
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = mojoscf.dft.accelerate((dft.UKS if spin else dft.RKS)(mol, xc=xc))
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    td = _td(mf, method, singlet)
     g = td.Gradients()
-    assert tdgrad.tdrks_xc_kernel(g, mf.xc, np.eye(mol.nao)) is None
-    assert abs(g.kernel(state=1) - tdrks.Gradients(td).kernel(state=1)).max() < 1e-11
+    eye = np.eye(mol.nao)
+    if spin:
+        assert tdgrad.tduks_xc_kernel(g, mf.xc, (eye, eye), (eye, eye)) is not None
+        ref = tduks.Gradients(td).kernel(state=1)
+    else:
+        assert tdgrad.tdrks_xc_kernel(g, mf.xc, eye, eye, singlet=singlet) is not None
+        ref = tdrks.Gradients(td).kernel(state=1)
+    assert abs(g.kernel(state=1) - ref).max() < 1e-10

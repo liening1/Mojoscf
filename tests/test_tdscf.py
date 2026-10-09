@@ -279,3 +279,17 @@ def test_metal_complex_uks():
     mf = _scf(mol, "b3lyp")
     ref = _pyscf_copy(mf)
     _check(mtd.TDA(mf), ref.TDA(), nstates=4)
+
+
+def test_hartree_fock_td_hooks():
+    """mf.TDA() / mf.TDHF() of the mojoscf HF classes create the MO-space TD classes."""
+    from pyscf.tdscf import rhf as td_rhf
+    from pyscf.tdscf import uhf as td_uhf
+
+    mol = gto.M(atom=WATER, basis="def2-svp", verbose=0)
+    for mf in (mojoscf.RHF(mol).run(), mojoscf.UHF(mol).run(), mojoscf.RHF(mol).density_fit().run()):
+        module = td_uhf if isinstance(mf, scf.uhf.UHF) else td_rhf
+        for td, ref in ((mf.TDA(), module.TDA(mf)), (mf.TDHF(), module.TDHF(mf))):
+            assert isinstance(td, mtd._MojoTD) and not isinstance(ref, mtd._MojoTD)
+            td.nstates = ref.nstates = 3
+            assert abs(td.kernel()[0] - ref.kernel()[0]).max() < 1e-9

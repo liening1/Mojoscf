@@ -82,6 +82,32 @@ def ferrocene_atoms(fe_ring=1.66, cc=1.43, ch=1.08):
     return atoms
 
 
+def porphyrin_atoms(metal="Fe", mn=2.00):
+    """Idealised D4h metalloporphine M(C20H12N4) in the xy plane.
+
+    Bond lengths of metalloporphyrin crystal structures: M-N ``mn``, N-Ca 1.37,
+    Ca-Cb 1.44, Cb-Cb 1.36, Ca-Cm 1.40, C-H 1.08 (Ca-N-Ca 106 degrees).
+    """
+    a = np.radians(53.0)
+    ca = (mn + 1.37 * np.cos(a), 1.37 * np.sin(a))
+    yb = 0.68
+    xb = ca[0] + np.sqrt(1.44**2 - (ca[1] - yb) ** 2)
+    d = np.array([xb - (mn + 1.12), yb])
+    hb = np.array([xb, yb]) + 1.08 * d / np.linalg.norm(d)
+    pyrrole = [("N", (mn, 0.0)), ("C", ca), ("C", (ca[0], -ca[1])), ("C", (xb, yb)), ("C", (xb, -yb)),
+               ("H", tuple(hb)), ("H", (hb[0], -hb[1]))]
+    # meso carbon on the diagonal, 1.40 from the C_a of both neighbouring pyrroles
+    p, q = ca
+    m = ((p + q) + np.sqrt((p + q) ** 2 - 2 * (p * p + q * q - 1.40**2))) / 2
+    meso = [("C", (m, m)), ("H", (m + 1.08 / np.sqrt(2), m + 1.08 / np.sqrt(2)))]
+    atoms = [(metal, (0.0, 0.0, 0.0))]
+    for k in range(4):
+        c, s_ = np.cos(k * np.pi / 2), np.sin(k * np.pi / 2)
+        for sym, (x, y) in pyrrole + meso:
+            atoms.append((sym, (c * x - s_ * y, s_ * x + c * y, 0.0)))
+    return atoms
+
+
 def _ligand(kind, pos, axis):
     """Atoms of a ligand bound through its first atom at ``pos``, pointing along the unit vector ``axis``."""
     axis = np.asarray(axis, float) / np.linalg.norm(axis)

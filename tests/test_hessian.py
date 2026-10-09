@@ -41,7 +41,8 @@ def _pyscf_xc_partial(mf):
     return de2
 
 
-@pytest.mark.parametrize("xc, spin", [("lda,vwn", 0), ("pbe", 0), ("b3lyp", 0), ("pbe", 1), ("b3lyp", 1)])
+@pytest.mark.parametrize("xc, spin", [("lda,vwn", 0), ("pbe", 0), ("b3lyp", 0), ("pbe", 1), ("b3lyp", 1),
+                                      ("tpss", 0), ("r2scan", 1), ("m06l", 0), ("tpssh", 1)])
 def test_xc_partial_hessian_matches_pyscf(xc, spin):
     mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
     mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc).run()
@@ -50,15 +51,10 @@ def test_xc_partial_hessian_matches_pyscf(xc, spin):
     assert abs(de2 - ref).max() < 1e-10
 
 
-def test_xc_partial_hessian_rejects_meta_gga(water=None):
-    mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
-    mf = dft.RKS(mol, xc="tpss").run()
-    assert mhess.xc_partial_hess(mdft.NumInt(), mol, mf.grids, "tpss", mf.mo_coeff, mf.mo_occ) is None
-
-
 @pytest.mark.parametrize("xc, spin, df", [("b3lyp", 0, True), ("pbe", 0, False), ("camb3lyp", 0, True),
                                           ("pbe", 1, True), ("b3lyp", 1, False), ("tpss", 0, True),
-                                          ("b3lyp", 0, False), ("camb3lyp", 0, False), ("wb97x", 1, False)])
+                                          ("b3lyp", 0, False), ("camb3lyp", 0, False), ("wb97x", 1, False),
+                                          ("m06l", 1, True), ("tpssh", 0, False)])
 def test_accelerated_hessian_matches_pyscf(xc, spin, df):
     mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
 
@@ -120,7 +116,7 @@ def test_cphf_operator_falls_back_with_own_get_jk():
     assert mhess.cphf_operator(mf) is None
 
 
-@pytest.mark.parametrize("xc, spin", [("lda,vwn", 0), ("pbe", 0), ("b3lyp", 1)])
+@pytest.mark.parametrize("xc, spin", [("lda,vwn", 0), ("pbe", 0), ("b3lyp", 1), ("tpss", 0), ("r2scan", 1)])
 def test_xc_h1mo_matches_pyscf(xc, spin):
     """The projected XC first-derivative Fock matrices against pyscf's _get_vxc_deriv1."""
     mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
@@ -349,3 +345,27 @@ def test_exact_first_order_fock_jk(spin, omega):
         vj, vk = mi.h1_jk(mol, [dm], [dm], omega=omega)
         for ia in range(mol.natm):
             assert abs(vj[ia, :, 0] - 0.5 * vk[ia, :, 0] - (ref[ia] - hcore(ia))).max() < 1e-10
+
+
+@pytest.mark.parametrize("spin, df", [(0, False), (1, False), (0, True), (1, True)])
+def test_hartree_fock_hessian_matches_pyscf(spin, df):
+    """mf.Hessian() of the mojoscf HF classes: exact or DF J/K terms, Fock derivatives and CPHF from the kernels."""
+    from pyscf import scf
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = (mojoscf.UHF if spin else mojoscf.RHF)(mol)
+    ref = (scf.UHF if spin else scf.RHF)(mol)
+    if df:
+        mf, ref = mf.density_fit(), ref.density_fit()
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    for key in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(ref, key, getattr(mf, key))
+    h = mf.Hessian()
+    assert isinstance(h, mhess._MojoHessMixin)
+    if df:
+        assert mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
+    else:
+        assert mhess._exact_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
+    assert mhess.cphf_operator(mf) is not None
+    assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-9

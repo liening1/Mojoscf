@@ -15,11 +15,13 @@ so the two-electron and XC parts come from the operators of
 call of the integral-direct kernel, the projected XC kernel), for all
 vectors of a Davidson iteration at once (``lib.davidson1`` with a batched
 operator in place of pyscf's per-vector ``lib.davidson``).  The Fock blocks,
-initial guesses, preconditioners, thresholds and the orbital rotation are
-pyscf's.  RHF/RKS (internal and external) and UHF/UKS (internal) objects
-take this route; ROHF, GHF, the UHF -> GHF analysis, point-group symmetry
-labels, solvent models and the cases :mod:`mojoscf.tdscf` leaves to pyscf
-run pyscf's code.
+preconditioners, thresholds and the orbital rotation are pyscf's; the
+starting space adds unit vectors on the lowest diagonal elements to pyscf's
+single vector (:func:`_guesses`), so that the lowest roots of symmetric
+molecules do not depend on rounding noise.  RHF/RKS (internal and external)
+and UHF/UKS (internal) objects take this route; ROHF, GHF, the UHF -> GHF
+analysis, point-group symmetry labels, solvent models and the cases
+:mod:`mojoscf.tdscf` leaves to pyscf run pyscf's code.
 
 >>> mf = mojoscf.dft.accelerate(dft.UKS(mol, xc="b3lyp").density_fit()).run()
 >>> mo_i, mo_e, stable_i, stable_e = mf.stability(return_status=True)
@@ -111,6 +113,25 @@ def _davidson(aop, x0, precond, tol, log, nroots):
     if nroots == 1:
         return e[0], x[0]
     return e, x
+
+
+def _guesses(x0, hdiag, allowed, nroots):
+    """pyscf's starting vector ``x0`` and unit vectors on the ``nroots + 2`` lowest diagonal elements among the
+    ``allowed`` rotations.
+
+    From pyscf's single vector Davidson reaches the symmetry sectors that
+    vector does not span only through rounding noise, so in a symmetric
+    molecule the lowest root may or may not be found (high-spin Fe(II) in
+    octahedral water: either solver missed it in one of two runs); the unit
+    vectors put the low-lying sectors into the first subspace.
+    """
+    idx = np.flatnonzero(allowed)
+    xs = [x0]
+    for i in idx[np.argsort(hdiag[idx], kind="stable")[: nroots + 2]]:
+        u = np.zeros_like(x0)
+        u[i] = 1.0
+        xs.append(u)
+    return xs
 
 
 def _vo_op(chans, fock, two, xc, ys_sign, jscale, xc_scale, scale):
@@ -219,8 +240,9 @@ def rhf_internal(mf, with_symmetry=True, verbose=None, return_status=False, nroo
     x0[g != 0] = 1.0 / hdiag[g != 0]
     if not with_symmetry:
         x0[np.argmin(hdiag)] = 1
+    xs = _guesses(x0, hdiag, g != 0 if with_symmetry else np.ones(g.size, dtype=bool), nroots)
     with serial_scipy_blas():
-        e, v = _davidson(aop, x0, precond, tol, log, nroots)
+        e, v = _davidson(aop, xs, precond, tol, log, nroots)
     log.info("rhf_internal: lowest eigs of H = %s", e)
     if nroots != 1:
         e, v = e[0], v[0]
@@ -248,8 +270,9 @@ def uhf_internal(mf, with_symmetry=True, verbose=None, return_status=False, nroo
     x0[g != 0] = 1.0 / hdiag[g != 0]
     if not with_symmetry:
         x0[np.argmin(hdiag)] = 1
+    xs = _guesses(x0, hdiag, g != 0 if with_symmetry else np.ones(g.size, dtype=bool), nroots)
     with serial_scipy_blas():
-        e, v = _davidson(aop, x0, precond, tol, log, nroots)
+        e, v = _davidson(aop, xs, precond, tol, log, nroots)
     log.info("uhf_internal: lowest eigs of H = %s", e)
     if nroots != 1:
         e, v = e[0], v[0]
@@ -279,18 +302,19 @@ def rhf_external(mf, with_symmetry=True, verbose=None, return_status=False, nroo
         return dx / hdiagd
 
     with serial_scipy_blas():
+        allowed = hdiag > 1e-5 if with_symmetry else np.ones(hdiag.size, dtype=bool)
         x0 = np.zeros_like(hdiag)
         x0[hdiag > 1e-5] = 1.0 / hdiag[hdiag > 1e-5]
         if not with_symmetry:
             x0[np.argmin(hdiag)] = 1
-        e1, v1 = _davidson(hop1, x0, precond, tol, log, nroots)
+        e1, v1 = _davidson(hop1, _guesses(x0, hdiag, allowed, nroots), precond, tol, log, nroots)
         log.info("rhf_real2complex: lowest eigs of H = %s", e1)
         if nroots != 1:
             e1, v1 = e1[0], v1[0]
         pstab.dump_status(log, not (e1 < -1e-5), f"{mf.__class__}", "real -> complex")
         x0 = np.zeros_like(hdiag)
         x0[hdiag > 1e-5] = 1.0 / hdiag[hdiag > 1e-5]
-        e3, v3 = _davidson(hop2, x0, precond, tol, log, nroots)
+        e3, v3 = _davidson(hop2, _guesses(x0, hdiag, hdiag > 1e-5, nroots), precond, tol, log, nroots)
     log.info("rhf_external: lowest eigs of H = %s", e3)
     if nroots != 1:
         e3, v3 = e3[0], v3[0]
