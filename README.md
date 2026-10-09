@@ -177,28 +177,34 @@ benchmarks/bench_bs.py [--heavy]`, 4 cores, direct SCF unless marked DF).
 
 | system                              | nao | E_RHF-E_BS [mEh] | <S^2>  | cycles | pyscf [s] | mojoscf [s] | speed-up | &#124;ΔE&#124; [Eh] |
 |-------------------------------------|----:|-----------------:|-------:|-------:|----------:|------------:|---------:|-------:|
-| H2, R = 2.0 Å / cc-pVDZ             |  10 |             80.9 |  0.904 |    7/7 |      0.02 |        0.01 |    2.0x  | 3e-15 |
-| H2, R = 3.0 Å / cc-pVDZ             |  10 |            172.3 |  0.995 |    6/6 |      0.02 |        0.01 |    1.7x  | 2e-15 |
-| H10 chain, AFM / 6-31G              |  20 |            298.3 |  3.693 |    8/8 |      0.03 |        0.01 |    2.2x  | 3e-14 |
-| H20 chain, AFM / 6-31G              |  40 |            595.3 |  7.266 |    8/8 |      0.04 |        0.03 |    1.4x  | 6e-14 |
-| H30 chain, AFM / 6-31G              |  60 |            892.3 | 10.840 |    8/8 |      0.09 |        0.06 |    1.5x  | 1e-13 |
-| H40 chain, AFM / 6-31G              |  80 |           1189.3 | 14.413 |    8/8 |      1.20 |        0.20 |    6.2x  | 1e-13 |
-| N2, R = 2.2 Å / cc-pVDZ             |  28 |            346.1 |  1.993 |  13/13 |      0.05 |        0.02 |    2.2x  | 1e-14 |
-| F2, R = 2.6 Å / cc-pVDZ             |  28 |            304.6 |  1.001 |    8/8 |      0.03 |        0.02 |    2.0x  | 0     |
-| twisted C2H4 (90°) / cc-pVDZ        |  48 |             98.3 |  1.035 |  10/10 |      0.08 |        0.04 |    1.8x  | 1e-14 |
-| [Cu2Cl6]2-, AFM / def2-SVP (DF)     | 170 |                  |  1.009 |  10/10 |     15.92 |        9.19 |    1.7x  | 2e-11 |
-| [Fe2S2(SH)4]2-, AFM / def2-SVP (DF) | 190 |                  |  4.988 |  40/40 |     66.49 |       34.04 |    2.0x  | 6e-12 |
+| H2, R = 2.0 Å / cc-pVDZ             |  10 |             80.9 |  0.904 |    7/7 |      0.03 |        0.01 |    2.4x  | 2e-15 |
+| H2, R = 3.0 Å / cc-pVDZ             |  10 |            172.3 |  0.995 |    6/6 |      0.02 |        0.01 |    2.5x  | 9e-16 |
+| H10 chain, AFM / 6-31G              |  20 |            298.3 |  3.693 |    8/8 |      0.03 |        0.02 |    2.2x  | 3e-14 |
+| H20 chain, AFM / 6-31G              |  40 |            595.3 |  7.266 |    8/8 |      0.04 |        0.03 |    1.4x  | 5e-14 |
+| H30 chain, AFM / 6-31G              |  60 |            892.3 | 10.840 |    8/8 |      0.11 |        0.07 |    1.5x  | 1e-13 |
+| H40 chain, AFM / 6-31G              |  80 |           1189.3 | 14.413 |    8/8 |      1.12 |        0.23 |    4.8x  | 1e-13 |
+| N2, R = 2.2 Å / cc-pVDZ             |  28 |            346.1 |  1.993 |  13/13 |      0.05 |        0.02 |    2.5x  | 1e-13 |
+| F2, R = 2.6 Å / cc-pVDZ             |  28 |            304.6 |  1.001 |    8/8 |      0.04 |        0.03 |    1.4x  | 0     |
+| twisted C2H4 (90°) / cc-pVDZ        |  48 |             98.3 |  1.035 |  10/10 |      0.09 |        0.05 |    1.7x  | 2e-13 |
+| [Cu2Cl6]2-, AFM / def2-SVP (DF)     | 170 |                  |  1.009 |  10/10 |     16.79 |        3.95 |    4.3x  | 2e-11 |
+| [Fe2S2(SH)4]2-, AFM / def2-SVP (DF) | 190 |                  |  4.988 |  38/38 |     71.53 |       12.70 |    5.6x  | 3e-12 |
 
 The two metal dimers are antiferromagnetically coupled singlets prepared by
 flipping the spin of one metal centre in the converged high-spin density
 (`flip_spin_on_atoms`): Cu(II)/Cu(II) (Mulliken spin +0.842 / -0.842, BS 0.18 mEh
 above the triplet) and Fe(III)/Fe(III) with five unpaired electrons per iron
 (Mulliken spin +3.88 / -4.54, BS 16.5 mEh below the S = 5 state), the latter
-needing 40 cycles with a 0.3 Eh level shift.  The N2 row is one of two
-broken-symmetry states the mix guess can reach (on the previous machine both
+needing 38 cycles with a 0.3 Eh level shift.  The two dimers gained most from
+the per-worker DF exchange (*The exchange update of small and medium
+molecules* below): 1.7x and 2.0x before.  The N2 row is one of two
+broken-symmetry states the mix guess can reach (on another machine both
 codes reached the other one, 190.6 mEh, <S^2> = 1.018), and the RHF reference
 of twisted ethylene has degenerate pi orbitals; see the degenerate-shell caveat
-below.  Measured on the 2.1 GHz machine with the default Mojo integrals.
+below.  Measured on the 2.1 GHz machine with the default Mojo integrals.  On a
+2.8 GHz Cascade Lake VM the level-shifted [Fe2S2] iteration took 88 cycles in
+pyscf and 108 in mojoscf, with energies 2e-7 Eh apart at conv_tol 1e-8: that
+SCF is sensitive to the rounding of the CPU's BLAS kernels (pyscf alone went
+from 38 to 88 cycles); [Cu2Cl6]2- took 12.8 s against 4.2 s there.
 
 ### Transition-metal complexes
 
@@ -211,21 +217,26 @@ default def2 JK-fitting basis, "direct" `max_memory=1`.
 
 | system                                         | nao | cycles | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | \|dE\| [Eh] |
 |------------------------------------------------|----:|------:|------:|------:|-----:|------:|------:|-----:|--------:|
-| ferrocene / def2-SVP (DF)                      | 221 | 14/14 |   14.5 |    3.8 | 3.8x |    7.9 |   1.5 | 5.2x | 4.5e-12 |
-| ferrocene / def2-TZVP (DF)                     | 415 | 16/16 |   31.5 |    9.3 | 3.4x |   20.3 |   5.7 | 3.6x | 1.1e-11 |
-| [Fe(H2O)6]2+ quintet / def2-TZVP (DF, UHF)     | 303 | 45/45 |   67.7 |   15.5 | 4.4x |   12.8 |   2.2 | 5.8x | 5.5e-12 |
-| [Fe(H2O)6]2+ 12H2O quintet / def2-SVP (DF, UHF) | 463 | 56/56 |  575.4 |  163.0 | 3.5x |  131.0 |  11.6 | 11.3x | 6.5e-11 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP (DF, UHF)     | 241 | 15/15 |   19.4 |    3.8 | 5.1x |    7.2 |   1.3 | 5.7x | 5.5e-11 |
-| Ni(CO)4 / def2-TZVP (DF)                       | 293 | 15/15 |   16.0 |    4.0 | 4.1x |    7.3 |   1.7 | 4.3x | 2.8e-11 |
-| cisplatin / def2-TZVP (DF, Pt ECP)             | 212 | 12/12 |    8.1 |    2.2 | 3.7x |    4.6 |   1.9 | 2.4x | 1.1e-12 |
-| ferrocene / def2-SVP (direct)                  | 221 | 14/14 |   64.4 |   22.7 | 2.8x |   36.5 |   8.6 | 4.3x | 4.5e-12 |
-| [Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)  | 175 | 28/28 |   55.7 |   18.4 | 3.0x |   13.9 |   3.2 | 4.3x | 2.4e-11 |
-| cisplatin / def2-SVP (direct, Pt ECP)          | 126 | 12/12 |   13.5 |    2.5 | 5.3x |    6.0 |   1.5 | 4.0x | 2.7e-12 |
-| Ni(CO)4 / def2-SVP (in-core)                   | 143 | 14/14 |    6.2 |    1.2 | 5.3x |    6.0 |   1.4 | 4.4x | 1.5e-11 |
+| ferrocene / def2-SVP (DF)                      | 221 | 14/14 |   13.9 |    3.6 | 3.8x |    8.4 |   1.8 | 4.7x | 5.5e-12 |
+| ferrocene / def2-TZVP (DF)                     | 415 | 16/16 |   33.1 |    9.4 | 3.5x |   24.6 |   7.3 | 3.3x | 1.8e-11 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP (DF, UHF)     | 303 | 45/45 |   74.1 |   16.7 | 4.4x |   14.1 |   2.3 | 6.0x | 3.2e-12 |
+| [Fe(H2O)6]2+ 12H2O quintet / def2-SVP (DF, UHF) | 463 | 56/56 |  651.9 |  141.0 | 4.6x |  155.4 |  14.2 | 10.9x | 6.0e-11 |
+| Fe(II) porphine triplet / def2-SVP (DF, UHF)   | 427 | 32/32 |  303.6 |   68.7 | 4.4x |  131.8 |  12.4 | 10.6x | 4.4e-10 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP (DF, UHF)     | 241 | 15/15 |   20.4 |    4.1 | 5.0x |    7.9 |   1.4 | 5.8x | 6.0e-11 |
+| Ni(CO)4 / def2-TZVP (DF)                       | 293 | 15/15 |   16.5 |    4.6 | 3.6x |    8.7 |   2.1 | 4.1x | 3.0e-11 |
+| cisplatin / def2-TZVP (DF, Pt ECP)             | 212 | 12/12 |    8.4 |    2.0 | 4.2x |    4.9 |   1.9 | 2.5x | 1.8e-12 |
+| ferrocene / def2-SVP (direct)                  | 221 | 14/14 |   71.0 |   28.4 | 2.5x |   41.0 |   9.5 | 4.3x | 4.5e-13 |
+| [Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)  | 175 | 28/28 |   58.9 |   19.0 | 3.1x |   14.8 |   3.3 | 4.4x | 1.8e-11 |
+| cisplatin / def2-SVP (direct, Pt ECP)          | 126 | 12/12 |   12.5 |    2.7 | 4.6x |    5.7 |   1.6 | 3.5x | 1.4e-12 |
+| Ni(CO)4 / def2-SVP (in-core)                   | 143 | 14/14 |    6.1 |    1.1 | 5.5x |    6.5 |   1.4 | 4.6x | 1.5e-11 |
 
 Gradients agree to 1e-11 or better except for the direct UHF Fe(II) case
-(3e-8), where the two independently converged SCF solutions differ at that
-level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
+(8e-9) and Fe(II) porphine (2e-6), where the two independently converged SCF
+solutions differ at that level (on the same SCF object they agree to 1e-12,
+`tests/test_grad.py`).  The same benchmark on a 2.8 GHz Cascade Lake VM (an
+older core, where the AVX-512 kernels of mojoscf gain less than pyscf's C
+code from the higher clock) gave 2.0-4.4x for the SCF and 2.1-6.7x for the
+gradients.
 
 * **Effective core potentials** only change the one-electron Hamiltonian,
   so molecules with ECPs (4d/5d metals with def2 or similar basis sets) use
@@ -239,8 +250,9 @@ level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
   OpenBLAS bundled with pyscf (0.3.3, no AVX-512 kernels: 13 GFLOPS per
   thread for these shapes on this machine), while mojoscf's worker threads
   call NumPy's newer OpenBLAS pinned to one thread each (45 GFLOPS); that
-  took this SCF from 1.6x to 3.5x faster than pyscf.  The gradients of the
-  same systems are 2.4-11x faster.
+  took this SCF from 1.6x to 3.5x faster than pyscf, and the per-worker
+  exchange update below to 4.6x.  The gradients of the same systems are
+  2.5-11x faster.
 * **The exchange update of small and medium molecules.**  After the
   transforms, `K += U^T U` over a block of auxiliary functions is a
   tall-skinny product (nao x nao from naux_block x nocc rows) that a
@@ -249,8 +261,10 @@ level (on the same SCF object they agree to 1e-12, `tests/test_grad.py`).
   range of auxiliary functions and accumulates its own K with one BLAS
   thread, the partial matrices summed at the end: one UHF J/K build of the
   [Cu2Cl6]2- dimer below went from 0.55 to 0.26 s (pyscf 0.74 s), its
-  broken-symmetry SCF from 7.9 to 3.7 s (2.8 GHz machine; the tables in this
-  README predate the change).
+  broken-symmetry SCF from 7.9 to 3.7 s (2.8 GHz machine).  Transforming both
+  spins in one GEMM per auxiliary function (a larger M) measured no gain:
+  these shapes run at about 54 GFLOPS per core in OpenBLAS whether 94, 186 or
+  372 orbitals are transformed.
 * **Segmented basis sets** (def2) consist largely of single-primitive shells,
   where vectorising over the primitive quartets of one shell quartet leaves
   most SIMD lanes empty.  The drivers therefore batch kets as SIMD lanes
