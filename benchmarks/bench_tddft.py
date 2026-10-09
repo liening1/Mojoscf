@@ -29,6 +29,8 @@ CASES = {
     "fc-pbe-casida": ("ferrocene / def2-SVP PBE, TDDFT (Casida)", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe", "TDDFT", 10, True),
     "fc-camb3lyp-tda": ("ferrocene / def2-SVP CAM-B3LYP, TDA", "ferrocene_atoms()", "def2-svp", 0, 0, "camb3lyp", "TDA", 10, True),
     "cu-b3lyp-tda": ("[Cu(NH3)4]2+ doublet / def2-TZVP B3LYP, TDA (UKS)", CU4, "def2-tzvp", 2, 1, "b3lyp", "TDA", 8, True),
+    "fep-b3lyp-tda": ("Fe(II) porphine triplet / def2-SVP B3LYP, TDA (UKS)", 'porphyrin_atoms("Fe")', "def2-svp", 0, 2,
+                      "b3lyp", "TDA", 5, True),
     # exact integrals (pyscf's default)
     "bz-b3lyp-tddft-x": ("benzene / def2-SVP B3LYP, TDDFT", "BENZENE_ATOMS", "def2-svp", 0, 0, "b3lyp", "TDDFT", 10, False),
     "bz-camb3lyp-tda-x": ("benzene / def2-SVP CAM-B3LYP, TDA", "BENZENE_ATOMS", "def2-svp", 0, 0, "camb3lyp", "TDA", 10, False),

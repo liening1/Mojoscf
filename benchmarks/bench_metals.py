@@ -38,6 +38,8 @@ CASES = {
     "fe6-svp-d": ("[Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)", FE6, "def2-svp", None, 2, 4, "uhf", "direct"),
     "cpt-svp-d": ("cisplatin / def2-SVP (direct, Pt ECP)", CPT, "def2-svp", "Pt", 0, 0, "rhf", "direct"),
     "ni-svp-ic": ("Ni(CO)4 / def2-SVP (in-core)", NI4, "def2-svp", None, 0, 0, "rhf", "incore"),
+    "fep-svp-df": ("Fe(II) porphine triplet / def2-SVP (DF, UHF)", 'porphyrin_atoms("Fe")', "def2-svp", None, 0, 2,
+                   "uhf", "df"),
 }
 
 WORKER = r'''

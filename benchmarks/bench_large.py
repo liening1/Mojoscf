@@ -16,7 +16,6 @@ import argparse
 import json
 import subprocess
 import sys
-import time
 
 CASES = {
     "C10H22": ("C10H22 / 6-31G* (DF)", "alkane_atoms(10)", "6-31g*", 0, 0, "rhf", True),

@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
-from pyscf import gto, lib, scf
+from pyscf import lib
 from pyscf.scf import diis as pyscf_diis
 from pyscf.scf import hf as pyscf_hf
 

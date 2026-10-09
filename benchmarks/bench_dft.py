@@ -35,6 +35,8 @@ CASES = {
     "cu-camb3lyp-df": ("[Cu(NH3)4]2+ doublet / def2-TZVP CAM-B3LYP (DF, UKS)", CU4, "def2-tzvp", 2, 1, "camb3lyp", "df"),
     "w5-pbe-ic": ("(H2O)5 / def2-TZVP PBE (in-core)", "water_cluster_atoms(5)", "def2-tzvp", 0, 0, "pbe", "incore"),
     "c8-b3lyp-d": ("C8H18 / 6-31G* B3LYP (direct)", "alkane_atoms(8)", "6-31g*", 0, 0, "b3lyp", "direct"),
+    "fep-b3lyp-df": ("Fe(II) porphine triplet / def2-SVP B3LYP (DF, UKS)", 'porphyrin_atoms("Fe")', "def2-svp", 0, 2,
+                     "b3lyp", "df"),
 }
 
 WORKER = r'''

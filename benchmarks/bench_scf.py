@@ -9,10 +9,8 @@ Both drivers start from the same initial guess and use identical settings.
 from __future__ import annotations
 
 import argparse
-import os
 import time
 
-import numpy as np
 from pyscf import gto, lib, scf
 
 import mojoscf
