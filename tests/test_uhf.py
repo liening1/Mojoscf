@@ -1,7 +1,7 @@
 """UHF: kernels, open-shell and broken-symmetry SCF runs compared with pyscf."""
 import numpy as np
 import pytest
-from pyscf import gto, lib, scf
+from pyscf import gto, scf
 from pyscf.scf import diis as pyscf_diis
 from pyscf.scf import hf as pyscf_hf
 
