@@ -157,9 +157,13 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
     the in-core DF tensor transformed once to the MO basis: Coulomb via (pi|Q),
     exchange with :func:`mojoscf.kernels.cphf_k`, and the XC kernel in one
     fused pass from the factors C x and C_o (:func:`mojoscf.dft.fxc_matrices`
-    with ``project``).  None (pyscf's operator runs) without an in-core DF
-    tensor, for solvent models, NLC, short-range-only hybrids, fractional
-    occupations and MO tensors that do not fit in ``max_memory``.
+    with ``project``).  With exact integrals the Coulomb and exchange parts
+    are J/K of the (symmetric) first-order densities of all vectors from one
+    call of the Mojo kernels (:func:`mojoscf.dft.exact_jk`, long-range ones
+    included), projected to C^T V C_o.  None (pyscf's operator runs) without
+    an in-core DF tensor or exact integrals with pyscf's ``get_jk``, for
+    solvent models, NLC, short-range-only hybrids, fractional occupations and
+    MO tensors that do not fit in ``max_memory``.
     """
     from pyscf import lib
     from pyscf.scf import hf, rohf, uhf
@@ -192,39 +196,68 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
     kterms = tdscf._exchange_terms(mf)
     if kterms is None:
         return None
-    cderi = dft._df_tensor(mf)
-    if cderi is None:
-        return None
-    tensors = {0.0: cderi}
-    for _, omega in kterms:
-        if omega not in tensors:
-            t = dft._df_tensor(mf, omega)
-            if t is None:
-                return None
-            tensors[omega] = t
     cs = [np.asarray(mo_coeff)] if not unrestricted else [np.asarray(c) for c in mo_coeff]
     chans = [_CPHFChannel(c, o) for c, o in zip(cs, occs)]
-    words = 0
-    for ch in chans:
-        words += cderi.shape[0] * ch.nmo * ch.nocc
-        for c, omega in kterms:
-            words += tensors[omega].shape[0] * (ch.nmo * ch.nmo + ch.nmo * ch.nocc + ch.nocc * ch.nocc)
-    if words * 8e-6 > 0.7 * (mf.max_memory - lib.current_memory()[0]):
-        return None
-    for ch in chans:
-        if ch.nocc == 0:
-            continue
-        for c, omega in kterms:
-            if c == 0:
+    cderi = dft._df_tensor(mf)
+    exact = cderi is None
+    if exact:
+        if not dft.exact_jk_applies(mf):
+            return None
+    else:
+        tensors = {0.0: cderi}
+        for _, omega in kterms:
+            if omega not in tensors:
+                t = dft._df_tensor(mf, omega)
+                if t is None:
+                    return None
+                tensors[omega] = t
+        words = 0
+        for ch in chans:
+            words += cderi.shape[0] * ch.nmo * ch.nocc
+            for c, omega in kterms:
+                words += tensors[omega].shape[0] * (ch.nmo * ch.nmo + ch.nmo * ch.nocc + ch.nocc * ch.nocc)
+        if words * 8e-6 > 0.7 * (mf.max_memory - lib.current_memory()[0]):
+            return None
+        for ch in chans:
+            if ch.nocc == 0:
                 continue
-            lfull = kernels.df_mo(tensors[omega], ch.c, ch.c)
-            lmo = np.ascontiguousarray(lfull[:, :, : ch.nocc])
-            loo = np.ascontiguousarray(lfull[:, : ch.nocc, : ch.nocc])
-            ch.k.append((c, lfull, lmo, loo))
-            if omega == 0 and ch.lmo is None:
-                ch.lmo = lmo
-        if ch.lmo is None:
-            ch.lmo = kernels.df_mo(cderi, ch.c, ch.co)
+            for c, omega in kterms:
+                if c == 0:
+                    continue
+                lfull = kernels.df_mo(tensors[omega], ch.c, ch.c)
+                lmo = np.ascontiguousarray(lfull[:, :, : ch.nocc])
+                loo = np.ascontiguousarray(lfull[:, : ch.nocc, : ch.nocc])
+                ch.k.append((c, lfull, lmo, loo))
+                if omega == 0 and ch.lmo is None:
+                    ch.lmo = lmo
+            if ch.lmo is None:
+                ch.lmo = kernels.df_mo(cderi, ch.c, ch.co)
+    kfull = sum(c for c, omega in kterms if omega == 0)
+    klr = [(c, omega) for c, omega in kterms if omega != 0 and c != 0]
+
+    def exact_jk_terms(xs):
+        """J - K of the first-order densities (exact integrals), projected to C^T V C_o per channel."""
+        nset = len(xs[0])
+        dms = []
+        for ch, x in zip(chans, xs):
+            d = ch.c @ x @ ch.co.T
+            d = d + d.transpose(0, 2, 1)
+            dms.append(d if unrestricted else 2.0 * d)
+        ksc = 1.0 if unrestricted else 0.5
+        dall = np.concatenate(dms)
+        if kfull != 0:
+            vj, vk = dft.exact_jk(mf, dall, 1, True, True)
+            vk = vk * (ksc * kfull)
+        else:
+            vj, vk = dft.exact_jk(mf, dall, 1, True, False)[0], np.zeros_like(dall)
+        for c, omega in klr:
+            vk = vk + dft.exact_jk(mf, dall, 1, False, True, omega)[1] * (ksc * c)
+        vj = vj.reshape(len(chans), nset, *vj.shape[1:]).sum(axis=0)
+        vs = []
+        for s, ch in enumerate(chans):
+            v = vj - vk[s * nset:(s + 1) * nset]
+            vs.append(ch.c.T @ v @ ch.co)
+        return vs
 
     xc = None
     if ks and mf._numint._xc_type(mf.xc) != "HF":
@@ -261,21 +294,24 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
             x = flat[:, off: off + n].reshape(nset, ch.nmo, ch.nocc)
             xs.append(np.ascontiguousarray(x[:, ch.perm]))
             off += n
-        # Coulomb: rho_Q = s sum (pi|Q) x_pi over the spins (s = 4 RKS, 2 UKS)
-        rho = 0.0
-        for ch, x in zip(chans, xs):
-            if ch.nocc:
-                rho = rho + ch.lmo.reshape(ch.lmo.shape[0], -1) @ x.reshape(nset, -1).T
-        rho = rho * (4.0 if not unrestricted else 2.0)
-        vs = []
-        for ch, x in zip(chans, xs):
-            if ch.nocc == 0:
-                vs.append(np.zeros_like(x))
-                continue
-            v = (rho.T @ ch.lmo.reshape(ch.lmo.shape[0], -1)).reshape(x.shape)
-            for c, lfull, lmo, loo in ch.k:
-                kernels.cphf_k(lfull, lmo, loo, x, -c, out=v)
-            vs.append(v)
+        if exact:
+            vs = exact_jk_terms(xs)
+        else:
+            # Coulomb: rho_Q = s sum (pi|Q) x_pi over the spins (s = 4 RKS, 2 UKS)
+            rho = 0.0
+            for ch, x in zip(chans, xs):
+                if ch.nocc:
+                    rho = rho + ch.lmo.reshape(ch.lmo.shape[0], -1) @ x.reshape(nset, -1).T
+            rho = rho * (4.0 if not unrestricted else 2.0)
+            vs = []
+            for ch, x in zip(chans, xs):
+                if ch.nocc == 0:
+                    vs.append(np.zeros_like(x))
+                    continue
+                v = (rho.T @ ch.lmo.reshape(ch.lmo.shape[0], -1)).reshape(x.shape)
+                for c, lfull, lmo, loo in ch.k:
+                    kernels.cphf_k(lfull, lmo, loo, x, -c, out=v)
+                vs.append(v)
         if xc is not None:
             scale = 4.0 if not unrestricted else 2.0
             px = xc([(scale * (ch.c @ x), ch.co) for ch, x in zip(chans, xs)])
@@ -439,6 +475,41 @@ def exact_jk_partial(hessobj, mo_coeff, mo_occ, tol=1e-14):
         if omega:
             de2 += integrals.hess2e(mol, dmj, np.array(dms), 0.0, kscale * c, tol=tol, omega=omega)
     return de2
+
+
+def exact_h1mo(hessobj, mo_coeff, mo_occ, tol=1e-14):
+    """Two-electron part of the first-order Fock matrices with exact integrals, per spin C^T (dJ - c dK) C_o
+    (natm, 3, nmo, nocc), or None.
+
+    The derivative J/K matrices of the ground-state densities for every
+    nuclear displacement come from one pass over the unique shell quartets
+    (:func:`mojoscf.integrals.h1_jk`, a second one per long-range exchange
+    term) in place of pyscf's per-atom ``_get_jk`` calls in ``make_h1``.
+    """
+    if _exact_jk_reason(hessobj, mo_coeff, mo_occ) is not None:
+        return None
+    mf = hessobj.base
+    mol = hessobj.mol
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    cs = [np.asarray(c) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff)]
+    occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
+    dms = [(c[:, o > 0] * o[o > 0]) @ c[:, o > 0].T for c, o in zip(cs, occs)]
+    dmj = dms[0] + dms[1] if unrestricted else dms[0]
+    ksc = 1.0 if unrestricted else 0.5
+    terms = _hess_exchange_terms(mf)
+    kfull = sum(c for c, omega in terms if omega == 0)
+    vj, vk = integrals.h1_jk(mol, [dmj], dms if kfull != 0 else [], tol=tol)
+    vs = [vj[:, :, 0] - (ksc * kfull) * vk[:, :, s] if kfull != 0 else vj[:, :, 0].copy() for s in range(len(cs))]
+    for c, omega in terms:
+        if omega:
+            vklr = integrals.h1_jk(mol, [], dms, tol=tol, omega=omega)[1]
+            for s in range(len(cs)):
+                vs[s] -= (ksc * c) * vklr[:, :, s]
+    out = []
+    for c, o, v in zip(cs, occs, vs):
+        co = c[:, o > 0]
+        out.append(np.einsum("mp,axmn,nq->axpq", c, v, co, optimize=True))
+    return out
 
 
 class _KChannel:
@@ -1071,15 +1142,23 @@ class _MojoHessMixin:
                     hm[ia] += c.T @ h1 @ c[:, o > 0]
         else:
             de2 = self.partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, log)
-            with _ZeroXC1(mol, unrestricted):
-                h1ao = self.make_h1(mo_coeff, mo_occ, None, atmlst, log)
-            h1s = list(h1ao) if unrestricted else [h1ao]
-            hmo = []
-            for c, o, h1 in zip(cs, occs, h1s):
-                hm = np.zeros((mol.natm, 3, c.shape[1], int((o > 0).sum())))
+            hmo = exact_h1mo(self, mo_coeff, mo_occ)
+            if hmo is not None:
+                hcore_deriv = mf.nuc_grad_method().hcore_generator(mol)
                 for ia in atmlst:
-                    hm[ia] = c.T @ np.asarray(h1[ia]) @ c[:, o > 0]
-                hmo.append(hm)
+                    h1 = hcore_deriv(ia)
+                    for c, o, hm in zip(cs, occs, hmo):
+                        hm[ia] += c.T @ h1 @ c[:, o > 0]
+            else:
+                with _ZeroXC1(mol, unrestricted):
+                    h1ao = self.make_h1(mo_coeff, mo_occ, None, atmlst, log)
+                h1s = list(h1ao) if unrestricted else [h1ao]
+                hmo = []
+                for c, o, h1 in zip(cs, occs, h1s):
+                    hm = np.zeros((mol.natm, 3, c.shape[1], int((o > 0).sum())))
+                    for ia in atmlst:
+                        hm[ia] = c.T @ np.asarray(h1[ia]) @ c[:, o > 0]
+                    hmo.append(hm)
         t1 = log.timer_debug1("partial hessian and H1", *t1)
         nao = cs[0].shape[0]
         s1a = -mol.intor("int1e_ipovlp", comp=3)

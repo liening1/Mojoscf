@@ -584,6 +584,25 @@ def grad2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14, omega=0.0):
     return de
 
 
+def h1_jk(mol, dm_j=(), dm_k=(), tol=1e-14, omega=0.0):
+    """First-order Coulomb and exchange matrices of all nuclear displacements at fixed densities.
+
+    Returns ``(vj, vk)``: ``vj[A, x, s] = d/dR_Ax J[dm_j[s]]`` and
+    ``vk[A, x, s] = d/dR_Ax K[dm_k[s]]`` (natm, 3, n, nao, nao), the integrals
+    differentiated at all four centres (the two-electron part of pyscf's
+    Hessian ``make_h1``), from one pass over the unique shell quartets; the
+    densities must be symmetric.  ``omega`` > 0: erf(omega r12) / r12.
+    """
+    nao = mol.nao_nr()
+    dmj = np.ascontiguousarray(np.asarray(dm_j, dtype=np.float64).reshape(-1, nao, nao))
+    dmk = np.ascontiguousarray(np.asarray(dm_k, dtype=np.float64).reshape(-1, nao, nao))
+    nj, nk = len(dmj), len(dmk)
+    out = np.zeros((mol.natm, 3, nj + nk, nao, nao))
+    if nj + nk:
+        get_extension().h1_2e(basis_tables(mol), _boys_table(), dmj, dmk, float(tol), out, _omega4c(omega))
+    return out[:, :, :nj], out[:, :, nj:]
+
+
 def hess2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14, omega=0.0):
     """Second derivatives (natm, natm, 3, 3) of the two-electron energy of :func:`grad2e` at fixed densities.
 

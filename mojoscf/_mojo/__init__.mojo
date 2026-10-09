@@ -28,7 +28,7 @@ from _mojo.dfmo import df_mo_core, df_sandwich_core, cphf_k_core
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
-from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
+from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core, h1_2e_core
 from _mojo.gradients import grad2e_core, grad2e_pairs_core, hess2e_core, grad2c_core, df_grad_rhs, grad_df3c_core, int3c2e_ip1_core, hess_df3c_core
 from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
 from _mojo.pcm import pcm_ds_core, pcm_pair_core
@@ -96,6 +96,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces, atoms): sum_k w_k (nabla i j|k) (3, nao, nao), sum_ij D_ij w_k (ij|nabla k) (nch, 3), 2 sum_{i on A} D_ij sum_k w_k (nabla i j|k) (natm, 3); an empty output is skipped.")
         m.def_function[py_int1e_iprinv_dm]("int1e_iprinv_dm", docstring="int1e_iprinv_dm(basis, table, centers, dm, out): sum_ij D_ij <nabla i|1/|r-R_c||j> per centre (ncenter, 3).")
         m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol, omega): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk (omega > 0: erf(omega r) / r).")
+        m.def_function[py_h1_2e]("h1_2e", docstring="h1_2e(basis, table, dmj, dmk, tol, out, omega): d/dR_Ax J[Dj_s] and K[Dk_s] for every atom and direction, (natm, 3, nj + nk, nao, nao).")
         m.def_function[py_direct_jk]("direct_jk", docstring="direct_jk(basis, table, dms, vj, vk, with_j, with_k, tol, nanti, omega): integral-direct J/K in one pass (the last nanti densities antisymmetric: K only; omega > 0: erf(omega r) / r).")
         return m.finalize()
     except e:
@@ -501,6 +502,17 @@ def py_int2c2e(auxbasis: PythonObject, dst: PythonObject, table: PythonObject, o
     int2c2e_core(aux, boys, f64ptr(dst), Float64(py=omega))
     _ = aux^
     _ = boys^
+    return PythonObject(None)
+
+
+def py_h1_2e(
+    basis: PythonObject, table: PythonObject, dmj: PythonObject, dmk: PythonObject, tol: PythonObject,
+    dst: PythonObject, omega: PythonObject,
+) raises -> PythonObject:
+    h1_2e_core(
+        _basis(basis), _boys(table), Int(py=dmj.shape[0]), f64ptr(dmj), Int(py=dmk.shape[0]), f64ptr(dmk),
+        Float64(py=tol), f64ptr(dst), Float64(py=omega),
+    )
     return PythonObject(None)
 
 

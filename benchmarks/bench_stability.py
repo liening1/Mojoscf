@@ -3,7 +3,7 @@
 For each (system, driver) pair the script converges the SCF (conv_tol 1e-9,
 pyscf's default grids; ``mojoscf.dft.accelerate`` for mojoscf, whose
 ``mf.stability()`` is :mod:`mojoscf.stability`) and runs pyscf's default
-internal analysis plus, for restricted references, the external one (real ->
+internal analysis, for the cases marked so also the external one (real ->
 complex and RHF -> UHF).  Reported: the time of ``mf.stability``, the SCF
 time and the lowest eigenvalue of each analysis from the log.  Usage:
 
@@ -18,13 +18,13 @@ import sys
 
 CU4 = 'square_planar_atoms("Cu", ["NH3"] * 4, [2.03] * 4)'
 
-# key: (label, atoms, basis, charge, spin, xc, density fitting)
+# key: (label, atoms, basis, charge, spin, xc, density fitting, external analysis)
 CASES = {
-    "fc-pbe0": ("ferrocene / def2-SVP PBE0 (RKS)", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", True),
-    "fc-pbe0-x": ("ferrocene / def2-SVP PBE0 (RKS)", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", False),
-    "cu-b3lyp": ("[Cu(NH3)4]2+ doublet / def2-TZVP B3LYP (UKS)", CU4, "def2-tzvp", 2, 1, "b3lyp", True),
+    "bz-b3lyp-x": ("benzene / def2-SVP B3LYP (RKS)", "BENZENE_ATOMS", "def2-svp", 0, 0, "b3lyp", False, True),
+    "fc-pbe0": ("ferrocene / def2-SVP PBE0 (RKS)", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", True, False),
+    "cu-b3lyp": ("[Cu(NH3)4]2+ doublet / def2-SVP B3LYP (UKS)", CU4, "def2-svp", 2, 1, "b3lyp", True, False),
     "fe-b3lyp": ("[Fe(H2O)6]2+ quintet / def2-SVP B3LYP (UKS)", 'octahedral_atoms("Fe", "H2O", 2.12)',
-                 "def2-svp", 2, 4, "b3lyp", True),
+                 "def2-svp", 2, 4, "b3lyp", True, False),
 }
 
 WORKER = r'''
@@ -33,6 +33,8 @@ import numpy as np
 sys.path.insert(0, %(bench_dir)r)
 from pyscf import dft, gto, lib
 from systems import *
+from bench_scf import BENZENE
+BENZENE_ATOMS = [(a[0], tuple(a[1])) for a in gto.format_atom(BENZENE, unit=1.0)]
 mol = gto.M(atom=atoms_to_str(%(atoms)s), basis=%(basis)r, charge=%(charge)d, spin=%(spin)d,
             verbose=0, max_memory=12000)
 driver = %(driver)r
@@ -51,7 +53,7 @@ buf = io.StringIO()
 mf.stdout = buf
 mf.verbose = 4
 t0 = time.perf_counter()
-out = mf.stability(internal=True, external=not %(spin)d, return_status=True)
+out = mf.stability(internal=True, external=%(external)r, return_status=True)
 tstab = time.perf_counter() - t0
 eigs = {m.group(1): [float(v) for v in m.group(2).replace("[", " ").replace("]", " ").split()][:1]
         for m in re.finditer(r"(\w+): lowest eigs of H = (\[[^\]]*\]|\S+)", buf.getvalue())}
@@ -61,9 +63,9 @@ print(json.dumps(dict(tscf=tscf, tstab=tstab, stable=[bool(s) if s is not None e
 
 
 def run(case, driver, bench_dir):
-    _, atoms, basis, charge, spin, xc, df = CASES[case]
+    _, atoms, basis, charge, spin, xc, df, external = CASES[case]
     code = WORKER % dict(bench_dir=bench_dir, atoms=atoms, basis=basis, charge=charge, spin=spin, xc=xc, df=df,
-                         driver=driver)
+                         driver=driver, external=external)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     if out.returncode != 0:
         raise RuntimeError(f"{case} / {driver} failed:\n{out.stderr[-3000:]}")

@@ -686,3 +686,181 @@ def jk_ip1_core(
     _ = ht^
     _ = basis^
     _ = boys^
+
+
+def h1_2e_core(
+    var basis: Basis, var boys: BoysTable, nj: Int, dmj: F64Ptr, nk: Int, dmk: F64Ptr, tol: Float64, dst: F64Ptr,
+    omega: Float64 = 0.0,
+):
+    """First-order Coulomb and exchange matrices of every nuclear displacement, at fixed densities.
+
+    dst[A][x][s] (natm x 3 x (nj + nk) x nao x nao, overwritten) is
+    d/dR_Ax J[Dj_s] for s < nj and d/dR_Ax K[Dk_(s - nj)] otherwise, with the
+    integrals differentiated at all four centres: the two-electron part of
+    the Hessian's first-order Fock matrices (pyscf's ``make_h1``).  The
+    densities must be symmetric.  Each unique quartet a >= b, c >= d,
+    ab >= cd is evaluated with the first derivatives of the bra pair (nabla_a,
+    nabla_b) and of the ket's first shell (nabla_c), the fourth centre from
+    translational invariance, and each of the twelve derivative blocks is
+    folded like an integral block (``digest_quartet``: the derivative has the
+    integral's eight-fold symmetry) into the matrices of the displaced atom.
+    A quartet is skipped when its derivative Schwarz bound times the largest
+    density element it meets is below ``tol``.  ``omega`` > 0: the
+    long-range operator erf(omega r12) / r12.
+    """
+    var nbas = basis.nbas
+    var nao = basis.nao
+    var natm = basis.natm
+    var n2 = nao * nao
+    var npairs = nbas * (nbas + 1) // 2
+    var nacc = nj + nk
+    var ht = HermTable(2 * basis.lmax + 1)
+    var sa = List[Int](capacity=npairs)
+    var sb = List[Int](capacity=npairs)
+    for a in range(nbas):
+        for b in range(a + 1):
+            sa.append(a)
+            sb.append(b)
+    var tab = PairTable(basis, basis, sa, sb, ht)
+    var q = schwarz_bounds(boys, tab, ht)
+    var tab6 = PairTable(basis, basis, sa, sb, ht, 2)
+    var q6 = schwarz_bounds(boys, tab6, ht)
+    var tab3 = PairTable(basis, basis, sa, sb, ht, 1)
+    var q3 = schwarz_bounds(boys, tab3, ht)
+    if omega > 0.0:
+        attenuate(tab, omega)
+    # largest density element per shell block, over all densities
+    var cond = List[Float64](length=max(nbas * nbas, 1), fill=0.0)
+    var pcond = list_ptr(cond)
+    for a in range(nbas):
+        for b in range(nbas):
+            var m = 0.0
+            for s in range(nacc):
+                var d = dmj.unsafe_offset(s * n2) if s < nj else dmk.unsafe_offset((s - nj) * n2)
+                for i in range(basis.ao_loc[a], basis.ao_loc[a + 1]):
+                    for j in range(basis.ao_loc[b], basis.ao_loc[b + 1]):
+                        m = max(m, abs(d[unsafe_offset=i * nao + j]))
+            pcond[unsafe_offset=a * nbas + b] = m
+    var nfmax = 1
+    for a in range(nbas):
+        nfmax = max(nfmax, shell_nfunc(basis, a))
+    var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
+    var per = natm * 3 * nacc * n2
+    var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
+    var pacc = list_ptr(accl)
+    var pq = list_ptr(q)
+    var pq6 = list_ptr(q6)
+    var pq3 = list_ptr(q3)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+
+    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab6, imm tab3, imm pq, imm pq6, imm pq3, imm pcond, imm pacc, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm nacc, imm nj, imm nk, imm dmj, imm dmk, imm tol, imm nfmax, imm per}:
+        var ws = EriWork(tab6.maxcomp, tab6.maxlab, tab6.maxcomp, tab6.maxlab)
+        var nf4 = nfmax * nfmax * nfmax * nfmax
+        var dbuf = List[Float64](length=12 * nf4 + 8, fill=0.0)
+        var pd = list_ptr(dbuf)
+        var loc = List[Float64](length=6 * nfmax * nfmax + 8, fill=0.0)
+        var ploc = list_ptr(loc)
+        var acc = pacc.unsafe_offset(w * per)
+        while True:
+            var task = Int(pcount[].fetch_add(1))
+            if task >= npairs:
+                break
+            var sp = npairs - 1 - task
+            var qab = pq[unsafe_offset=sp]
+            if qab == 0.0:
+                continue
+            var a = tab.get(sp, I_A)
+            var b = tab.get(sp, I_B)
+            var na = basis.ao_loc[a + 1] - basis.ao_loc[a]
+            var nb = basis.ao_loc[b + 1] - basis.ao_loc[b]
+            var nab = na * nb
+            var dab = pcond[unsafe_offset=a * nbas + b]
+            for spk in range(sp + 1):
+                var qq = max(pq6[unsafe_offset=sp] * pq[unsafe_offset=spk], qab * pq3[unsafe_offset=spk])
+                if qq < tol:
+                    continue
+                var c = tab.get(spk, I_A)
+                var d = tab.get(spk, I_B)
+                var dmax = 4.0 * max(dab, pcond[unsafe_offset=c * nbas + d])
+                dmax = max(dmax, max(pcond[unsafe_offset=a * nbas + c], pcond[unsafe_offset=a * nbas + d]))
+                dmax = max(dmax, max(pcond[unsafe_offset=b * nbas + c], pcond[unsafe_offset=b * nbas + d]))
+                if qq * dmax < tol:
+                    continue
+                var nc = basis.ao_loc[c + 1] - basis.ao_loc[c]
+                var nd = basis.ao_loc[d + 1] - basis.ao_loc[d]
+                var ncd = nc * nd
+                var nabcd = nab * ncd
+                # d/dR = -nabla: blocks [centre a, b, c, d][x][ij][kl]
+                if not eri_quartet(tab6, sp, tab, spk, ht, boys, ws):
+                    continue
+                var o6 = list_ptr(ws.out)
+                for x in range(6):
+                    var src = o6.unsafe_offset(x * nabcd)
+                    var dst = pd.unsafe_offset(x * nabcd)
+                    for e in range(nabcd):
+                        dst[unsafe_offset=e] = -src[unsafe_offset=e]
+                _ = eri_quartet(tab, sp, tab3, spk, ht, boys, ws)
+                var o3 = list_ptr(ws.out)
+                for ij in range(nab):
+                    for x in range(3):
+                        var src = o3.unsafe_offset((ij * 3 + x) * ncd)
+                        var dst = pd.unsafe_offset((6 + x) * nabcd + ij * ncd)
+                        for e in range(ncd):
+                            dst[unsafe_offset=e] = -src[unsafe_offset=e]
+                for x in range(3):
+                    var ba = pd.unsafe_offset(x * nabcd)
+                    var bb = pd.unsafe_offset((3 + x) * nabcd)
+                    var bc = pd.unsafe_offset((6 + x) * nabcd)
+                    var bd = pd.unsafe_offset((9 + x) * nabcd)
+                    for e in range(nabcd):
+                        bd[unsafe_offset=e] = -(ba[unsafe_offset=e] + bb[unsafe_offset=e] + bc[unsafe_offset=e])
+                for cen in range(4):
+                    var sh = a if cen == 0 else (b if cen == 1 else (c if cen == 2 else d))
+                    var atm = basis.atom[sh]
+                    for x in range(3):
+                        var aj = acc.unsafe_offset((atm * 3 + x) * nacc * n2)
+                        digest_quartet(
+                            basis, a, b, c, d, sp == spk, pd.unsafe_offset((cen * 3 + x) * nabcd), nao, n2, nj, nk,
+                            dmj, dmk, aj, aj.unsafe_offset(nj * n2), ploc,
+                        )
+        _ = ws^
+        _ = dbuf^
+        _ = loc^
+
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    var total = per
+
+    def reduce(cidx: Int) {imm pacc, imm total, imm nworkers}:
+        var nchunk = 64
+        var lo = total * cidx // nchunk
+        var hi = total * (cidx + 1) // nchunk
+        for w2 in range(1, nworkers):
+            vaxpy(pacc.unsafe_offset(lo), hi - lo, 1.0, pacc.unsafe_offset(w2 * total + lo))
+
+    if nworkers > 1:
+        parallelize(reduce, 64)
+    # each matrix: A + A^T (the digestion's half of the symmetric result)
+    for m in range(natm * 3 * nacc):
+        var src = pacc.unsafe_offset(m * n2)
+        var d = dst.unsafe_offset(m * n2)
+        for i in range(nao):
+            for j in range(nao):
+                d[unsafe_offset=i * nao + j] = src[unsafe_offset=i * nao + j] + src[unsafe_offset=j * nao + i]
+    _ = accl^
+    _ = cond^
+    _ = counter^
+    _ = tab^
+    _ = tab6^
+    _ = tab3^
+    _ = q^
+    _ = q6^
+    _ = q3^
+    _ = sa^
+    _ = sb^
+    _ = ht^
+    _ = basis^
+    _ = boys^

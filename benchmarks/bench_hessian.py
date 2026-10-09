@@ -1,10 +1,11 @@
-"""Analytical Hessians (density fitting): pyscf versus mojoscf (dft.accelerate + mojoscf.hessian), each in its own process.
+"""Analytical Hessians: pyscf versus mojoscf (dft.accelerate + mojoscf.hessian), each in its own process.
 
-For each system the script converges the density-fitted Kohn-Sham SCF
-(conv_tol 1e-10, pyscf's default grids; accelerated with
-``mojoscf.dft.accelerate`` for mojoscf, whose ``mf.Hessian()`` then carries
-the Mojo kernels) and computes the nuclear Hessian with pyscf's driver
-(auxiliary-basis response included, pyscf's default for DF Hessians).
+For each system the script converges the Kohn-Sham SCF (density fitting or
+exact integrals as the case says; conv_tol 1e-10, pyscf's default grids;
+accelerated with ``mojoscf.dft.accelerate`` for mojoscf, whose
+``mf.Hessian()`` then carries the Mojo kernels) and computes the nuclear
+Hessian with pyscf's driver (auxiliary-basis response included, pyscf's
+default for DF Hessians).
 Reported: the Hessian time, the SCF time, the largest difference of the
 Hessian elements and of the harmonic frequencies.  Usage:
 
@@ -23,13 +24,18 @@ import sys
 
 CUCL4 = 'square_planar_atoms("Cu", ["Cl"] * 4, [2.25] * 4)'
 
-# key: (label, atoms, basis, charge, spin, xc)
+# key: (label, atoms, basis, charge, spin, xc, density fitting)
 CASES = {
-    "bz-b3lyp": ("benzene / def2-SVP B3LYP", "BENZENE_ATOMS", "def2-svp", 0, 0, "b3lyp"),
-    "fc-pbe0": ("ferrocene / def2-SVP PBE0", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0"),
-    "fc-pbe": ("ferrocene / def2-SVP PBE", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe"),
-    "fc-camb3lyp": ("ferrocene / def2-SVP CAM-B3LYP", "ferrocene_atoms()", "def2-svp", 0, 0, "camb3lyp"),
-    "cucl4-b3lyp": ("[CuCl4]2- doublet / def2-SVP B3LYP (UKS)", CUCL4, "def2-svp", -2, 1, "b3lyp"),
+    "bz-b3lyp": ("benzene / def2-SVP B3LYP", "BENZENE_ATOMS", "def2-svp", 0, 0, "b3lyp", True),
+    "fc-pbe0": ("ferrocene / def2-SVP PBE0", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", True),
+    "fc-pbe": ("ferrocene / def2-SVP PBE", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe", True),
+    "fc-camb3lyp": ("ferrocene / def2-SVP CAM-B3LYP", "ferrocene_atoms()", "def2-svp", 0, 0, "camb3lyp", True),
+    "cucl4-b3lyp": ("[CuCl4]2- doublet / def2-SVP B3LYP (UKS)", CUCL4, "def2-svp", -2, 1, "b3lyp", True),
+    # exact integrals (pyscf's default)
+    "bz-b3lyp-x": ("benzene / def2-SVP B3LYP", "BENZENE_ATOMS", "def2-svp", 0, 0, "b3lyp", False),
+    "bz-camb3lyp-x": ("benzene / def2-SVP CAM-B3LYP", "BENZENE_ATOMS", "def2-svp", 0, 0, "camb3lyp", False),
+    "cucl4-b3lyp-x": ("[CuCl4]2- doublet / def2-SVP B3LYP (UKS)", CUCL4, "def2-svp", -2, 1, "b3lyp", False),
+    "fc-pbe0-x": ("ferrocene / def2-SVP PBE0", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", False),
 }
 
 WORKER = r'''
@@ -47,7 +53,9 @@ driver = %(driver)r
 if driver == "mojoscf":
     import mojoscf
     mojoscf.UHF(gto.M(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)).run()  # start the runtime
-mf = (dft.UKS if %(spin)d else dft.RKS)(mol, xc=%(xc)r).density_fit()
+mf = (dft.UKS if %(spin)d else dft.RKS)(mol, xc=%(xc)r)
+if %(df)r:
+    mf = mf.density_fit()
 mf.verbose = 0; mf.conv_tol = 1e-10; mf.max_cycle = 100
 if driver == "mojoscf":
     mojoscf.dft.accelerate(mf)
@@ -62,9 +70,9 @@ print(json.dumps(dict(tscf=tscf, thess=thess, hess=np.asarray(hess).ravel().toli
 
 
 def run(case, driver, bench_dir):
-    _, atoms, basis, charge, spin, xc = CASES[case]
+    _, atoms, basis, charge, spin, xc, df = CASES[case]
     code = WORKER % dict(bench_dir=bench_dir, atoms=atoms, basis=basis, charge=charge, spin=spin, xc=xc,
-                         driver=driver)
+                         driver=driver, df=df)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -97,24 +105,24 @@ def main():
         return cache[tag]
 
     if args.list:
-        print("\n".join(f"{k:12s} {v[0]}" for k, v in CASES.items()))
+        print("\n".join(f"{k:14s} {v[0]}{'' if v[6] else ', exact integrals'}" for k, v in CASES.items()))
         return
     bench_dir = os.path.dirname(os.path.abspath(__file__))
-    print(f"{'system':42s} {'nao':>4s} | {'Hess pyscf':>10s} {'mojoscf':>8s} {'x':>5s} | "
+    print(f"{'system':42s} {'ints':>5s} {'nao':>4s} | {'Hess pyscf':>10s} {'mojoscf':>8s} {'x':>5s} | "
           f"{'SCF pyscf':>9s} {'mojoscf':>8s} | {'max|dH|':>8s} {'max|dfreq|':>10s}")
     drivers = args.drivers.split(",")
     for key in args.cases.split(","):
-        name = CASES[key][0]
+        name, ints = CASES[key][0], "DF" if CASES[key][6] else "exact"
         ref = result(key, "pyscf")
         if "mojoscf" not in drivers:
-            print(f"{name:42s} {ref['nao']:4d} | {ref['thess']:10.1f}", flush=True)
+            print(f"{name:42s} {ints:>5s} {ref['nao']:4d} | {ref['thess']:10.1f}", flush=True)
             continue
         moj = result(key, "mojoscf")
         flag = "" if ref["conv"] and moj["conv"] else "  NOT CONVERGED"
         dh = abs(np.array(ref["hess"]) - np.array(moj["hess"])).max()
         n = min(len(ref["freq"]), len(moj["freq"]))
         df = abs(np.array(ref["freq"][:n]) - np.array(moj["freq"][:n])).max()
-        print(f"{name:42s} {ref['nao']:4d} | {ref['thess']:10.1f} {moj['thess']:8.1f} "
+        print(f"{name:42s} {ints:>5s} {ref['nao']:4d} | {ref['thess']:10.1f} {moj['thess']:8.1f} "
               f"{ref['thess'] / moj['thess']:4.1f}x | {ref['tscf']:9.1f} {moj['tscf']:8.1f} | "
               f"{dh:8.1e} {df:8.2f}cm-1{flag}", flush=True)
 

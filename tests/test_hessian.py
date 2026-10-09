@@ -57,7 +57,8 @@ def test_xc_partial_hessian_rejects_meta_gga(water=None):
 
 
 @pytest.mark.parametrize("xc, spin, df", [("b3lyp", 0, True), ("pbe", 0, False), ("camb3lyp", 0, True),
-                                          ("pbe", 1, True), ("b3lyp", 1, False), ("tpss", 0, True)])
+                                          ("pbe", 1, True), ("b3lyp", 1, False), ("tpss", 0, True),
+                                          ("b3lyp", 0, False), ("camb3lyp", 0, False), ("wb97x", 1, False)])
 def test_accelerated_hessian_matches_pyscf(xc, spin, df):
     mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
 
@@ -73,28 +74,32 @@ def test_accelerated_hessian_matches_pyscf(xc, spin, df):
         setattr(ref, key, getattr(mf, key))
     h = mf.Hessian()
     assert isinstance(h, mhess._MojoHessMixin)
-    # density fitting: the J/K terms run natively (range-separated functionals included)
+    # the J/K terms run natively (range-separated functionals included), DF or exact integrals
     native = mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
     assert native == df
+    assert (mhess._exact_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None) == (not df)
     # the long-range metric of erf(omega r) / r is numerically singular (condition ~1e16 here): both
     # Cholesky solves carry noise at the 1e-9 level
     tol = 5e-9 if xc == "camb3lyp" else 1e-9
     assert abs(h.kernel() - ref.Hessian().kernel()).max() < tol
 
 
+@pytest.mark.parametrize("df", [True, False])
 @pytest.mark.parametrize("xc, spin", [("pbe", 0), ("b3lyp", 0), ("camb3lyp", 0), ("tpss", 0), (None, 0),
                                       ("b3lyp", 1), ("wb97x", 1), (None, 1)])
-def test_cphf_operator_matches_pyscf(xc, spin):
-    """The MO-basis coupled-perturbed operator against pyscf's Hessian gen_vind on random first-order orbitals."""
+def test_cphf_operator_matches_pyscf(xc, spin, df):
+    """The MO-basis coupled-perturbed operator against pyscf's Hessian gen_vind on random first-order orbitals
+    (density fitting: MO-basis DF tensors; exact integrals: J/K of the first-order densities)."""
     from pyscf import scf
     from pyscf.hessian import rhf as rhf_hess
     from pyscf.hessian import uhf as uhf_hess
 
     mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
     if xc is None:
-        mf = (scf.UHF if spin else scf.RHF)(mol).density_fit().run()
+        mf = (scf.UHF if spin else scf.RHF)(mol)
     else:
-        mf = mojoscf.dft.accelerate((dft.UKS if spin else dft.RKS)(mol, xc=xc).density_fit()).run()
+        mf = mojoscf.dft.accelerate((dft.UKS if spin else dft.RKS)(mol, xc=xc))
+    mf = (mf.density_fit() if df else mf).run()
     fx = mhess.cphf_operator(mf)
     assert fx is not None
     ref = (uhf_hess if spin else rhf_hess).gen_vind(mf, mf.mo_coeff, mf.mo_occ)
@@ -107,9 +112,11 @@ def test_cphf_operator_matches_pyscf(xc, spin):
     assert abs(a - b).max() < 1e-12 * abs(b).max()
 
 
-def test_cphf_operator_falls_back_without_df():
+def test_cphf_operator_falls_back_with_own_get_jk():
     mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
     mf = mojoscf.dft.accelerate(dft.RKS(mol, xc="pbe")).run()
+    assert mhess.cphf_operator(mf) is not None
+    mf.get_jk = lambda *args, **kwargs: dft.rks.RKS.get_jk(mf, *args, **kwargs)
     assert mhess.cphf_operator(mf) is None
 
 
@@ -312,3 +319,33 @@ def test_exact_partial_hessian_matches_pyscf(xc, spin):
     de2 = h.partial_hess_elec()
     ref2 = ref.Hessian().partial_hess_elec()
     assert abs(de2 - ref2).max() < 1e-8
+
+
+@pytest.mark.parametrize("spin, omega", [(0, 0.0), (1, 0.0), (0, 0.35)])
+def test_exact_first_order_fock_jk(spin, omega):
+    """h1_jk: the J - K part of pyscf's make_h1 (exact integrals) for every atom, also long-range."""
+    from pyscf import scf
+    from pyscf.hessian import rhf as rhf_hess
+    from pyscf.hessian import uhf as uhf_hess
+
+    from mojoscf import integrals as mi
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = (scf.UHF if spin else scf.RHF)(mol).run(conv_tol=1e-10)
+    h = mf.Hessian()
+    hcore = mf.nuc_grad_method().hcore_generator(mol)
+    if omega:
+        with mol.with_range_coulomb(omega):
+            ref = rhf_hess.make_h1(h, mf.mo_coeff, mf.mo_occ)
+    else:
+        ref = (uhf_hess if spin else rhf_hess).make_h1(h, mf.mo_coeff, mf.mo_occ)
+    dm = mf.make_rdm1()
+    if spin:
+        vj, vk = mi.h1_jk(mol, [dm[0] + dm[1]], dm)
+        for s in range(2):
+            for ia in range(mol.natm):
+                assert abs(vj[ia, :, 0] - vk[ia, :, s] - (ref[s][ia] - hcore(ia))).max() < 1e-10
+    else:
+        vj, vk = mi.h1_jk(mol, [dm], [dm], omega=omega)
+        for ia in range(mol.natm):
+            assert abs(vj[ia, :, 0] - 0.5 * vk[ia, :, 0] - (ref[ia] - hcore(ia))).max() < 1e-10
