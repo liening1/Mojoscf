@@ -68,11 +68,11 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[scf_kernel]("scf_kernel", docstring="Native RHF/UHF SCF driver; see mojoscf.scf.kernel.")
         m.def_function[py_boys_table]("boys_table", docstring="boys_table(out): fill out (721 * 40 float64) with the Boys-function table.")
         m.def_function[py_int1e]("int1e", docstring="int1e(basis, s_out, t_out, v_out, table): overlap, kinetic and nuclear attraction matrices.")
-        m.def_function[py_int2e_s8]("int2e_s8", docstring="int2e_s8(basis, eri_out, schwarz_tol, table): 8-fold packed electron repulsion integrals.")
+        m.def_function[py_int2e_s8]("int2e_s8", docstring="int2e_s8(basis, eri_out, schwarz_tol, table, omega): 8-fold packed electron repulsion integrals (omega > 0: erf(omega r) / r).")
         m.def_function[py_int3c2e]("int3c2e", docstring="int3c2e(basis, auxbasis, out, table, omega): (ab|P) as a (naux, npair) array; omega > 0: erf(omega r)/r.")
         m.def_function[py_int2c2e]("int2c2e", docstring="int2c2e(auxbasis, out, table, omega): (P|Q) as a dense (naux, naux) array; omega > 0: erf(omega r)/r.")
         m.def_function[py_int1e_ip]("int1e_ip", docstring="int1e_ip(basis, table, centers, charges, want_st, s_out, t_out, v_out): <nabla i|j>, <nabla i|T|j>, <nabla i|sum q/r|j>.")
-        m.def_function[py_grad2e]("grad2e", docstring="grad2e(basis, table, dmj, dmk, jfac, kfac, tol, de): two-electron energy gradient (natm, 3).")
+        m.def_function[py_grad2e]("grad2e", docstring="grad2e(basis, table, dmj, dmk, jfac, kfac, tol, de, omega): two-electron energy gradient (natm, 3) (omega > 0: erf(omega r) / r).")
         m.def_function[py_int3c2e_block]("int3c2e_block", docstring="int3c2e_block(basis, auxbasis, table, s0, s1, out): (ab|P) for the auxiliary shells [s0, s1), (np, npair).")
         m.def_function[py_df_grad_rhs]("df_grad_rhs", docstring="df_grad_rhs(basis, auxbasis, table, dm_tril, orbs, blk, rho, q, seq_path, seq_prefix, omega): fit right-hand sides of the DF gradient.")
         m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix, omega): three-centre term of the DF gradient.")
@@ -93,8 +93,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_mm_esp]("mm_esp", docstring="mm_esp(basis, table, coords, zetas, point, dms, out): sum_ij D_s,ij (ij|k) for symmetric dms (nset, nao, nao) at point or unit Gaussian charges, out (nset, nch).")
         m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces, atoms): sum_k w_k (nabla i j|k) (3, nao, nao), sum_ij D_ij w_k (ij|nabla k) (nch, 3), 2 sum_{i on A} D_ij sum_k w_k (nabla i j|k) (natm, 3); an empty output is skipped.")
         m.def_function[py_int1e_iprinv_dm]("int1e_iprinv_dm", docstring="int1e_iprinv_dm(basis, table, centers, dm, out): sum_ij D_ij <nabla i|1/|r-R_c||j> per centre (ncenter, 3).")
-        m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk.")
-        m.def_function[py_direct_jk]("direct_jk", docstring="direct_jk(basis, table, dms, vj, vk, with_j, with_k, tol, nanti): integral-direct J/K in one pass (the last nanti densities antisymmetric: K only).")
+        m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol, omega): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk (omega > 0: erf(omega r) / r).")
+        m.def_function[py_direct_jk]("direct_jk", docstring="direct_jk(basis, table, dms, vj, vk, with_j, with_k, tol, nanti, omega): integral-direct J/K in one pass (the last nanti densities antisymmetric: K only; omega > 0: erf(omega r) / r).")
         return m.finalize()
     except e:
         abort(String("error creating the mojoscf._mojoscf module: ", e))
@@ -469,10 +469,12 @@ def py_int1e(basis: PythonObject, s: PythonObject, t: PythonObject, v: PythonObj
     return PythonObject(None)
 
 
-def py_int2e_s8(basis: PythonObject, eri: PythonObject, schwarz_tol: PythonObject, table: PythonObject) raises -> PythonObject:
+def py_int2e_s8(
+    basis: PythonObject, eri: PythonObject, schwarz_tol: PythonObject, table: PythonObject, omega: PythonObject
+) raises -> PythonObject:
     var bs = _basis(basis)
     var boys = _boys(table)
-    eri_s8_core(bs, boys, f64ptr(eri), Float64(py=schwarz_tol))
+    eri_s8_core(bs, boys, f64ptr(eri), Float64(py=schwarz_tol), Float64(py=omega))
     _ = bs^
     _ = boys^
     return PythonObject(None)
@@ -502,11 +504,11 @@ def py_int2c2e(auxbasis: PythonObject, dst: PythonObject, table: PythonObject, o
 
 def py_direct_jk(
     basis: PythonObject, table: PythonObject, dms: PythonObject, vj: PythonObject, vk: PythonObject,
-    with_j: PythonObject, with_k: PythonObject, tol: PythonObject, nanti: PythonObject,
+    with_j: PythonObject, with_k: PythonObject, tol: PythonObject, nanti: PythonObject, omega: PythonObject,
 ) raises -> PythonObject:
     """vj[s] = J[dms[s]] for the first nset - nanti (symmetric) densities, vk[s] = K[dms[s]] for all (the last
-    nanti antisymmetric), in one pass over the integrals (outputs overwritten)."""
-    var jk = DirectJK(_basis(basis), _boys(table))
+    nanti antisymmetric), in one pass over the integrals (outputs overwritten); omega > 0: erf(omega r) / r."""
+    var jk = DirectJK(_basis(basis), _boys(table), Float64(py=omega))
     var nset = Int(py=dms.shape[0])
     var na = Int(py=nanti)
     var nj = nset - na if Bool(py=with_j) else 0
@@ -533,22 +535,22 @@ def py_int1e_ip(
 
 def py_jk_ip1(
     basis: PythonObject, table: PythonObject, dms: PythonObject, vj: PythonObject, vk: PythonObject,
-    with_j: PythonObject, with_k: PythonObject, tol: PythonObject,
+    with_j: PythonObject, with_k: PythonObject, tol: PythonObject, omega: PythonObject,
 ) raises -> PythonObject:
     jk_ip1_core(
         _basis(basis), _boys(table), Int(py=dms.shape[0]), f64ptr(dms), f64ptr(vj), f64ptr(vk),
-        Bool(py=with_j), Bool(py=with_k), Float64(py=tol),
+        Bool(py=with_j), Bool(py=with_k), Float64(py=tol), Float64(py=omega),
     )
     return PythonObject(None)
 
 
 def py_grad2e(
     basis: PythonObject, table: PythonObject, dmj: PythonObject, dmk: PythonObject, jfac: PythonObject,
-    kfac: PythonObject, tol: PythonObject, de: PythonObject,
+    kfac: PythonObject, tol: PythonObject, de: PythonObject, omega: PythonObject,
 ) raises -> PythonObject:
     grad2e_core(
         _basis(basis), _boys(table), f64ptr(dmj), Int(py=dmk.shape[0]), f64ptr(dmk), Float64(py=jfac),
-        Float64(py=kfac), Float64(py=tol), f64ptr(de),
+        Float64(py=kfac), Float64(py=tol), f64ptr(de), Float64(py=omega),
     )
     return PythonObject(None)
 

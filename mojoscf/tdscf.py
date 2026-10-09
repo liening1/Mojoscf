@@ -204,7 +204,6 @@ def _operator(td):
     """``(vind, hdiag)`` of the MO-space response for ``td``, or None when pyscf's operator has to run."""
     from pyscf.scf import hf, rohf, uhf
 
-    from . import dft
 
     mf = td._scf
     mol = mf.mol
@@ -235,34 +234,56 @@ def _operator(td):
         mf._numint.libxc.test_deriv_order(mf.xc, 2, raise_error=True)
         if not td.exclude_nlc and mf.do_nlc():
             return None
+    chans = _channels(td)
+    parts = _response_parts(mf, chans, singlet, kind == "rpa", td.max_memory, logger.new_logger(td))
+    if parts is None:
+        return None
+    two, xc = parts
+    if unrestricted:
+        return _uks_operator(kind, chans, xc, two)
+    return _rks_operator(kind, chans[0], singlet, xc, two)
+
+
+def _response_parts(mf, chans, singlet, need_b, max_memory, log):
+    """``(two, xc)`` of the occupied-virtual response of ``mf`` (RHF/UHF/RKS/UKS) for the channels ``chans``,
+    or None when pyscf's AO operator has to run.
+
+    ``two(xs, ys, jscale)`` gives the Coulomb and exact-exchange parts (see
+    :func:`_rks_operator`): from the MO-basis DF tensors, from MO-basis exact
+    ERIs (in-core ERIs) or from J/K of the AO transition densities
+    (integral-direct); ``xc(factors)`` the XC kernel part (:func:`_xc_response`,
+    None for Hartree-Fock).  ``singlet`` selects the RKS kernel (ignored for
+    UHF/UKS); ``need_b`` builds the B-type exchange (x and y vectors).
+    """
+    from pyscf.scf import hf, uhf
+
+    from . import dft
+
+    ks = isinstance(mf, hf.KohnShamDFT)
+    unrestricted = isinstance(mf, uhf.UHF)
     kterms = _exchange_terms(mf)
     if kterms is None:
         return None
-    chans = _channels(td)
+    need_j = singlet or unrestricted
     cderi = dft._df_tensor(mf)
     if cderi is not None:
-        two = _df_two_electron(td, chans, kterms, cderi, need_j=singlet or unrestricted, need_b=kind == "rpa")
+        two = _df_two_electron(mf, chans, kterms, cderi, need_j, need_b, max_memory, log)
     elif dft.exact_jk_applies(mf):
-        two = _exact_mo_two_electron(td, chans, kterms, need_j=singlet or unrestricted, need_b=kind == "rpa")
+        two = _exact_mo_two_electron(mf, chans, kterms, need_j, need_b, max_memory, log)
         if two is None:
             two = _exact_two_electron(mf, chans, kterms)
     else:
         two = None
     if two is None:
         return None
-    xc = _xc_response(td, ks, unrestricted, singlet, chans)
-    if unrestricted:
-        return _uks_operator(kind, chans, xc, two)
-    return _rks_operator(kind, chans[0], singlet, xc, two)
+    return two, _xc_response(mf, ks, unrestricted, singlet, chans)
 
 
-def _df_two_electron(td, chans, kterms, cderi, need_j, need_b):
+def _df_two_electron(mf, chans, kterms, cderi, need_j, need_b, max_memory, log):
     """``two(xs, ys, jscale)`` (:func:`_rks_operator`) from the MO-basis DF tensors, which this sets up on the
     channels; None when a tensor is missing or they would not fit in ``max_memory``."""
     from . import dft
 
-    mf = td._scf
-    log = logger.new_logger(td)
     tensors = {0.0: cderi}
     for _, omega in kterms:
         if omega not in tensors:
@@ -277,7 +298,7 @@ def _df_two_electron(td, chans, kterms, cderi, need_j, need_b):
         words += naux * no * nv if need_j else 0
         for c, omega in kterms:
             words += tensors[omega].shape[0] * (no * no + nv * nv + (no * nv if need_b else 0))
-    avail = td.max_memory - lib.current_memory()[0]
+    avail = max_memory - lib.current_memory()[0]
     if words * 8e-6 > 0.7 * avail:
         log.info("mojoscf.tdscf: the MO-basis DF tensors (%.0f MB) exceed max_memory; pyscf's operator runs",
                  words * 8e-6)
@@ -314,18 +335,16 @@ def _df_two_electron(td, chans, kterms, cderi, need_j, need_b):
     return two
 
 
-def _exact_mo_two_electron(td, chans, kterms, need_j, need_b):
+def _exact_mo_two_electron(mf, chans, kterms, need_j, need_b, max_memory, log):
     """``two(xs, ys, jscale)`` (:func:`_rks_operator`) from exact MO-basis integrals, transformed once from the
     in-core 8-fold ERIs: (ia|jb) for J, and per exchange term (ij|ab) for K_A and (ib|ja) for K_B, each stored
     as an (ov) x (ov) matrix, so that every product is one GEMM for all vectors.  Range-separated hybrids
-    take their long-range ERIs from pyscf (libcint).  None when the ERIs are not kept in core or the MO
-    matrices would not fit in ``max_memory`` (then :func:`_exact_two_electron`).
+    add the same from the long-range ERIs (Mojo engine, erf(omega r) / r).  None when the ERIs are not kept
+    in core or the MO matrices would not fit in ``max_memory`` (then :func:`_exact_two_electron`).
     """
     from pyscf import ao2mo
 
-    mf = td._scf
     mol = mf.mol
-    log = logger.new_logger(td)
     if getattr(mf, "_eri", None) is None and not (mol.incore_anyway or mf._is_mem_enough()):
         return None
     nao = mol.nao_nr()
@@ -337,7 +356,7 @@ def _exact_mo_two_electron(td, chans, kterms, need_j, need_b):
     words += npair * (npair + 1) // 2 * (1 if any(omega for _, omega in kts) else 0)
     if getattr(mf, "_eri", None) is None:
         words += npair * (npair + 1) // 2
-    avail = td.max_memory - lib.current_memory()[0]
+    avail = max_memory - lib.current_memory()[0]
     if words * 8e-6 > 0.7 * avail:
         log.info("mojoscf.tdscf: the MO-basis ERIs (%.0f MB) exceed max_memory; J/K of AO densities run", words * 8e-6)
         return None
@@ -360,11 +379,7 @@ def _exact_mo_two_electron(td, chans, kterms, need_j, need_b):
                     gj[s, t] = ovov(eri0, s, t)
     kmats = [[] for _ in chans]           # per channel [(c, K_A matrix, K_B matrix or None)]
     for c, omega in kts:
-        if omega:
-            with mol.with_range_coulomb(omega):
-                eri = mol.intor("int2e", aosym="s8")
-        else:
-            eri = eri0
+        eri = integrals.int2e_s8(mol, omega=omega) if omega else eri0
         for s, ch in enumerate(chans):
             if not live[s]:
                 continue
@@ -422,12 +437,11 @@ def _exact_two_electron(mf, chans, kterms):
     densities ``C_v x^T C_o^T + C_o y C_v^T`` of all vectors in one call of the Mojo kernels
     (:func:`mojoscf.dft.exact_jk`, in-core or integral-direct; their symmetric parts give J and K, the
     antisymmetric ones K), projected on the occupied-virtual block: ``C_v^T V C_o`` for the top block,
-    ``C_o^T V C_v`` for the bottom one.  The long-range exchange of range-separated hybrids is pyscf's
-    ``get_k(omega=...)``.
+    ``C_o^T V C_v`` for the bottom one.  The long-range exchange of range-separated hybrids comes from the
+    same kernel with erf(omega r) / r.
     """
     from . import dft
 
-    mol = mf.mol
     cfull = sum(c for c, omega in kterms if omega == 0)
     lr = [(c, omega) for c, omega in kterms if omega != 0 and c != 0]
 
@@ -470,7 +484,7 @@ def _exact_two_electron(mf, chans, kterms):
                 if bots is not None:
                     bots[s] -= bot(ch, cfull * k)
         for c, omega in lr:
-            vk = np.asarray(mf.get_k(mol, np.concatenate(dms), hermi=0, omega=omega))
+            vk = dft.exact_jk(mf, np.concatenate(dms), 0, False, True, omega)[1]
             for s, ch in enumerate(chans):
                 if _empty(ch, n):
                     continue
@@ -483,7 +497,7 @@ def _exact_two_electron(mf, chans, kterms):
     return two
 
 
-def _xc_response(td, ks, unrestricted, singlet, chans):
+def _xc_response(mf, ks, unrestricted, singlet, chans):
     """``f(factors) -> [(n, nocc, nvir) per channel]``: the XC kernel response to transition densities.
 
     ``factors`` holds one ``(L (n, nao, nocc), R = C_o)`` pair per spin
@@ -499,7 +513,6 @@ def _xc_response(td, ks, unrestricted, singlet, chans):
 
     if not ks:
         return None
-    mf = td._scf
     ni = mf._numint
     if ni._xc_type(mf.xc) == "HF":
         return None

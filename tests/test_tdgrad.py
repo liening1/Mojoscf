@@ -38,7 +38,7 @@ def test_derivative_jk_of_nonsymmetric_densities():
 
 @pytest.mark.parametrize("xc, method, singlet", [("b3lyp", "TDDFT", True), ("pbe", "TDA", True),
                                                  ("lda,vwn", "TDA", True), ("b3lyp", "TDDFT", False),
-                                                 ("pbe", "TDA", False)])
+                                                 ("pbe", "TDA", False), ("camb3lyp", "TDDFT", True)])
 def test_rks_td_gradients_match_pyscf(xc, method, singlet):
     mol = gto.M(atom=WATER, basis="def2-svp", verbose=0)
     mf = mojoscf.dft.accelerate(dft.RKS(mol, xc=xc))

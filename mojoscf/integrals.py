@@ -202,18 +202,28 @@ def get_hcore(mol):
     return t + v
 
 
-def int2e_s8(mol, schwarz_tol: float = 1e-14):
+def int2e_s8(mol, schwarz_tol: float = 1e-14, omega: float = 0.0):
     """Electron repulsion integrals in pyscf's 8-fold packed layout (``aosym="s8"``).
 
     Shell quartets whose Schwarz bound is below ``schwarz_tol`` are skipped
-    (left at zero); pass ``0`` to compute every quartet.
+    (left at zero); pass ``0`` to compute every quartet.  ``omega`` > 0 gives
+    those of the long-range operator erf(omega r12) / r12, as pyscf's
+    ``mol.intor("int2e", aosym="s8")`` inside ``mol.with_range_coulomb(omega)``.
     """
     tables = basis_tables(mol)
     nao = mol.nao_nr()
     npair = nao * (nao + 1) // 2
     eri = np.empty(npair * (npair + 1) // 2)
-    get_extension().int2e_s8(tables, eri, float(schwarz_tol), _boys_table())
+    get_extension().int2e_s8(tables, eri, float(schwarz_tol), _boys_table(), _omega4c(omega))
     return eri
+
+
+def _omega4c(omega) -> float:
+    """``omega`` for the four-centre kernels: 0 (Coulomb) or > 0 (erf(omega r) / r)."""
+    omega = float(omega or 0.0)
+    if omega < 0:
+        raise NotImplementedError("mojoscf.integrals: short-range (omega < 0) four-centre integrals")
+    return omega
 
 
 def int2e(mol, schwarz_tol: float = 1e-14):
@@ -353,7 +363,7 @@ def attach(mf, schwarz_tol: float = 1e-14, auxbasis=None):
     return mf
 
 
-def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13, hermi=1):
+def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13, hermi=1, omega=0.0):
     """Integral-direct J and K of density matrices, like ``pyscf.scf.hf.get_jk``.
 
     ``dm`` is (nao, nao) or (n, nao, nao); returns (vj, vk) of the same shape
@@ -361,7 +371,8 @@ def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13, hermi=1):
     with the Schwarz bounds times the density, as pyscf's ``direct_scf_tol``.
     All densities share one pass over the integrals; ``hermi=0`` accepts
     non-symmetric densities (their antisymmetric parts go through the kernel
-    as such, J being that of the symmetric parts).
+    as such, J being that of the symmetric parts).  ``omega`` > 0: the
+    long-range operator erf(omega r12) / r12 (pyscf's ``omega`` argument).
     """
     from .kernels import _merge_anti, _sym_anti
 
@@ -371,7 +382,7 @@ def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13, hermi=1):
     vj = np.zeros(stack.shape)
     vk = np.zeros(stack.shape)
     get_extension().direct_jk(basis_tables(mol), _boys_table(), stack, vj, vk, bool(with_j), bool(with_k),
-                              float(direct_scf_tol), len(anti))
+                              float(direct_scf_tol), len(anti), _omega4c(omega))
     vj, vk = _merge_anti(vj if with_j else None, vk if with_k else None, dms.shape[0], anti)
     shape = dm.shape
     vj = vj.reshape(shape) if with_j else None
@@ -530,12 +541,13 @@ def mm_grad_terms(mol, dm, coords, weights, zetas=None):
     return atoms, forces
 
 
-def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14):
+def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14, omega=0.0):
     """Gradient J/K exactly as ``pyscf.grad.rhf.get_jk``: ``(-sum (nabla i j|kl) D_lk, -sum (nabla i j|kl) D_jk)``.
 
     ``dm`` is (nao, nao) or (n, nao, nao); the results have shape (3, nao, nao)
     or (n, 3, nao, nao).  K is right for any density, J only for symmetric
-    ones (``grad._jk_ip1`` handles the others).
+    ones (``grad._jk_ip1`` handles the others).  ``omega`` > 0: the
+    long-range operator erf(omega r12) / r12.
     """
     dm = np.asarray(dm, dtype=np.float64)
     single = dm.ndim == 2
@@ -543,14 +555,15 @@ def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14):
     nset, nao = dms.shape[0], dms.shape[1]
     vj = np.zeros((nset, 3, nao, nao))
     vk = np.zeros((nset, 3, nao, nao))
-    get_extension().jk_ip1(basis_tables(mol), _boys_table(), dms, vj, vk, bool(with_j), bool(with_k), float(tol))
+    get_extension().jk_ip1(basis_tables(mol), _boys_table(), dms, vj, vk, bool(with_j), bool(with_k), float(tol),
+                           _omega4c(omega))
     vj, vk = -vj, -vk
     if single:
         vj, vk = vj[0], vk[0]
     return (vj if with_j else None), (vk if with_k else None)
 
 
-def grad2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14):
+def grad2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14, omega=0.0):
     """Two-electron part of the nuclear gradient at fixed densities, shape (natm, 3).
 
     The derivative of ``E2 = 1/2 sum_ijkl (ij|kl) G_ijkl`` with respect to the
@@ -560,12 +573,14 @@ def grad2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14):
     ``dm_k`` ((nao, nao) or (n, nao, nao)).  RHF: ``grad2e(mol, D, D, 1, 0.5)``;
     UHF: ``grad2e(mol, Da + Db, (Da, Db))``.  The derivative integrals are
     contracted with ``G`` as they are evaluated (8-fold symmetry, nothing stored).
+    ``omega`` > 0: the long-range operator erf(omega r12) / r12.
     """
     nao = mol.nao_nr()
     dmj = np.ascontiguousarray(dm_j, dtype=np.float64).reshape(nao, nao)
     dmk = np.ascontiguousarray(dm_k, dtype=np.float64).reshape(-1, nao, nao)
     de = np.zeros((mol.natm, 3))
-    get_extension().grad2e(basis_tables(mol), _boys_table(), dmj, dmk, float(j_factor), float(k_factor), float(tol), de)
+    get_extension().grad2e(basis_tables(mol), _boys_table(), dmj, dmk, float(j_factor), float(k_factor), float(tol), de,
+                           _omega4c(omega))
     return de
 
 

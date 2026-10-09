@@ -92,9 +92,14 @@ class _MojoGrad1eMixin:
         )
 
     def _mojo_2e_ok(self, mol=None, omega=None):
-        """The two-electron pieces can come from the Mojo engine (ECPs, X2C and finite nuclei allowed)."""
+        """The two-electron pieces can come from the Mojo engine (ECPs, X2C and finite nuclei allowed; ``omega``
+        > 0 for the long-range operator)."""
         mol = self.mol if mol is None else mol
-        return integrals.available(mol, two_electron=True) and not getattr(mol, "_pseudo", None) and not omega
+        return (
+            integrals.available(mol, two_electron=True)
+            and not getattr(mol, "_pseudo", None)
+            and not (omega or 0) < 0
+        )
 
     _mojo_ip_cache = None
 
@@ -222,14 +227,15 @@ class _MojoGrad1eMixin:
         return de
 
 
-def _jk_ip1(mol, dm, with_j=True, with_k=True):
+def _jk_ip1(mol, dm, with_j=True, with_k=True, omega=None):
     """pyscf's ``grad.rhf.get_jk`` (derivative J/K matrices) from the Mojo engine for any real densities.
 
     The kernel's exchange matrix is right for any density; its Coulomb
     matrix assumes a symmetric one, and J depends only on the symmetric part:
     antisymmetric densities (TDHF/TDDFT gradients pass one) have J = 0, and
     densities that are neither go in a second time, symmetrised, for J, so
-    that one pass over the integrals serves all.
+    that one pass over the integrals serves all.  ``omega`` > 0: the
+    long-range operator erf(omega r12) / r12.
     """
     dm = np.asarray(dm, dtype=np.float64)
     single = dm.ndim == 2
@@ -240,7 +246,7 @@ def _jk_ip1(mol, dm, with_j=True, with_k=True):
     anti = [bool(np.allclose(d, -t, rtol=0.0, atol=1e-12)) for d, t in zip(dms, tr)]
     general = [i for i in range(n) if not (sym[i] or anti[i])] if with_j else []
     stack = dms if not general else np.concatenate([dms, 0.5 * (dms[general] + tr[general])])
-    vj, vk = integrals.get_jk_ip1(mol, np.ascontiguousarray(stack), with_j, with_k, tol=grad_tol)
+    vj, vk = integrals.get_jk_ip1(mol, np.ascontiguousarray(stack), with_j, with_k, tol=grad_tol, omega=omega or 0.0)
     if with_j:
         for k, i in enumerate(general):
             vj[i] = vj[n + k]
@@ -273,7 +279,7 @@ class _MojoGradMixin(_MojoGrad1eMixin):
         if not self._mojo_jk_ok(mol, dm, omega):
             return super().get_jk(mol, dm, hermi, omega)
         cpu0 = (logger.process_clock(), logger.perf_counter())
-        vj, vk = _jk_ip1(mol, np.asarray(dm))
+        vj, vk = _jk_ip1(mol, np.asarray(dm), omega=omega)
         logger.timer(self, "vj and vk (Mojo)", *cpu0)
         return vj, vk
 
@@ -283,7 +289,7 @@ class _MojoGradMixin(_MojoGrad1eMixin):
             dm = self.base.make_rdm1()
         if not self._mojo_jk_ok(mol, dm, omega):
             return super().get_j(mol, dm, hermi, omega)
-        return _jk_ip1(mol, np.asarray(dm), with_k=False)[0]
+        return _jk_ip1(mol, np.asarray(dm), with_k=False, omega=omega)[0]
 
     def get_k(self, mol=None, dm=None, hermi=0, omega=None):
         mol = self.mol if mol is None else mol
@@ -291,7 +297,7 @@ class _MojoGradMixin(_MojoGrad1eMixin):
             dm = self.base.make_rdm1()
         if not self._mojo_jk_ok(mol, dm, omega):
             return super().get_k(mol, dm, hermi, omega)
-        return _jk_ip1(mol, np.asarray(dm), with_j=False)[1]
+        return _jk_ip1(mol, np.asarray(dm), with_j=False, omega=omega)[1]
 
     def _direct_2e(self):
         """True if the two-electron term can bypass ``get_veff`` (it is not overridden)."""
@@ -306,13 +312,19 @@ class _MojoGradMixin(_MojoGrad1eMixin):
         """d/dR of the two-electron energy at fixed density (natm, 3); ``dm0`` as from ``base.make_rdm1()``."""
         return self._grad_jk(dm0, mol, 1.0)
 
-    def _grad_jk(self, dm0, mol, k_scale):
-        """Coulomb and (``k_scale`` times) exchange part of ``grad_2e``."""
+    def _grad_jk(self, dm0, mol, k_scale, lr_scale=0.0, omega=0.0):
+        """Coulomb and (``k_scale`` times) exchange part of ``grad_2e``, plus ``lr_scale`` times the exchange
+        of the long-range operator erf(omega r) / r."""
         mol = self.mol if mol is None else mol
         dm0 = np.asarray(dm0)
         if self._unrestricted:
-            return integrals.grad2e(mol, dm0[0] + dm0[1], dm0, 1.0, k_scale, tol=grad_tol)
-        return integrals.grad2e(mol, dm0, dm0, 1.0, 0.5 * k_scale, tol=grad_tol)
+            dm_j, dm_k, k_factor = dm0[0] + dm0[1], dm0, 1.0
+        else:
+            dm_j, dm_k, k_factor = dm0, dm0, 0.5
+        de = integrals.grad2e(mol, dm_j, dm_k, 1.0, k_factor * k_scale, tol=grad_tol)
+        if lr_scale != 0:
+            de += integrals.grad2e(mol, dm_j, dm_k, 0.0, k_factor * lr_scale, tol=grad_tol, omega=omega)
+        return de
 
 
 class _MojoDFGradMixin(_MojoGrad1eMixin):
@@ -396,17 +408,17 @@ class _MojoKSGradMixin:
     The XC term (at fixed grids) is :func:`mojoscf.dft.grad_xc`: the Mojo
     kernels for ``mojoscf.dft.NumInt`` with LDA, GGA and meta-GGA
     functionals, pyscf's ``get_vxc`` otherwise.  Range-separated functionals
-    with density fitting add the long-range exchange term from the
-    attenuated integrals (``grad2e_df(omega=...)``); without density fitting
-    they, non-local correlation (``nlc``) and ``grid_response`` keep pyscf's
-    ``get_veff``.
+    add the long-range exchange term from the attenuated integrals
+    (``grad2e(omega=...)``, with density fitting ``grad2e_df(omega=...)``);
+    short-range-only exchange (omega < 0), non-local correlation (``nlc``)
+    and ``grid_response`` keep pyscf's ``get_veff``.
     """
 
     def _hybrid(self):
         """(supported, exact-exchange fraction, long-range fraction, omega) of the functional.
 
         pyscf's exchange of a range-separated functional is hyb K + (alpha -
-        hyb) K_LR(omega); the long-range part needs density fitting here.
+        hyb) K_LR(omega).
         """
         mf = self.base
         if self.grid_response or mf.do_nlc():
@@ -414,8 +426,7 @@ class _MojoKSGradMixin:
         omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=self.mol.spin)
         if omega == 0:
             return True, hyb, 0.0, 0.0
-        ok = omega > 0 and isinstance(self, _MojoDFGradMixin)
-        return ok, hyb, alpha - hyb, omega
+        return omega > 0, hyb, alpha - hyb, omega
 
     def _direct_2e(self):
         return self._hybrid()[0] and super()._direct_2e()

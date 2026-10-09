@@ -576,7 +576,7 @@ def _exact_jk(mf, mol, dm, hermi, with_j, with_k, omega):
 
     if isinstance(mf, df_jk._DFHF) or (mol is not None and mol is not mf.mol):
         return None
-    if omega or hermi not in (0, 1) or not np.isrealobj(dm) or "get_jk" in vars(mf):
+    if (omega or 0) < 0 or hermi not in (0, 1) or not np.isrealobj(dm) or "get_jk" in vars(mf):
         return None
     mro = type(mf).__mro__
     nxt = next((c for c in mro[mro.index(_MojoKSHook) + 1:] if "get_jk" in c.__dict__), None)
@@ -584,7 +584,7 @@ def _exact_jk(mf, mol, dm, hermi, with_j, with_k, omega):
         return None
     if integrals.engine() != "mojo" or not integrals.available(mf.mol, two_electron=True):
         return None
-    return exact_jk(mf, dm, hermi, with_j, with_k)
+    return exact_jk(mf, dm, hermi, with_j, with_k, omega)
 
 
 def exact_jk_applies(mf) -> bool:
@@ -607,15 +607,16 @@ def exact_jk_applies(mf) -> bool:
                            and eri.size == npair * (npair + 1) // 2)
 
 
-def exact_jk(mf, dm, hermi=1, with_j=True, with_k=True):
+def exact_jk(mf, dm, hermi=1, with_j=True, with_k=True, omega=None):
     """J/K of ``dm`` with exact integrals over ``mf.mol``, as pyscf's ``RHF.get_jk`` forms them.
 
     pyscf's in-core 8-fold ERIs ``mf._eri`` (built with the Mojo engine when
     pyscf would keep them in core) are contracted by
     :func:`mojoscf.kernels.jk_s8`, else the integral-direct kernel runs
     (:func:`mojoscf.integrals.get_jk`, screened with ``mf.direct_scf_tol``).
-    ``hermi`` 1: symmetric densities, 0: any.  None when ``mf._eri`` is not an
-    8-fold ERI array.
+    ``hermi`` 1: symmetric densities, 0: any.  ``omega`` > 0: the long-range
+    operator erf(omega r12) / r12, integral-direct as in pyscf.  None when
+    ``mf._eri`` is not an 8-fold ERI array.
     """
     from . import kernels
 
@@ -623,6 +624,9 @@ def exact_jk(mf, dm, hermi=1, with_j=True, with_k=True):
     nao = mol.nao_nr()
     npair = nao * (nao + 1) // 2
     dm = np.asarray(dm, dtype=np.float64)
+    if omega:
+        return integrals.get_jk(mol, dm, with_j, with_k, direct_scf_tol=mf.direct_scf_tol, hermi=hermi,
+                                omega=omega)
     eri = getattr(mf, "_eri", None)
     if eri is None and (mol.incore_anyway or mf._is_mem_enough()):
         eri = mf._eri = integrals.int2e_s8(mol)
@@ -702,6 +706,12 @@ class _MojoKSHook:
         from . import hessian
 
         return hessian.accelerate(super().Hessian())
+
+    def stability(self, internal=True, external=False, verbose=None, return_status=False, **kwargs):
+        """pyscf's stability analysis with the orbital Hessian of :mod:`mojoscf.stability`."""
+        from . import stability
+
+        return stability.stability(self, internal, external, verbose, return_status, **kwargs)
 
     def TDA(self, frozen=None):
         """pyscf's TDA with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""

@@ -275,6 +275,29 @@ def test_direct_get_jk_nonsymmetric(h2o_dz, rng):
 
 
 @pytest.mark.parametrize("atom, basis", [
+    ("O 0 0 0; H 0 0.76 0.59; H 0 -0.76 0.59", "def2-tzvp"),
+    ("Cu 0 0 0; H 0 0 1.5", "def2-svp"),
+    ("C 0 0 0; O 0 0 1.13", "cc-pvtz"),
+])
+def test_long_range_eris_and_direct_jk(atom, basis, rng):
+    """erf(omega r) / r four-centre integrals: in-core ERIs and integral-direct J/K against libcint."""
+    mol = gto.M(atom=atom, basis=basis, spin=None, verbose=0)
+    with mol.with_range_coulomb(0.4):
+        ref = mol.intor("int2e", aosym="s8")
+    eri = mojoscf.integrals.int2e_s8(mol, schwarz_tol=0.0, omega=0.4)
+    assert abs(eri - ref).max() < 1e-11
+    n = mol.nao_nr()
+    a = rng.standard_normal((2, n, n))
+    a[0] = a[0] + a[0].T
+    rj, rk = scf.hf.get_jk(mol, a, hermi=0, omega=0.4)
+    vj, vk = mojoscf.integrals.get_jk(mol, a, direct_scf_tol=0.0, hermi=0, omega=0.4)
+    assert abs(vj - rj).max() < 1e-10 * max(1.0, abs(rj).max())
+    assert abs(vk - rk).max() < 1e-10 * max(1.0, abs(rk).max())
+    with pytest.raises(NotImplementedError):
+        mojoscf.integrals.get_jk(mol, a[0], omega=-0.4)
+
+
+@pytest.mark.parametrize("atom, basis", [
     ("Cu 0 0 0; H 0 0 1.5", "def2-svp"),                       # segmented, f shell on Cu
     ("O 0 0 0; H 0 0.76 0.59; H 0 -0.76 0.59", "def2-tzvp"),    # (fd), (ff) pairs: unbatched kets
     ("N 0 0 0; N 0 0 1.1", "6-31g*"),

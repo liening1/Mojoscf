@@ -40,7 +40,7 @@ def _block_max(d: F64Ptr, nao: Int, i0: Int, i1: Int, j0: Int, j1: Int) -> Float
 
 def grad2e_core(
     var basis: Basis, var boys: BoysTable, dmj: F64Ptr, nk: Int, dmk: F64Ptr, jfac: Float64, kfac: Float64,
-    tol: Float64, de: F64Ptr,
+    tol: Float64, de: F64Ptr, omega: Float64 = 0.0,
 ):
     """de[A][x] = d/dR_Ax of E2 = 1/2 sum_ijkl (ij|kl) G_ijkl at fixed densities, for every atom A.
 
@@ -56,7 +56,9 @@ def grad2e_core(
     are contracted with G as they are produced, so no derivative matrices are
     formed.  A quartet is skipped when
     max(q'_ab q_cd, q_ab q'_cd) max|G| < tol, q' the Schwarz bound of the
-    six-component pair.
+    six-component pair.  ``omega`` > 0: the long-range operator
+    erf(omega r12) / r12 (the plain pair table, one side of both passes,
+    attenuated after the Schwarz bounds are taken).
     """
     var nbas = basis.nbas
     var nao = basis.nao
@@ -75,6 +77,8 @@ def grad2e_core(
     var tab2 = PairTable(basis, basis, sa, sb, ht, 2)
     var q2 = schwarz_bounds(boys, tab2, ht)
     var tab1 = PairTable(basis, basis, sa, sb, ht, 1)
+    if omega > 0.0:
+        attenuate(tab, omega)
     # largest |Dj| and largest |Dk_s| per shell block
     var cj = List[Float64](length=max(nbas * nbas, 1), fill=0.0)
     var ck = List[Float64](length=max(nbas * nbas, 1), fill=0.0)

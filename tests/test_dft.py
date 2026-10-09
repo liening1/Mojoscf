@@ -138,7 +138,9 @@ def test_exact_jk_matches_pyscf():
             j1, k1 = mf.get_jk(mol, d)
             assert abs(j0 - j1).max() < 1e-10 and abs(k0 - k1).max() < 1e-10
             assert abs(mf.get_j(mol, d) - j0).max() < 1e-10
-        assert abs(mf.get_k(mol, dm, omega=0.3) - ref.get_k(mol, dm, omega=0.3)).max() < 1e-10   # pyscf's
+        assert abs(mf.get_k(mol, dm, omega=0.3) - ref.get_k(mol, dm, omega=0.3)).max() < 1e-10
+        assert mdft._exact_jk(mf, mol, dm, 1, False, True, 0.3) is not None        # long-range: Mojo kernel
+        assert mdft._exact_jk(mf, mol, dm, 1, False, True, -0.3) is None           # short-range: pyscf's
         # non-symmetric densities (TDDFT X - Y) through the same kernels
         x = np.random.default_rng(1).normal(size=(2, mol.nao, mol.nao))
         j0, k0 = ref.get_jk(mol, x, hermi=0)
@@ -161,7 +163,7 @@ def test_ks_gradients(df, xc):
     g0 = ref.nuc_grad_method().kernel()
     mf = mdft.accelerate(make()).run(conv_tol=1e-11)
     g = mf.nuc_grad_method()
-    assert g._direct_2e() == (df or xc != "camb3lyp")   # range separation without DF: pyscf's get_veff
+    assert g._direct_2e()
     assert abs(g.kernel() - g0).max() < 1e-7
     if xc == "pbe":
         g = mf.nuc_grad_method()
@@ -175,20 +177,25 @@ def test_ks_gradients(df, xc):
         assert g._direct_2e() and abs(g.kernel() - g0).max() < 1e-7
 
 
+@pytest.mark.parametrize("df", [True, False])
 @pytest.mark.parametrize("xc, spin", [("camb3lyp", 0), ("wb97x", 0), ("hse06", 0), ("wb97x", 1)])
-def test_range_separated_df(xc, spin):
-    """Long-range exchange from the attenuated DF tensor (SCF) and integrals (gradient); same-SCF gradients."""
+def test_range_separated(xc, spin, df):
+    """Long-range exchange from the attenuated DF tensor or four-centre integrals (SCF) and integrals
+    (gradient); same-SCF gradients."""
     mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
 
     def make():
-        return (dft.UKS if spin else dft.RKS)(mol, xc=xc).density_fit()
+        mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc)
+        return mf.density_fit() if df else mf
 
     ref = make().run(conv_tol=1e-11)
     mf = mdft.accelerate(make())
     dm = ref.make_rdm1()
     omega = mf._numint.rsh_and_hybrid_coeff(xc)[0]
-    if omega > 0:   # the long-range tensor comes from the Mojo engine (pyscf's range_coulomb context)
+    if omega > 0 and df:   # the long-range tensor comes from the Mojo engine (pyscf's range_coulomb context)
         assert mdft._df_tensor(mf, omega) is not None and mol.omega == 0
+    if omega > 0 and not df:
+        assert mdft._exact_jk(mf, mol, dm, 1, False, True, omega) is not None
     assert abs(mf.get_k(mol, dm, omega=omega) - ref.get_k(mol, dm, omega=omega)).max() < 1e-10
     mf.run(conv_tol=1e-11)
     assert abs(mf.e_tot - ref.e_tot) < 1e-9

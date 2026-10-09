@@ -468,6 +468,12 @@ class _MojoGlueMixin:
             return kernels.eigh(h, s)
         return kernels.eigh(h, x=x)
 
+    def stability(self, internal=True, external=False, verbose=None, return_status=False, **kwargs):
+        """pyscf's stability analysis with the orbital Hessian of :mod:`mojoscf.stability`."""
+        from . import stability
+
+        return stability.stability(self, internal, external, verbose, return_status, **kwargs)
+
 
 class _MojoRHFMixin(_MojoGlueMixin):
     """Mojo implementations of the RHF glue; mixed in front of a pyscf RHF class."""

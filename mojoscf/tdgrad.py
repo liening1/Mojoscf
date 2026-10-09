@@ -47,7 +47,6 @@ def tdrks_xc_kernel(td_grad, xc_code, dmvo, dmoo=None, with_vxc=True, with_kxc=T
     mo_coeff, mo_occ = np.asarray(mf.mo_coeff), np.asarray(mf.mo_occ)
     if mo_coeff.ndim != 2 or not np.isrealobj(mo_coeff):
         return None
-    nao = mol.nao_nr()
     xctype = ni._xc_type(xc_code)
     coords, weights = dft._grid(mf.grids)
     nvar = (1, 4)[kind]
@@ -202,7 +201,7 @@ class _MojoTDGradMixin:
     __name_mixin__ = "Mojo"
 
     def _mojo_jk_ok(self, mol, dm, omega):
-        if omega or integrals.engine() != "mojo" or integrals.unsupported_reason(mol, two_electron=True):
+        if (omega or 0) < 0 or integrals.engine() != "mojo" or integrals.unsupported_reason(mol, two_electron=True):
             return False
         if getattr(mol, "omega", 0):
             return False
@@ -215,7 +214,7 @@ class _MojoTDGradMixin:
         mol = self.mol if mol is None else mol
         if dm is None or not self._mojo_jk_ok(mol, dm, omega):
             return super().get_jk(mol, dm, hermi, omega)
-        return _jk_ip1(mol, np.asarray(dm))
+        return _jk_ip1(mol, np.asarray(dm), omega=omega)
 
     def get_j(self, mol=None, dm=None, hermi=0, omega=None):
         from .grad import _jk_ip1
@@ -223,7 +222,7 @@ class _MojoTDGradMixin:
         mol = self.mol if mol is None else mol
         if dm is None or not self._mojo_jk_ok(mol, dm, omega):
             return super().get_j(mol, dm, hermi, omega)
-        return _jk_ip1(mol, np.asarray(dm), with_k=False)[0]
+        return _jk_ip1(mol, np.asarray(dm), with_k=False, omega=omega)[0]
 
     def get_k(self, mol=None, dm=None, hermi=0, omega=None):
         from .grad import _jk_ip1
@@ -231,7 +230,7 @@ class _MojoTDGradMixin:
         mol = self.mol if mol is None else mol
         if dm is None or not self._mojo_jk_ok(mol, dm, omega):
             return super().get_k(mol, dm, hermi, omega)
-        return _jk_ip1(mol, np.asarray(dm), with_j=False)[1]
+        return _jk_ip1(mol, np.asarray(dm), with_j=False, omega=omega)[1]
 
     def grad_elec(self, *args, **kwargs):
         with _XCKernel():

@@ -25,6 +25,11 @@ primitive pairs, up to BATCH_LANES of them, are the SIMD lanes of one
 kernel call, so even single-primitive quartets of segmented basis sets run
 vectorised.  Kets beyond the lane kernels' degrees go through
 ``eri_quartet`` one at a time.
+
+With ``omega`` > 0 the integrals are those of the long-range operator
+erf(omega r12) / r12: the bra side of every quartet comes from a second,
+attenuated pair table (``attenuate``); the Schwarz bounds of the full
+operator remain valid upper bounds.
 """
 from std.atomic import Atomic
 from std.math import sqrt
@@ -35,7 +40,8 @@ from max.algorithm import parallelize
 from _mojo.linalg import F64Ptr, list_ptr, vfill, vaxpy
 from _mojo.integrals import (
     Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, I64Ptr, IntPtr, eri_quartet, eri_batch, schwarz_bounds,
-    shell_nfunc, batch_supported, batch_classes, lanes_preferred, int_ptr, KetQueue, I_A, I_B, I_LAB, I_NCOMP, I_NP,
+    shell_nfunc, batch_supported, batch_classes, lanes_preferred, int_ptr, KetQueue, attenuate, I_A, I_B, I_LAB,
+    I_NCOMP, I_NP,
 )
 
 
@@ -259,11 +265,12 @@ def digest_quartet(
 
 
 def flush_batch(
-    jk: DirectJK, sp: Int, kets: IntPtr, nket: Int, mut ws: EriWork, mut wb: EriBatch, n2: Int,
+    jk: DirectJK, tb: PairTable, sp: Int, kets: IntPtr, nket: Int, mut ws: EriWork, mut wb: EriBatch, n2: Int,
     nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, ploc: F64Ptr,
 ):
-    """Integrals of bra ``sp`` with the queued kets (``eri_batch``) folded into the J/K accumulators."""
-    eri_batch(jk.tab, sp, jk.tab, kets, nket, jk.boys, ws, wb)
+    """Integrals of bra ``sp`` (of ``tb``: ``jk.tab`` or its attenuated copy) with the queued kets
+    (``eri_batch``) folded into the J/K accumulators."""
+    eri_batch(tb, sp, jk.tab, kets, nket, jk.boys, ws, wb)
     var a = jk.tab.get(sp, I_A)
     var b = jk.tab.get(sp, I_B)
     for k in range(nket):
@@ -274,6 +281,55 @@ def flush_batch(
         )
 
 
+def _jk_bra(
+    self: DirectJK, tb: PairTable, sp: Int, mut ws: EriWork, mut wb: EriBatch, mut queue: KetQueue, ploc: F64Ptr,
+    pcond: F64Ptr, pq: F64Ptr, npairs: Int, nbas: Int, nao: Int, n2: Int, nj: Int, nk: Int, dmj: F64Ptr,
+    dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, tol: Float64,
+):
+    """The quartets of bra pair ``sp`` folded into a worker's J/K accumulators (``DirectJK.jk``); ``tb`` is the
+    bra-side pair table (``self.tab``, or its attenuated copy for the long-range operator)."""
+    var qab = pq[unsafe_offset=sp]
+    if qab == 0.0:
+        return
+    var pkcls = int_ptr(self.kcls)
+    var a = self.tab.get(sp, I_A)
+    var b = self.tab.get(sp, I_B)
+    var dab = pcond[unsafe_offset=a * nbas + b]
+    var npb = self.tab.get(sp, I_NP)
+    var batch_bra = batch_supported(self.tab.get(sp, I_LAB), 0)
+    # each unique quartet belongs to the pair with more primitive pairs (ties: the
+    # higher index), so the kets are the less contracted side
+    for spk in range(npairs):
+        var npk = self.tab.get(spk, I_NP)
+        if npk > npb or (npk == npb and spk > sp):
+            continue
+        var qq = qab * pq[unsafe_offset=spk]
+        if qq < tol:
+            continue
+        var c = self.tab.get(spk, I_A)
+        var d = self.tab.get(spk, I_B)
+        var dmax = 4.0 * max(dab, pcond[unsafe_offset=c * nbas + d])
+        dmax = max(dmax, max(pcond[unsafe_offset=a * nbas + c], pcond[unsafe_offset=a * nbas + d]))
+        dmax = max(dmax, max(pcond[unsafe_offset=b * nbas + c], pcond[unsafe_offset=b * nbas + d]))
+        if qq * dmax < tol:
+            continue
+        var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
+        if kc >= 0 and lanes_preferred(self.tab, sp, self.tab, spk):
+            if queue.full(kc, npk):
+                flush_batch(self, tb, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+                queue.clear(kc)
+            queue.push(kc, spk, npk)
+            continue
+        if not eri_quartet(tb, sp, self.tab, spk, self.ht, self.boys, ws):
+            continue
+        digest_quartet(self.basis, a, b, c, d, sp == spk, list_ptr(ws.out), nao, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+    # the rest of this bra's batches
+    for kc in range(self.nclass):
+        if queue.cnt[kc] > 0:
+            flush_batch(self, tb, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+            queue.clear(kc)
+
+
 struct DirectJK(Movable):
     """Integral-direct J and K for one basis (see the module docstring)."""
 
@@ -282,6 +338,8 @@ struct DirectJK(Movable):
     var boys: BoysTable
     var ht: HermTable
     var tab: PairTable
+    var tabw: PairTable       # the bra side for omega > 0 (attenuated copy of tab), else empty
+    var omega: Float64
     var q: List[Float64]      # Schwarz bound per shell pair a >= b (index a (a + 1) / 2 + b)
     var kcls: List[Int]       # batch class of each pair as a ket (-1: not batched)
     var nclass: Int
@@ -289,7 +347,7 @@ struct DirectJK(Movable):
     var nao: Int
     var nfmax: Int
 
-    def __init__(out self, var basis: Basis, var boys: BoysTable):
+    def __init__(out self, var basis: Basis, var boys: BoysTable, omega: Float64 = 0.0):
         var nbas = basis.nbas
         var npairs = nbas * (nbas + 1) // 2
         var ht = HermTable(2 * basis.lmax)
@@ -301,6 +359,15 @@ struct DirectJK(Movable):
                 sb.append(b)
         var tab = PairTable(basis, basis, sa, sb, ht)
         var q = schwarz_bounds(boys, tab, ht)
+        var none = List[Int]()
+        var tabw: PairTable
+        if omega > 0.0:
+            tabw = PairTable(basis, basis, sa, sb, ht)
+            attenuate(tabw, omega)
+        else:
+            tabw = PairTable(basis, basis, none, none, ht)
+        self.tabw = tabw^
+        self.omega = omega
         var nfmax = 1
         for a in range(nbas):
             nfmax = max(nfmax, shell_nfunc(basis, a))
@@ -326,6 +393,8 @@ struct DirectJK(Movable):
         var sa = List[Int]()
         var sb = List[Int]()
         self.tab = PairTable(basis, basis, sa, sb, ht)
+        self.tabw = PairTable(basis, basis, sa, sb, ht)
+        self.omega = 0.0
         self.ht = ht^
         self.active = False
         self.nbas = 0
@@ -382,7 +451,9 @@ struct DirectJK(Movable):
         var pcount = Pointer(to=counter)
         var nfmax = self.nfmax
 
-        def work(w: Int) {imm self, imm pacc, imm pcond, imm pq, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm nacc, imm nj, imm nk, imm dmj, imm dmk, imm tol, imm nfmax}:
+        var attenuated = self.omega > 0.0
+
+        def work(w: Int) {imm self, imm pacc, imm pcond, imm pq, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm nacc, imm nj, imm nk, imm dmj, imm dmk, imm tol, imm nfmax, imm attenuated}:
             var ws = EriWork(self.tab.maxcomp, self.tab.maxlab, self.tab.maxcomp, self.tab.maxlab)
             var wb = EriBatch(self.tab.maxcomp, self.tab.maxcomp)
             var loc = List[Float64](length=6 * nfmax * nfmax + 8, fill=0.0)
@@ -390,51 +461,15 @@ struct DirectJK(Movable):
             var aj = pacc.unsafe_offset(w * nacc * n2)
             var ak = aj.unsafe_offset(nj * n2)
             var queue = KetQueue(self.nclass)    # kets of the current bra waiting for a batch
-            var pkcls = int_ptr(self.kcls)
             while True:
                 var task = Int(pcount[].fetch_add(1))
                 if task >= npairs:
                     break
                 var sp = npairs - 1 - task
-                var qab = pq[unsafe_offset=sp]
-                if qab == 0.0:
-                    continue
-                var a = self.tab.get(sp, I_A)
-                var b = self.tab.get(sp, I_B)
-                var dab = pcond[unsafe_offset=a * nbas + b]
-                var npb = self.tab.get(sp, I_NP)
-                var batch_bra = batch_supported(self.tab.get(sp, I_LAB), 0)
-                # each unique quartet belongs to the pair with more primitive pairs (ties: the
-                # higher index), so the kets are the less contracted side
-                for spk in range(npairs):
-                    var npk = self.tab.get(spk, I_NP)
-                    if npk > npb or (npk == npb and spk > sp):
-                        continue
-                    var qq = qab * pq[unsafe_offset=spk]
-                    if qq < tol:
-                        continue
-                    var c = self.tab.get(spk, I_A)
-                    var d = self.tab.get(spk, I_B)
-                    var dmax = 4.0 * max(dab, pcond[unsafe_offset=c * nbas + d])
-                    dmax = max(dmax, max(pcond[unsafe_offset=a * nbas + c], pcond[unsafe_offset=a * nbas + d]))
-                    dmax = max(dmax, max(pcond[unsafe_offset=b * nbas + c], pcond[unsafe_offset=b * nbas + d]))
-                    if qq * dmax < tol:
-                        continue
-                    var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
-                    if kc >= 0 and lanes_preferred(self.tab, sp, self.tab, spk):
-                        if queue.full(kc, npk):
-                            flush_batch(self, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
-                            queue.clear(kc)
-                        queue.push(kc, spk, npk)
-                        continue
-                    if not eri_quartet(self.tab, sp, self.tab, spk, self.ht, self.boys, ws):
-                        continue
-                    digest_quartet(self.basis, a, b, c, d, sp == spk, list_ptr(ws.out), nao, n2, nj, nk, dmj, dmk, aj, ak, ploc)
-                # the rest of this bra's batches
-                for kc in range(self.nclass):
-                    if queue.cnt[kc] > 0:
-                        flush_batch(self, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
-                        queue.clear(kc)
+                if attenuated:
+                    _jk_bra(self, self.tabw, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol)
+                else:
+                    _jk_bra(self, self.tab, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol)
             _ = wb^
             _ = queue^
             _ = ws^
@@ -534,7 +569,7 @@ def digest_ip1(
 
 def jk_ip1_core(
     var basis: Basis, var boys: BoysTable, nset: Int, dms: F64Ptr, vj: F64Ptr, vk: F64Ptr,
-    with_j: Bool, with_k: Bool, tol: Float64,
+    with_j: Bool, with_k: Bool, tol: Float64, omega: Float64 = 0.0,
 ):
     """J1 = sum_kl (nabla i j|kl) D_lk and K1 = sum_jk (nabla i j|kl) D_jk, each (nset, 3, nao, nao).
 
@@ -543,6 +578,8 @@ def jk_ip1_core(
     ket pairs c >= d; a quartet is skipped when
     q'_ab q_cd max(2 D_cd, D_bc, D_bd) < tol with q' the Schwarz bound of the
     derivative pair and D the largest density element per shell block.
+    ``omega`` > 0: the long-range operator erf(omega r12) / r12 (the ket
+    table attenuated after its Schwarz bounds are taken).
     """
     var nbas = basis.nbas
     var nao = basis.nao
@@ -556,6 +593,8 @@ def jk_ip1_core(
             sb.append(b)
     var tab = PairTable(basis, basis, sa, sb, ht)
     var q = schwarz_bounds(boys, tab, ht)
+    if omega > 0.0:
+        attenuate(tab, omega)
     var da = List[Int](capacity=nbas * nbas)
     var db = List[Int](capacity=nbas * nbas)
     for a in range(nbas):

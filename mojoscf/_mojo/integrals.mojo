@@ -2367,11 +2367,12 @@ def schwarz_bounds(boys: BoysTable, tab: PairTable, ht: HermTable) -> List[Float
 
 
 def scatter_batch(
-    basis: Basis, tab: PairTable, sp: Int, kets: IntPtr, nket: Int, boys: BoysTable, ws: EriWork,
+    basis: Basis, tb: PairTable, tab: PairTable, sp: Int, kets: IntPtr, nket: Int, boys: BoysTable, ws: EriWork,
     mut wb: EriBatch, eri: F64Ptr,
 ):
-    """``eri_batch`` of bra ``sp`` and the queued kets, stored into the 8-fold packed ``eri``."""
-    eri_batch(tab, sp, tab, kets, nket, boys, ws, wb)
+    """``eri_batch`` of bra ``sp`` (of ``tb``: ``tab`` or its attenuated copy) and the queued kets of ``tab``,
+    stored into the 8-fold packed ``eri``."""
+    eri_batch(tb, sp, tab, kets, nket, boys, ws, wb)
     var a = tab.get(sp, I_A)
     var b = tab.get(sp, I_B)
     var na = basis.ao_loc[a + 1] - basis.ao_loc[a]
@@ -2386,8 +2387,55 @@ def scatter_batch(
         )
 
 
-def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64):
+def _s8_bra(
+    basis: Basis, boys: BoysTable, tb: PairTable, tab: PairTable, ht: HermTable, sp: Int, pq: F64Ptr,
+    pkcls: IntPtr, nclass: Int, eri: F64Ptr, schwarz_tol: Float64, mut ws: EriWork, mut wb: EriBatch,
+    mut queue: KetQueue,
+):
+    """The packed elements of bra pair ``sp`` (``eri_s8_core``); ``tb`` is the bra-side table (``tab`` or its
+    attenuated copy)."""
+    var qab = pq[unsafe_offset=sp]
+    var npb = tab.get(sp, I_NP)
+    if npb == 0:
+        return
+    var a = tab.get(sp, I_A)
+    var b = tab.get(sp, I_B)
+    var na = basis.ao_loc[a + 1] - basis.ao_loc[a]
+    var nb = basis.ao_loc[b + 1] - basis.ao_loc[b]
+    var batch_bra = batch_supported(tab.get(sp, I_LAB), 0)
+    # kets spk <= sp (the elements of a bra are contiguous rows of the packed output),
+    # batched by class (see ``DirectJK``)
+    for spk in range(sp + 1):
+        var npk = tab.get(spk, I_NP)
+        if qab * pq[unsafe_offset=spk] < schwarz_tol:
+            continue
+        var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
+        if kc >= 0 and lanes_preferred(tab, sp, tab, spk):
+            if queue.full(kc, npk):
+                scatter_batch(basis, tb, tab, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb, eri)
+                queue.clear(kc)
+            queue.push(kc, spk, npk)
+            continue
+        if not eri_quartet(tb, sp, tab, spk, ht, boys, ws):
+            continue
+        var c = tab.get(spk, I_A)
+        var d = tab.get(spk, I_B)
+        scatter_s8(
+            basis, a, b, c, d, list_ptr(ws.out), na, nb,
+            basis.ao_loc[c + 1] - basis.ao_loc[c], basis.ao_loc[d + 1] - basis.ao_loc[d], eri,
+        )
+    for kc in range(nclass):
+        if queue.cnt[kc] > 0:
+            scatter_batch(basis, tb, tab, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb, eri)
+            queue.clear(kc)
+
+
+def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64, omega: Float64 = 0.0):
     """8-fold packed ERIs of ``basis`` into ``eri`` (length npair (npair + 1) / 2).
+
+    ``omega`` > 0: those of the long-range operator erf(omega r12) / r12 (the
+    bra side of every quartet from an attenuated copy of the pair table, see
+    ``attenuate``; the Schwarz bounds of the full operator screen them).
 
     The shell-pair table of all pairs a >= b is built once (in parallel).
     Shell quartets whose Schwarz bound ``sqrt((ab|ab)) sqrt((cd|cd))`` falls
@@ -2435,7 +2483,16 @@ def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm basis, imm boys, imm tab, imm ht, imm pq, imm pkcls, imm nclass, imm eri, imm schwarz_tol, imm npairs, imm pcount}:
+    var none = List[Int]()
+    var tabw: PairTable
+    if omega > 0.0:
+        tabw = PairTable(basis, basis, sa, sb, ht)
+        attenuate(tabw, omega)
+    else:
+        tabw = PairTable(basis, basis, none, none, ht)
+    var attenuated = omega > 0.0
+
+    def work(w: Int) {imm basis, imm boys, imm tab, imm tabw, imm attenuated, imm ht, imm pq, imm pkcls, imm nclass, imm eri, imm schwarz_tol, imm npairs, imm pcount}:
         var ws = EriWork(tab.maxcomp, tab.maxlab, tab.maxcomp, tab.maxlab)
         var wb = EriBatch(tab.maxcomp, tab.maxcomp)
         var queue = KetQueue(nclass)
@@ -2444,40 +2501,10 @@ def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64
             if task >= npairs:
                 break
             var sp = npairs - 1 - task
-            var qab = pq[unsafe_offset=sp]
-            var npb = tab.get(sp, I_NP)
-            if npb == 0:
-                continue
-            var a = tab.get(sp, I_A)
-            var b = tab.get(sp, I_B)
-            var na = basis.ao_loc[a + 1] - basis.ao_loc[a]
-            var nb = basis.ao_loc[b + 1] - basis.ao_loc[b]
-            var batch_bra = batch_supported(tab.get(sp, I_LAB), 0)
-            # kets spk <= sp (the elements of a bra are contiguous rows of the packed output),
-            # batched by class (see ``DirectJK``)
-            for spk in range(sp + 1):
-                var npk = tab.get(spk, I_NP)
-                if qab * pq[unsafe_offset=spk] < schwarz_tol:
-                    continue
-                var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
-                if kc >= 0 and lanes_preferred(tab, sp, tab, spk):
-                    if queue.full(kc, npk):
-                        scatter_batch(basis, tab, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb, eri)
-                        queue.clear(kc)
-                    queue.push(kc, spk, npk)
-                    continue
-                if not eri_quartet(tab, sp, tab, spk, ht, boys, ws):
-                    continue
-                var c = tab.get(spk, I_A)
-                var d = tab.get(spk, I_B)
-                scatter_s8(
-                    basis, a, b, c, d, list_ptr(ws.out), na, nb,
-                    basis.ao_loc[c + 1] - basis.ao_loc[c], basis.ao_loc[d + 1] - basis.ao_loc[d], eri,
-                )
-            for kc in range(nclass):
-                if queue.cnt[kc] > 0:
-                    scatter_batch(basis, tab, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb, eri)
-                    queue.clear(kc)
+            if attenuated:
+                _s8_bra(basis, boys, tabw, tab, ht, sp, pq, pkcls, nclass, eri, schwarz_tol, ws, wb, queue)
+            else:
+                _s8_bra(basis, boys, tab, tab, ht, sp, pq, pkcls, nclass, eri, schwarz_tol, ws, wb, queue)
         _ = ws^
         _ = wb^
         _ = queue^
@@ -2490,6 +2517,8 @@ def eri_s8_core(basis: Basis, boys: BoysTable, eri: F64Ptr, schwarz_tol: Float64
     _ = kcls^
     _ = counter^
     _ = tab^
+    _ = tabw^
+    _ = none^
     _ = ht^
     _ = sa^
     _ = sb^

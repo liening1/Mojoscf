@@ -50,6 +50,26 @@ def test_derivative_jk_matches_pyscf():
     assert vk1 is None and abs(vj1 - rj[0]).max() < 1e-11
 
 
+@pytest.mark.parametrize("basis", ["cc-pvdz", "def2-tzvp"])
+def test_long_range_derivative_jk_and_gradient_term(basis):
+    """erf(omega r) / r: derivative J/K and the two-electron gradient term against pyscf's range_coulomb."""
+    mol = _mol(basis, atom="C 0 0 0; O 0 0 1.13; H 0.9 0.3 -0.5", spin=1)
+    rng = np.random.default_rng(3)
+    dms = rng.standard_normal((2, mol.nao, mol.nao))
+    dms[0] = dms[0] + dms[0].T
+    with mol.with_range_coulomb(0.33):
+        rj, rk = rhf_grad.get_jk(mol, dms)
+    vj, vk = mi.get_jk_ip1(mol, np.ascontiguousarray(dms[:1]), omega=0.33)
+    assert abs(vj - rj[:1]).max() < 1e-11 and abs(vk - rk[:1]).max() < 1e-11
+    assert abs(mi.get_jk_ip1(mol, dms, with_j=False, omega=0.33)[1] - rk).max() < 1e-11
+    dm = scf.UHF(mol).run().make_rdm1()
+    with mol.with_range_coulomb(0.33):
+        ref = _pyscf_grad2e(mol, dm, True)
+    de = mi.grad2e(mol, dm[0] + dm[1], dm, omega=0.33)
+    assert abs(de - ref).max() < 1e-11
+    assert abs(de.sum(axis=0)).max() < 1e-11
+
+
 def _pyscf_grad2e(mol, dm, unrestricted):
     vj, vk = rhf_grad.get_jk(mol, dm)
     vhf = vj[0] + vj[1] - vk if unrestricted else vj - 0.5 * vk
