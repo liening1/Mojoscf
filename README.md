@@ -1268,6 +1268,16 @@ trajectory exactly whenever the problem is well posed (all other examples in thi
 repository), and the tests compare only rotation-invariant quantities for the
 degenerate cases.
 
+Hard SCF problems with several nearby solutions are sensitive to the
+summation order of the parallel kernels as well: an Fe(II) porphine triplet
+(UKS B3LYP) converged to two states 9 mEh apart in two runs whose XC
+integration had distributed the grid blocks to the threads differently.
+The XC kernels therefore assign the blocks round-robin and the
+density-fitted exchange gives each thread a fixed range of auxiliary
+functions, so these results are bitwise reproducible for a given number of
+threads; the integral-direct J/K and the gradient kernels schedule shell
+pairs dynamically for load balance (as pyscf's libcvhf does with OpenMP).
+
 ## Development
 
 ```bash

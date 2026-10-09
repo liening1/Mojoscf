@@ -181,6 +181,7 @@ struct AOWork(Movable):
     var run_row: List[Int]  # runs of consecutive AO indices: first local row,
     var run_ao: List[Int]   # first global AO index,
     var run_len: List[Int]  # length
+    var flags: List[Int]    # scratch per local row (prune_rows)
     var nrun: Int
 
     def __init__(out self, nao: Int, nbas: Int, ncomp: Int, lmax: Int, nctr_max: Int):
@@ -203,6 +204,7 @@ struct AOWork(Movable):
         self.run_row = List[Int](length=max(nbas, 1), fill=0)
         self.run_ao = List[Int](length=max(nbas, 1), fill=0)
         self.run_len = List[Int](length=max(nbas, 1), fill=0)
+        self.flags = List[Int](length=max(nao, 1), fill=0)
         self.nrun = 0
 
     def ao(self) -> F64Ptr:
@@ -599,6 +601,62 @@ def _eval_block3(basis: Basis, grid: Grid, blk: Int, nshell: Int, nrow: Int, mut
     _ = cpz^
 
 
+def prune_rows(nrow: Int, ncomp: Int, mut ws: AOWork) -> Int:
+    """Drop the AO rows whose values and derivatives (``ncomp`` components) stay below AO_CUT at every
+    point of the block, after ``eval_block``; returns the number of rows kept.
+
+    ``select_shells`` bounds whole shells over the block's bounding sphere,
+    which keeps many functions negligible everywhere on the block (a quarter
+    of the rows of a metalloporphyrin, whose blocks are 4 bohr across).  The
+    AO values ([comp][row][BLK]) are compacted in place, ``ws.rows`` and the
+    runs of consecutive AO indices rebuilt.
+    """
+    var ao = ws.ao()
+    var cs = nrow * BLK
+    var nk = 0
+    for r in range(nrow):
+        var m = F64V(0.0)
+        for c in range(ncomp):
+            var row = ao.unsafe_offset(c * cs + r * BLK)
+            for v in range(NV):
+                m = max(m, abs(row.unsafe_load[width=W](v * W)))
+        if m.reduce_max() >= AO_CUT:
+            ws.flags[r] = 1
+            nk += 1
+        else:
+            ws.flags[r] = 0
+    if nk == nrow:
+        return nrow
+    # in place: every destination lies at or before its source, components in order
+    var ncs = nk * BLK
+    for c in range(ncomp):
+        var k = 0
+        for r in range(nrow):
+            if ws.flags[r] != 0:
+                var dst = c * ncs + k * BLK
+                var src = c * cs + r * BLK
+                if dst != src:
+                    vcopy(ao.unsafe_offset(dst), ao.unsafe_offset(src), BLK)
+                k += 1
+    var k = 0
+    var nrun = 0
+    for r in range(nrow):
+        if ws.flags[r] == 0:
+            continue
+        var i = ws.rows[r]
+        ws.rows[k] = i
+        if nrun > 0 and ws.run_ao[nrun - 1] + ws.run_len[nrun - 1] == i:
+            ws.run_len[nrun - 1] += 1
+        else:
+            ws.run_row[nrun] = k
+            ws.run_ao[nrun] = i
+            ws.run_len[nrun] = 1
+            nrun += 1
+        k += 1
+    ws.nrun = nrun
+    return nk
+
+
 def gather_block(dm: F64Ptr, nao: Int, nrow: Int, ws: AOWork):
     """ws.dsub[i][j] = dm[rows_i][rows_j], copying runs of consecutive AO indices."""
     var dsub = ws.dsub()
@@ -736,7 +794,7 @@ def xc_rho_core(
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nout, imm kind, imm nset, imm dms, imm norb, imm orbs, imm occs, imm rho_out, imm ngrid}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nout, imm kind, imm nset, imm dms, imm norb, imm orbs, imm occs, imm rho_out, imm ngrid, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var pl = List[Float64](length=(4 if kind == 2 else 1) * max(norb, 1) * BLK + W, fill=0.0)
         var pbuf = F64Ptr(unsafe_from_address=aligned_addr(pl))     # psi_c (meta-GGA orbital route)
@@ -745,8 +803,11 @@ def xc_rho_core(
         # orbitals when their GEMMs are cheaper than the products with D_sub
         var ngemm_orb = 1 if kind == 0 else (2 if kind == 1 else 4)
         var ngemm_d = 4 if kind == 2 else 1
+        var it = 0
         while True:
-            var blk = Int(pcount[].fetch_add(1))
+            # static round-robin: every worker sums its blocks in a fixed order (reproducible results)
+            var blk = w + it * nworkers
+            it += 1
             if blk >= nblk:
                 break
             var sel = select_shells(basis, grid, blk, rcut, ws)
@@ -759,6 +820,12 @@ def xc_rho_core(
                         vfill(rho_out.unsafe_offset((s * nout + c) * ngrid + p0), npt, 0.0)
                 continue
             eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            nrow = prune_rows(nrow, ncomp, ws)
+            if nrow == 0:
+                for s in range(nset):
+                    for c in range(nout):
+                        vfill(rho_out.unsafe_offset((s * nout + c) * ngrid + p0), npt, 0.0)
+                continue
             var cs = nrow * BLK
             var use_orb = norb > 0 and ngemm_orb * norb * 10 < ngemm_d * nrow * 9
             for s in range(nset):
@@ -898,11 +965,14 @@ def xc_vmat_core(
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm kind, imm nset, imm wv, imm pacc, imm ngrid}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm kind, imm nset, imm wv, imm pacc, imm ngrid, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nset * n2)
+        var it = 0
         while True:
-            var blk = Int(pcount[].fetch_add(1))
+            # static round-robin: every worker sums its blocks in a fixed order (reproducible results)
+            var blk = w + it * nworkers
+            it += 1
             if blk >= nblk:
                 break
             var sel = select_shells(basis, grid, blk, rcut, ws)
@@ -912,6 +982,7 @@ def xc_vmat_core(
             var p0 = blk * BLK
             var npt = min(BLK, ngrid - p0)
             eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            nrow = prune_rows(nrow, ncomp, ws)
             var cs = nrow * BLK
             for s in range(nset):
                 var off = (s * nw) * ngrid + p0
@@ -1006,14 +1077,17 @@ def xc_grad_core(
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm mgga, imm nset, imm wv, imm pacc, imm ngrid}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm mgga, imm nset, imm wv, imm pacc, imm ngrid, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nset * 3 * n2)
         # meta-GGA: w_4 d_c phi for c = x, y, z (3 x nao x BLK)
         var tl = List[Float64](length=(3 * nao * BLK if mgga else 0) + 2 * W, fill=0.0)
         var tb = F64Ptr(unsafe_from_address=aligned_addr(tl))
+        var it = 0
         while True:
-            var blk = Int(pcount[].fetch_add(1))
+            # static round-robin: every worker sums its blocks in a fixed order (reproducible results)
+            var blk = w + it * nworkers
+            it += 1
             if blk >= nblk:
                 break
             var sel = select_shells(basis, grid, blk, rcut, ws)
@@ -1023,6 +1097,7 @@ def xc_grad_core(
             var p0 = blk * BLK
             var npt = min(BLK, ngrid - p0)
             eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            nrow = prune_rows(nrow, ncomp, ws)
             var cs = nrow * BLK
             var ao = ws.ao()
             var zb = ws.y()
@@ -1153,8 +1228,13 @@ def xc_grad_dm_core(
     var pacc = list_ptr(accl)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
+    var aoatom_l = List[Int](length=max(nao, 1), fill=0)      # atom of every AO
+    for b in range(basis.nbas):
+        for i in range(basis.ao_loc[b], basis.ao_loc[b + 1]):
+            aoatom_l[i] = basis.atom[b]
+    var aoatom = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(aoatom_l.unsafe_ptr()))
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm kind, imm nset, imm wv, imm dms, imm norb, imm orbs, imm occs, imm pacc, imm ngrid}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm kind, imm nset, imm wv, imm dms, imm norb, imm orbs, imm occs, imm pacc, imm ngrid, imm aoatom, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * basis.natm * 3)
         var tl = List[Float64](length=max(norb, 1) * BLK + W, fill=0.0)
@@ -1162,23 +1242,25 @@ def xc_grad_dm_core(
         var wl = List[Float64](length=5 * BLK + W, fill=0.0)    # the block's weights, zero-padded
         var wb = list_ptr(wl)
         var rowatm = List[Int](length=max(nao, 1), fill=0)
+        var it = 0
         while True:
-            var blk = Int(pcount[].fetch_add(1))
+            # static round-robin: every worker sums its blocks in a fixed order (reproducible results)
+            var blk = w + it * nworkers
+            it += 1
             if blk >= nblk:
                 break
             var sel = select_shells(basis, grid, blk, rcut, ws)
             var nrow = sel[1]
             if nrow == 0:
                 continue
-            var r = 0
-            for si in range(sel[0]):
-                var b = ws.shells[si]
-                for _ in range(basis.ao_loc[b + 1] - basis.ao_loc[b]):
-                    rowatm[r] = basis.atom[b]
-                    r += 1
             var p0 = blk * BLK
             var npt = min(BLK, ngrid - p0)
             eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            nrow = prune_rows(nrow, ncomp, ws)
+            if nrow == 0:
+                continue
+            for r in range(nrow):
+                rowatm[r] = aoatom[unsafe_offset=ws.rows[r]]
             var cs = nrow * BLK
             var ao = ws.ao()
             var zb = ws.y()
@@ -1301,6 +1383,7 @@ def xc_grad_dm_core(
     else:
         parallelize(work, nworkers)
     blas.serial_end(nthr)
+    _ = aoatom_l^
     for i in range(natm * 3):
         var v = 0.0
         for w2 in range(nworkers):
@@ -1374,7 +1457,7 @@ def xc_fxc_core(
     var pcount = Pointer(to=counter)
     var rk = max(rank, 1)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nvar, imm nv2, imm nb, imm kind, imm nspin, imm nset, imm fxc, imm weights, imm dms, imm rank, imm rk, imm lfac, imm rfac, imm pacc, imm total, imm ngrid, imm project, imm nbc}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nvar, imm nv2, imm nb, imm kind, imm nspin, imm nset, imm fxc, imm weights, imm dms, imm rank, imm rk, imm lfac, imm rfac, imm pacc, imm total, imm ngrid, imm project, imm nbc, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * total)
         var n_rsub = nspin * nao * rk
@@ -1395,8 +1478,11 @@ def xc_fxc_core(
         var tau = wvb.unsafe_offset(n_r1)
         var ubuf = tau.unsafe_offset(BLK)
         var wblk = ubuf.unsafe_offset(n_u)
+        var it = 0
         while True:
-            var blk = Int(pcount[].fetch_add(1))
+            # static round-robin: every worker sums its blocks in a fixed order (reproducible results)
+            var blk = w + it * nworkers
+            it += 1
             if blk >= nblk:
                 break
             var sel = select_shells(basis, grid, blk, rcut, ws)
@@ -1406,6 +1492,7 @@ def xc_fxc_core(
             var p0 = blk * BLK
             var npt = min(BLK, ngrid - p0)
             eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            nrow = prune_rows(nrow, ncomp, ws)
             var cs = nrow * BLK
             var use_lr = False
             if rank > 0:
@@ -1693,7 +1780,7 @@ def xc_hess_core(
     var pd2 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d2t.unsafe_ptr()))
     var pd3 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d3t.unsafe_ptr()))
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm mgga, imm nvar, imm nv2, imm ncy, imm ngb, imm nspin, imm dms, imm vxc, imm fxc, imm weights, imm aoatm, imm natm, imm pacc, imm nde, imm ngrid, imm pd2, imm pd3}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm mgga, imm nvar, imm nv2, imm ncy, imm ngb, imm nspin, imm dms, imm vxc, imm fxc, imm weights, imm aoatm, imm natm, imm pacc, imm nde, imm ngrid, imm pd2, imm pd3, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nde)
         var n_y = nspin * ncy * nao * BLK
@@ -1712,8 +1799,11 @@ def xc_hess_core(
         var alist = List[Int](length=natm + 1, fill=0)   # atoms of the block
         var a0l = List[Int](length=natm + 1, fill=0)     # their local row ranges
         var a1l = List[Int](length=natm + 1, fill=0)
+        var it = 0
         while True:
-            var blk = Int(pcount[].fetch_add(1))
+            # static round-robin: every worker sums its blocks in a fixed order (reproducible results)
+            var blk = w + it * nworkers
+            it += 1
             if blk >= nblk:
                 break
             var sel = select_shells(basis, grid, blk, rcut, ws)
@@ -1723,6 +1813,7 @@ def xc_hess_core(
             var p0 = blk * BLK
             var npt = min(BLK, ngrid - p0)
             eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            nrow = prune_rows(nrow, ncomp, ws)
             var cs = nrow * BLK
             var ao = ws.ao()
             # atoms on the block and their (contiguous) local rows
@@ -1972,7 +2063,7 @@ def xc_h1_core(
                                    (1 if x == 2 else 0) + (1 if y == 2 else 0))
     var pd2 = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(d2t.unsafe_ptr()))
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm mgga, imm nvar, imm nphi, imm nv2, imm ncy, imm nspin, imm dms, imm fxc, imm weights, imm aoatm, imm natm, imm cmo, imm nmo, imm nocc, imm pacc, imm nh, imm ngrid, imm pd2}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm mgga, imm nvar, imm nphi, imm nv2, imm ncy, imm nspin, imm dms, imm fxc, imm weights, imm aoatm, imm natm, imm cmo, imm nmo, imm nocc, imm pacc, imm nh, imm ngrid, imm pd2, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nh)
         var kmax = 3 * natm
@@ -1995,8 +2086,11 @@ def xc_h1_core(
         var alist = List[Int](length=natm + 1, fill=0)
         var a0l = List[Int](length=natm + 1, fill=0)
         var a1l = List[Int](length=natm + 1, fill=0)
+        var it = 0
         while True:
-            var blk = Int(pcount[].fetch_add(1))
+            # static round-robin: every worker sums its blocks in a fixed order (reproducible results)
+            var blk = w + it * nworkers
+            it += 1
             if blk >= nblk:
                 break
             var sel = select_shells(basis, grid, blk, rcut, ws)
@@ -2006,6 +2100,7 @@ def xc_h1_core(
             var p0 = blk * BLK
             var npt = min(BLK, ngrid - p0)
             eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+            nrow = prune_rows(nrow, ncomp, ws)
             var cs = nrow * BLK
             var ao = ws.ao()
             var na = 0
