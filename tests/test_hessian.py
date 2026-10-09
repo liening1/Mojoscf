@@ -270,3 +270,45 @@ def test_ecp_metal_hessian_matches_pyscf():
     h = mf.Hessian()
     assert mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
     assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-8
+
+
+@pytest.mark.parametrize("spin, omega", [(0, 0.0), (1, 0.0), (0, 0.35)])
+def test_exact_two_electron_hessian_term(spin, omega):
+    """hess2e: the J - K part of pyscf's _partial_hess_ejk (exact integrals), also long-range."""
+    from pyscf import scf
+    from pyscf.hessian import rhf as rhf_hess
+    from pyscf.hessian import uhf as uhf_hess
+
+    from mojoscf import integrals as mi
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = (scf.UHF if spin else scf.RHF)(mol).run(conv_tol=1e-10)
+    h = mf.Hessian()
+    if omega:
+        with mol.with_range_coulomb(omega):
+            _, ej, ek = rhf_hess._partial_hess_ejk(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ)
+    else:
+        mod = uhf_hess if spin else rhf_hess
+        _, ej, ek = mod._partial_hess_ejk(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ)
+    dm = mf.make_rdm1()
+    if spin:
+        de2 = mi.hess2e(mol, dm[0] + dm[1], dm, 1.0, 1.0)
+    else:
+        de2 = mi.hess2e(mol, dm, dm, 1.0, 0.5, omega=omega)
+    assert abs(de2 - (ej - ek)).max() < 1e-9
+    # translational invariance: every row of atom blocks sums to zero
+    assert abs(de2.sum(axis=1)).max() < 1e-9
+
+
+@pytest.mark.parametrize("xc, spin", [("b3lyp", 0), ("pbe", 0), ("camb3lyp", 0), ("pbe0", 1)])
+def test_exact_partial_hessian_matches_pyscf(xc, spin):
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    ref = (dft.UKS if spin else dft.RKS)(mol, xc=xc).run(conv_tol=1e-10)
+    mf = mdft.accelerate((dft.UKS if spin else dft.RKS)(mol, xc=xc))
+    for k in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(mf, k, getattr(ref, k))
+    h = mf.Hessian()
+    assert mhess.exact_jk_partial(h, mf.mo_coeff, mf.mo_occ) is not None
+    de2 = h.partial_hess_elec()
+    ref2 = ref.Hessian().partial_hess_elec()
+    assert abs(de2 - ref2).max() < 1e-8

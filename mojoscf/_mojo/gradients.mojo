@@ -6,6 +6,11 @@ derivatives are contracted with the density factors as they are produced, so
 no derivative integrals or derivative matrices are stored.
 
 * ``grad2e_core``: exact two-electron term, ``1/2 sum (ij|kl) G_ijkl``.
+* ``grad2e_pairs_core``: the same with G built from several Coulomb-type
+  and exchange-type density pairs (the two-electron term of excited-state
+  gradients).
+* ``hess2e_core``: second derivatives of ``1/2 sum (ij|kl) G_ijkl`` (the
+  two-electron part of the partial Hessian), all atom pairs at once.
 * ``grad_df3c_core`` and ``grad2c_core``: the two terms of the density-fitted
   two-electron energy, ``sum (mu nu|P) Gamma_P,mu nu`` and
   ``-1/2 sum (P|Q) W_PQ`` (their derivatives give the DF gradient, including
@@ -226,6 +231,498 @@ def grad2e_core(
     _ = tab2^
     _ = q^
     _ = q2^
+    _ = sa^
+    _ = sb^
+    _ = ht^
+    _ = basis^
+    _ = boys^
+
+
+
+def grad2e_pairs_core(
+    var basis: Basis, var boys: BoysTable, nj: Int, jl: F64Ptr, jr: F64Ptr, jc: F64Ptr, nk: Int, kl: F64Ptr,
+    kr: F64Ptr, kc: F64Ptr, tol: Float64, de: F64Ptr, omega: Float64 = 0.0,
+):
+    """de[A][x] = d/dR_Ax of E2 = 1/2 sum_ijkl (ij|kl) G_ijkl for every atom A (``de`` overwritten), with
+
+        G_ijkl = sum_p c_p (L_p,ij R_p,kl + R_p,ij L_p,kl)
+               + sum_q c'_q / 2 (A_q,jk B_q,il + A_q,ik B_q,jl + A_q,jl B_q,ik + A_q,il B_q,jk)
+
+    for ``nj`` Coulomb pairs (L, R, c) in ``jl``/``jr``/``jc`` and ``nk``
+    exchange pairs (A, B, c') in ``kl``/``kr``/``kc``, each matrix nao x nao.
+    The pair matrices must be symmetric, or for an exchange pair both
+    antisymmetric; then G has the eight-fold symmetry of the integrals, and
+    E2 = sum_p c_p sum (ij|kl) L_ij R_kl + sum_q c'_q sum (ij|kl) A_jk B_il.
+    Evaluated as ``grad2e_core`` (unique quartets, the six bra and three ket
+    derivative components, translational invariance for the last centre);
+    a quartet is skipped when its Schwarz bound times the largest |G| it can
+    reach (from the largest element of each matrix per shell block) is below
+    ``tol``.  ``omega`` > 0: the long-range operator erf(omega r12) / r12.
+    """
+    var nbas = basis.nbas
+    var nao = basis.nao
+    var natm = basis.natm
+    var n2 = nao * nao
+    var nb2 = nbas * nbas
+    var npairs = nbas * (nbas + 1) // 2
+    var ht = HermTable(2 * basis.lmax + 1)
+    var sa = List[Int](capacity=npairs)
+    var sb = List[Int](capacity=npairs)
+    for a in range(nbas):
+        for b in range(a + 1):
+            sa.append(a)
+            sb.append(b)
+    var tab = PairTable(basis, basis, sa, sb, ht)
+    var q = schwarz_bounds(boys, tab, ht)
+    var tab2 = PairTable(basis, basis, sa, sb, ht, 2)
+    var q2 = schwarz_bounds(boys, tab2, ht)
+    var tab1 = PairTable(basis, basis, sa, sb, ht, 1)
+    if omega > 0.0:
+        attenuate(tab, omega)
+    # largest element per shell block of every pair matrix: [jl, jr, kl, kr] x pairs x nbas^2
+    var nmat = 2 * nj + 2 * nk
+    var bm = List[Float64](length=max(nmat * nb2, 1), fill=0.0)
+    var pbm = list_ptr(bm)
+    for m in range(nmat):
+        var d: F64Ptr
+        if m < nj:
+            d = jl.unsafe_offset(m * n2)
+        elif m < 2 * nj:
+            d = jr.unsafe_offset((m - nj) * n2)
+        elif m < 2 * nj + nk:
+            d = kl.unsafe_offset((m - 2 * nj) * n2)
+        else:
+            d = kr.unsafe_offset((m - 2 * nj - nk) * n2)
+        for a in range(nbas):
+            for b in range(nbas):
+                pbm[unsafe_offset=m * nb2 + a * nbas + b] = _block_max(
+                    d, nao, basis.ao_loc[a], basis.ao_loc[a + 1], basis.ao_loc[b], basis.ao_loc[b + 1]
+                )
+    var nfmax = 1
+    for a in range(nbas):
+        nfmax = max(nfmax, shell_nfunc(basis, a))
+    var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
+    var per = 3 * natm
+    var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
+    var pacc = list_ptr(accl)
+    var pq = list_ptr(q)
+    var pq2 = list_ptr(q2)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+
+    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab1, imm tab2, imm pq, imm pq2, imm pbm, imm pacc, imm pcount, imm npairs, imm nbas, imm nb2, imm nao, imm n2, imm per, imm nj, imm jl, imm jr, imm jc, imm nk, imm kl, imm kr, imm kc, imm tol, imm nfmax}:
+        var ws = EriWork(tab2.maxcomp, tab2.maxlab, tab.maxcomp, tab.maxlab)
+        var gbuf = List[Float64](length=nfmax * nfmax * nfmax * nfmax + 8, fill=0.0)
+        var g = list_ptr(gbuf)
+        var gabuf = List[Float64](length=16, fill=0.0)
+        var ga = list_ptr(gabuf)
+        var acc = pacc.unsafe_offset(w * per)
+        var bjl = pbm
+        var bjr = pbm.unsafe_offset(nj * nb2)
+        var bkl = pbm.unsafe_offset(2 * nj * nb2)
+        var bkr = pbm.unsafe_offset((2 * nj + nk) * nb2)
+        while True:
+            var task = Int(pcount[].fetch_add(1))
+            if task >= npairs:
+                break
+            var sp = npairs - 1 - task
+            var qab = pq[unsafe_offset=sp]
+            var q2ab = pq2[unsafe_offset=sp]
+            if qab == 0.0:
+                continue
+            var a = tab.get(sp, I_A)
+            var b = tab.get(sp, I_B)
+            var i0 = basis.ao_loc[a]
+            var na = basis.ao_loc[a + 1] - i0
+            var j0 = basis.ao_loc[b]
+            var nb = basis.ao_loc[b + 1] - j0
+            var nab = na * nb
+            for spk in range(sp + 1):
+                var qcd = pq[unsafe_offset=spk]
+                var qq = max(q2ab * qcd, qab * pq2[unsafe_offset=spk])
+                if qq < tol:
+                    continue
+                var c = tab.get(spk, I_A)
+                var d = tab.get(spk, I_B)
+                var ab = a * nbas + b
+                var cd = c * nbas + d
+                var ac = a * nbas + c
+                var ad = a * nbas + d
+                var bc = b * nbas + c
+                var bd = b * nbas + d
+                var gmax = 0.0
+                for p in range(nj):
+                    var o = p * nb2
+                    gmax += abs(jc[unsafe_offset=p]) * (
+                        bjl[unsafe_offset=o + ab] * bjr[unsafe_offset=o + cd]
+                        + bjr[unsafe_offset=o + ab] * bjl[unsafe_offset=o + cd]
+                    )
+                for p in range(nk):
+                    var o = p * nb2
+                    gmax += 0.5 * abs(kc[unsafe_offset=p]) * (
+                        bkl[unsafe_offset=o + bc] * bkr[unsafe_offset=o + ad]
+                        + bkl[unsafe_offset=o + ac] * bkr[unsafe_offset=o + bd]
+                        + bkl[unsafe_offset=o + bd] * bkr[unsafe_offset=o + ac]
+                        + bkl[unsafe_offset=o + ad] * bkr[unsafe_offset=o + bc]
+                    )
+                if qq * gmax < tol:
+                    continue
+                var k0 = basis.ao_loc[c]
+                var nc = basis.ao_loc[c + 1] - k0
+                var l0 = basis.ao_loc[d]
+                var nd = basis.ao_loc[d + 1] - l0
+                var ncd = nc * nd
+                # G[ij][kl] of the block
+                for i in range(na):
+                    for j in range(nb):
+                        var row = g.unsafe_offset((i * nb + j) * ncd)
+                        vfill(row, ncd, 0.0)
+                        for p in range(nj):
+                            var lm = jl.unsafe_offset(p * n2)
+                            var rm = jr.unsafe_offset(p * n2)
+                            var cf = jc[unsafe_offset=p]
+                            var lij = cf * lm[unsafe_offset=(i0 + i) * nao + j0 + j]
+                            var rij = cf * rm[unsafe_offset=(i0 + i) * nao + j0 + j]
+                            for k in range(nc):
+                                var lk = lm.unsafe_offset((k0 + k) * nao + l0)
+                                var rk = rm.unsafe_offset((k0 + k) * nao + l0)
+                                var r = row.unsafe_offset(k * nd)
+                                for l in range(nd):
+                                    r[unsafe_offset=l] += lij * rk[unsafe_offset=l] + rij * lk[unsafe_offset=l]
+                        for p in range(nk):
+                            var am = kl.unsafe_offset(p * n2)
+                            var bmx = kr.unsafe_offset(p * n2)
+                            var cf = 0.5 * kc[unsafe_offset=p]
+                            var ai = am.unsafe_offset((i0 + i) * nao)
+                            var aj = am.unsafe_offset((j0 + j) * nao)
+                            var bi = bmx.unsafe_offset((i0 + i) * nao)
+                            var bj = bmx.unsafe_offset((j0 + j) * nao)
+                            for k in range(nc):
+                                var ajk = cf * aj[unsafe_offset=k0 + k]
+                                var aik = cf * ai[unsafe_offset=k0 + k]
+                                var bik = cf * bi[unsafe_offset=k0 + k]
+                                var bjk = cf * bj[unsafe_offset=k0 + k]
+                                var r = row.unsafe_offset(k * nd)
+                                for l in range(nd):
+                                    r[unsafe_offset=l] += (
+                                        ajk * bi[unsafe_offset=l0 + l] + aik * bj[unsafe_offset=l0 + l]
+                                        + bik * aj[unsafe_offset=l0 + l] + bjk * ai[unsafe_offset=l0 + l]
+                                    )
+                var nabcd = nab * ncd
+                var wgt = 0.5
+                if a != b:
+                    wgt *= 2.0
+                if c != d:
+                    wgt *= 2.0
+                if sp != spk:
+                    wgt *= 2.0
+                vfill(ga, 9, 0.0)
+                # (nabla a b|cd) and (a nabla b|cd): layout [6][ij][kl]
+                if not eri_quartet(tab2, sp, tab, spk, ht, boys, ws):
+                    continue
+                var blk = list_ptr(ws.out)
+                for x in range(6):
+                    ga[unsafe_offset=x] = vdot_serial(blk.unsafe_offset(x * nabcd), g, nabcd)
+                # (ab|nabla c d): layout [ij][3][kl]
+                _ = eri_quartet(tab, sp, tab1, spk, ht, boys, ws)
+                for ij in range(nab):
+                    var grow = g.unsafe_offset(ij * ncd)
+                    for x in range(3):
+                        ga[unsafe_offset=6 + x] += vdot_serial(blk.unsafe_offset((ij * 3 + x) * ncd), grow, ncd)
+                # d/dR = -nabla: atom(a) gets -ga[0:3], atom(b) -ga[3:6], atom(c) -ga[6:9], atom(d) the rest
+                var pa = acc.unsafe_offset(3 * basis.atom[a])
+                var pb = acc.unsafe_offset(3 * basis.atom[b])
+                var pc = acc.unsafe_offset(3 * basis.atom[c])
+                var pd = acc.unsafe_offset(3 * basis.atom[d])
+                for x in range(3):
+                    var gx = ga[unsafe_offset=x]
+                    var gy = ga[unsafe_offset=3 + x]
+                    var gz = ga[unsafe_offset=6 + x]
+                    pa[unsafe_offset=x] -= wgt * gx
+                    pb[unsafe_offset=x] -= wgt * gy
+                    pc[unsafe_offset=x] -= wgt * gz
+                    pd[unsafe_offset=x] += wgt * (gx + gy + gz)
+        _ = ws^
+        _ = gbuf^
+        _ = gabuf^
+
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    for i in range(per):
+        var v = 0.0
+        for w2 in range(nworkers):
+            v += pacc[unsafe_offset=w2 * per + i]
+        de[unsafe_offset=i] = v
+    _ = accl^
+    _ = bm^
+    _ = counter^
+    _ = tab^
+    _ = tab1^
+    _ = tab2^
+    _ = q^
+    _ = q2^
+    _ = sa^
+    _ = sb^
+    _ = ht^
+    _ = basis^
+    _ = boys^
+
+
+
+def _sym3(c: Int) -> Int:
+    """Index into the six symmetric components (xx, xy, xz, yy, yz, zz) for the pair c = 3 x + y."""
+    var x = c // 3
+    var y = c % 3
+    if x > y:
+        var t = x
+        x = y
+        y = t
+    if x == 0:
+        return y
+    if x == 1:
+        return 2 + y
+    return 5
+
+
+def _add_block(hess: F64Ptr, natm: Int, ia: Int, ja: Int, blk: F64Ptr, w: Float64, transpose: Bool):
+    """hess[ia][ja] += w blk (3 x 3, row-major), or w blk^T."""
+    var dst = hess.unsafe_offset((ia * natm + ja) * 9)
+    for x in range(3):
+        for y in range(3):
+            var v = blk[unsafe_offset=y * 3 + x] if transpose else blk[unsafe_offset=x * 3 + y]
+            dst[unsafe_offset=x * 3 + y] += w * v
+
+
+def hess2e_core(
+    var basis: Basis, var boys: BoysTable, dmj: F64Ptr, nk: Int, dmk: F64Ptr, jfac: Float64, kfac: Float64,
+    tol: Float64, hess: F64Ptr, omega: Float64 = 0.0,
+):
+    """hess[A][B][x][y] = d^2/dR_Ax dR_By of E2 = 1/2 sum_ijkl (ij|kl) G_ijkl at fixed densities, all atoms.
+
+    G as in ``grad2e_core`` (``jfac`` Dj Dj - ``kfac``/2 sum_s exchange products
+    of the symmetric ``nk`` matrices Dk_s).  Each unique quartet a >= b,
+    c >= d, ab >= cd is evaluated with its eight permutations folded into a
+    weight, three times: with the 21 second-derivative components of the bra
+    pair (nabla_a nabla_a, nabla_a nabla_b, nabla_b nabla_b), with those of the
+    ket pair, and with the first derivatives of both pairs (nabla_a, nabla_b
+    by nabla_c, nabla_d); every component block is contracted with G as it is
+    produced and the 3 x 3 blocks go to the atoms of the four centres
+    (d^2/dR dR = nabla nabla).  A quartet is skipped when the largest Schwarz
+    bound of the three derivative products times max |G| is below ``tol``.
+    ``hess`` (natm x natm x 3 x 3) is overwritten.  ``omega`` > 0: the
+    long-range operator erf(omega r12) / r12.
+    """
+    var nbas = basis.nbas
+    var nao = basis.nao
+    var natm = basis.natm
+    var n2 = nao * nao
+    var npairs = nbas * (nbas + 1) // 2
+    var ht = HermTable(2 * basis.lmax + 2)
+    var sa = List[Int](capacity=npairs)
+    var sb = List[Int](capacity=npairs)
+    for a in range(nbas):
+        for b in range(a + 1):
+            sa.append(a)
+            sb.append(b)
+    var tab = PairTable(basis, basis, sa, sb, ht)
+    var q = schwarz_bounds(boys, tab, ht)
+    var tab21 = PairTable(basis, basis, sa, sb, ht, 3)
+    var q21 = schwarz_bounds(boys, tab21, ht)
+    var tab6 = PairTable(basis, basis, sa, sb, ht, 2)
+    var q6 = schwarz_bounds(boys, tab6, ht)
+    var none = List[Int]()
+    var tab6w: PairTable
+    if omega > 0.0:
+        attenuate(tab, omega)
+        tab6w = PairTable(basis, basis, sa, sb, ht, 2)
+        attenuate(tab6w, omega)
+    else:
+        tab6w = PairTable(basis, basis, none, none, ht)
+    var attenuated = omega > 0.0
+    # largest |Dj| and largest |Dk_s| per shell block
+    var cj = List[Float64](length=max(nbas * nbas, 1), fill=0.0)
+    var ck = List[Float64](length=max(nbas * nbas, 1), fill=0.0)
+    for a in range(nbas):
+        var i0 = basis.ao_loc[a]
+        var i1 = basis.ao_loc[a + 1]
+        for b in range(nbas):
+            var j0 = basis.ao_loc[b]
+            var j1 = basis.ao_loc[b + 1]
+            cj[a * nbas + b] = _block_max(dmj, nao, i0, i1, j0, j1)
+            var m = 0.0
+            for s in range(nk):
+                m = max(m, _block_max(dmk.unsafe_offset(s * n2), nao, i0, i1, j0, j1))
+            ck[a * nbas + b] = m
+    var nfmax = 1
+    for a in range(nbas):
+        nfmax = max(nfmax, shell_nfunc(basis, a))
+    var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
+    var per = natm * natm * 9
+    var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
+    var pacc = list_ptr(accl)
+    var pq = list_ptr(q)
+    var pq21 = list_ptr(q21)
+    var pq6 = list_ptr(q6)
+    var pcj = list_ptr(cj)
+    var pck = list_ptr(ck)
+    var counter = Atomic[Int64](0)
+    var pcount = Pointer(to=counter)
+    var ajf = abs(jfac)
+    var akf = 0.5 * Float64(nk) * abs(kfac)
+
+    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab21, imm tab6, imm tab6w, imm attenuated, imm pq, imm pq21, imm pq6, imm pcj, imm pck, imm pacc, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm natm, imm per, imm nk, imm dmj, imm dmk, imm jfac, imm kfac, imm ajf, imm akf, imm tol, imm nfmax}:
+        var ws = EriWork(tab21.maxcomp, tab21.maxlab, tab21.maxcomp, tab21.maxlab)
+        var gbuf = List[Float64](length=nfmax * nfmax * nfmax * nfmax + 8, fill=0.0)
+        var g = list_ptr(gbuf)
+        var hbuf = List[Float64](length=21 + 21 + 36 + 9 * 4 + 8, fill=0.0)
+        var hb = list_ptr(hbuf)                 # bra second derivatives (21)
+        var hk = hb.unsafe_offset(21)           # ket second derivatives (21)
+        var hm = hk.unsafe_offset(21)           # mixed [bra 6][ket 6]
+        var blk3 = hm.unsafe_offset(36)         # 3 x 3 scratch blocks
+        var acc = pacc.unsafe_offset(w * per)
+        while True:
+            var task = Int(pcount[].fetch_add(1))
+            if task >= npairs:
+                break
+            var sp = npairs - 1 - task
+            var qab = pq[unsafe_offset=sp]
+            if qab == 0.0:
+                continue
+            var a = tab.get(sp, I_A)
+            var b = tab.get(sp, I_B)
+            var i0 = basis.ao_loc[a]
+            var na = basis.ao_loc[a + 1] - i0
+            var j0 = basis.ao_loc[b]
+            var nb = basis.ao_loc[b + 1] - j0
+            var nab = na * nb
+            var djab = ajf * pcj[unsafe_offset=a * nbas + b]
+            for spk in range(sp + 1):
+                var qcd = pq[unsafe_offset=spk]
+                var qq = max(max(pq21[unsafe_offset=sp] * qcd, qab * pq21[unsafe_offset=spk]),
+                             pq6[unsafe_offset=sp] * pq6[unsafe_offset=spk])
+                if qq < tol:
+                    continue
+                var c = tab.get(spk, I_A)
+                var d = tab.get(spk, I_B)
+                var gmax = djab * pcj[unsafe_offset=c * nbas + d] + akf * (
+                    pck[unsafe_offset=a * nbas + c] * pck[unsafe_offset=b * nbas + d]
+                    + pck[unsafe_offset=a * nbas + d] * pck[unsafe_offset=b * nbas + c]
+                )
+                if qq * gmax < tol:
+                    continue
+                var k0 = basis.ao_loc[c]
+                var nc = basis.ao_loc[c + 1] - k0
+                var l0 = basis.ao_loc[d]
+                var nd = basis.ao_loc[d + 1] - l0
+                var ncd = nc * nd
+                # G[ij][kl] of the block
+                for i in range(na):
+                    for j in range(nb):
+                        var row = g.unsafe_offset((i * nb + j) * ncd)
+                        var dij = jfac * dmj[unsafe_offset=(i0 + i) * nao + j0 + j]
+                        for k in range(nc):
+                            var dkrow = dmj.unsafe_offset((k0 + k) * nao + l0)
+                            for l in range(nd):
+                                row[unsafe_offset=k * nd + l] = dij * dkrow[unsafe_offset=l]
+                        for s in range(nk):
+                            var dm = dmk.unsafe_offset(s * n2)
+                            var di = dm.unsafe_offset((i0 + i) * nao)
+                            var dj = dm.unsafe_offset((j0 + j) * nao)
+                            for k in range(nc):
+                                var dik = 0.5 * kfac * di[unsafe_offset=k0 + k]
+                                var djk = 0.5 * kfac * dj[unsafe_offset=k0 + k]
+                                var r = row.unsafe_offset(k * nd)
+                                for l in range(nd):
+                                    r[unsafe_offset=l] -= dik * dj[unsafe_offset=l0 + l] + djk * di[unsafe_offset=l0 + l]
+                var nabcd = nab * ncd
+                var wgt = 0.5
+                if a != b:
+                    wgt *= 2.0
+                if c != d:
+                    wgt *= 2.0
+                if sp != spk:
+                    wgt *= 2.0
+                # bra second derivatives: layout [21][ij][kl]
+                if not eri_quartet(tab21, sp, tab, spk, ht, boys, ws):
+                    continue
+                var out = list_ptr(ws.out)
+                for x in range(21):
+                    hb[unsafe_offset=x] = vdot_serial(out.unsafe_offset(x * nabcd), g, nabcd)
+                # ket second derivatives: layout [ij][21][kl]
+                _ = eri_quartet(tab, sp, tab21, spk, ht, boys, ws)
+                vfill(hk, 21, 0.0)
+                for ij in range(nab):
+                    var grow = g.unsafe_offset(ij * ncd)
+                    for x in range(21):
+                        hk[unsafe_offset=x] += vdot_serial(out.unsafe_offset((ij * 21 + x) * ncd), grow, ncd)
+                # first derivatives of both pairs: layout [6][ij][6][kl]
+                if attenuated:
+                    _ = eri_quartet(tab6, sp, tab6w, spk, ht, boys, ws)
+                else:
+                    _ = eri_quartet(tab6, sp, tab6, spk, ht, boys, ws)
+                vfill(hm, 36, 0.0)
+                for x in range(6):
+                    for ij in range(nab):
+                        var grow = g.unsafe_offset(ij * ncd)
+                        var base = out.unsafe_offset(((x * nab + ij) * 6) * ncd)
+                        for y in range(6):
+                            hm[unsafe_offset=x * 6 + y] += vdot_serial(base.unsafe_offset(y * ncd), grow, ncd)
+                var atm_a = basis.atom[a]
+                var atm_b = basis.atom[b]
+                var atm_c = basis.atom[c]
+                var atm_d = basis.atom[d]
+                # aa, ab, bb and cc, cd, dd blocks
+                for side in range(2):
+                    var h = hb if side == 0 else hk
+                    var p = atm_a if side == 0 else atm_c
+                    var r = atm_b if side == 0 else atm_d
+                    for xy in range(9):
+                        blk3[unsafe_offset=xy] = h[unsafe_offset=_sym3(xy)]
+                    _add_block(acc, natm, p, p, blk3, wgt, False)
+                    for xy in range(9):
+                        blk3[unsafe_offset=xy] = h[unsafe_offset=15 + _sym3(xy)]
+                    _add_block(acc, natm, r, r, blk3, wgt, False)
+                    for xy in range(9):
+                        blk3[unsafe_offset=xy] = h[unsafe_offset=6 + xy]
+                    _add_block(acc, natm, p, r, blk3, wgt, False)
+                    _add_block(acc, natm, r, p, blk3, wgt, True)
+                # bra-ket blocks: (a or b) x (c or d)
+                for u in range(2):
+                    var p = atm_a if u == 0 else atm_b
+                    for v in range(2):
+                        var r = atm_c if v == 0 else atm_d
+                        for x in range(3):
+                            for y in range(3):
+                                blk3[unsafe_offset=x * 3 + y] = hm[unsafe_offset=(u * 3 + x) * 6 + v * 3 + y]
+                        _add_block(acc, natm, p, r, blk3, wgt, False)
+                        _add_block(acc, natm, r, p, blk3, wgt, True)
+        _ = ws^
+        _ = gbuf^
+        _ = hbuf^
+
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    for i in range(per):
+        var v = 0.0
+        for w2 in range(nworkers):
+            v += pacc[unsafe_offset=w2 * per + i]
+        hess[unsafe_offset=i] = v
+    _ = accl^
+    _ = cj^
+    _ = ck^
+    _ = counter^
+    _ = tab^
+    _ = tab21^
+    _ = tab6^
+    _ = tab6w^
+    _ = none^
+    _ = q^
+    _ = q21^
+    _ = q6^
     _ = sa^
     _ = sb^
     _ = ht^

@@ -29,7 +29,7 @@ from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
 from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core
-from _mojo.gradients import grad2e_core, grad2c_core, df_grad_rhs, grad_df3c_core, int3c2e_ip1_core, hess_df3c_core
+from _mojo.gradients import grad2e_core, grad2e_pairs_core, hess2e_core, grad2c_core, df_grad_rhs, grad_df3c_core, int3c2e_ip1_core, hess_df3c_core
 from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
 from _mojo.pcm import pcm_ds_core, pcm_pair_core
 from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core, xc_hess_core, xc_h1_core
@@ -72,6 +72,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_int3c2e]("int3c2e", docstring="int3c2e(basis, auxbasis, out, table, omega): (ab|P) as a (naux, npair) array; omega > 0: erf(omega r)/r.")
         m.def_function[py_int2c2e]("int2c2e", docstring="int2c2e(auxbasis, out, table, omega): (P|Q) as a dense (naux, naux) array; omega > 0: erf(omega r)/r.")
         m.def_function[py_int1e_ip]("int1e_ip", docstring="int1e_ip(basis, table, centers, charges, want_st, s_out, t_out, v_out): <nabla i|j>, <nabla i|T|j>, <nabla i|sum q/r|j>.")
+        m.def_function[py_grad2e_pairs]("grad2e_pairs", docstring="grad2e_pairs(basis, table, jl, jr, jc, kl, kr, kc, tol, de, omega): d/dR of sum_p jc_p sum (ij|kl) L_ij R_kl + sum_q kc_q sum (ij|kl) A_jk B_il (natm, 3).")
+        m.def_function[py_hess2e]("hess2e", docstring="hess2e(basis, table, dmj, dmk, jfac, kfac, tol, hess, omega): second derivatives (natm, natm, 3, 3) of the two-electron energy at fixed densities.")
         m.def_function[py_grad2e]("grad2e", docstring="grad2e(basis, table, dmj, dmk, jfac, kfac, tol, de, omega): two-electron energy gradient (natm, 3) (omega > 0: erf(omega r) / r).")
         m.def_function[py_int3c2e_block]("int3c2e_block", docstring="int3c2e_block(basis, auxbasis, table, s0, s1, out): (ab|P) for the auxiliary shells [s0, s1), (np, npair).")
         m.def_function[py_df_grad_rhs]("df_grad_rhs", docstring="df_grad_rhs(basis, auxbasis, table, dm_tril, orbs, blk, rho, q, seq_path, seq_prefix, omega): fit right-hand sides of the DF gradient.")
@@ -540,6 +542,28 @@ def py_jk_ip1(
     jk_ip1_core(
         _basis(basis), _boys(table), Int(py=dms.shape[0]), f64ptr(dms), f64ptr(vj), f64ptr(vk),
         Bool(py=with_j), Bool(py=with_k), Float64(py=tol), Float64(py=omega),
+    )
+    return PythonObject(None)
+
+
+def py_grad2e_pairs(
+    basis: PythonObject, table: PythonObject, jl: PythonObject, jr: PythonObject, jc: PythonObject,
+    kl: PythonObject, kr: PythonObject, kc: PythonObject, tol: PythonObject, de: PythonObject, omega: PythonObject,
+) raises -> PythonObject:
+    grad2e_pairs_core(
+        _basis(basis), _boys(table), Int(py=jc.shape[0]), f64ptr(jl), f64ptr(jr), f64ptr(jc),
+        Int(py=kc.shape[0]), f64ptr(kl), f64ptr(kr), f64ptr(kc), Float64(py=tol), f64ptr(de), Float64(py=omega),
+    )
+    return PythonObject(None)
+
+
+def py_hess2e(
+    basis: PythonObject, table: PythonObject, dmj: PythonObject, dmk: PythonObject, jfac: PythonObject,
+    kfac: PythonObject, tol: PythonObject, hess: PythonObject, omega: PythonObject,
+) raises -> PythonObject:
+    hess2e_core(
+        _basis(basis), _boys(table), f64ptr(dmj), Int(py=dmk.shape[0]), f64ptr(dmk), Float64(py=jfac),
+        Float64(py=kfac), Float64(py=tol), f64ptr(hess), Float64(py=omega),
     )
     return PythonObject(None)
 

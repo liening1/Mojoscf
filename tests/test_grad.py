@@ -70,6 +70,41 @@ def test_long_range_derivative_jk_and_gradient_term(basis):
     assert abs(de.sum(axis=0)).max() < 1e-11
 
 
+def _first_index_terms(mol, x, y, kind):
+    """sum over atoms A of sum_(i on A) sum_j V'[x]_ij y_ij with V' pyscf's derivative J (or K) matrix."""
+    vj, vk = rhf_grad.get_jk(mol, np.array([x]))
+    v = (vj if kind == "j" else vk)[0]
+    out = np.zeros((mol.natm, 3))
+    for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:, 2:]):
+        out[ia] = np.einsum("xij,ij->x", v[:, p0:p1], y[p0:p1])
+    return out
+
+
+def test_pair_gradient_kernel():
+    """d/dR of sum (ij|kl) L_ij R_kl and sum (ij|kl) A_jk B_il from the four first-index contractions."""
+    mol = _mol("def2-svp", atom="C 0 0 0; O 0 0 1.13; H 0.9 0.3 -0.5", spin=1)
+    rng = np.random.default_rng(5)
+    n = mol.nao
+    sym = [m + m.T for m in rng.standard_normal((2, n, n))]
+    a = rng.standard_normal((n, n))
+    anti = a - a.T
+    l, r = sym
+    ref_j = 2 * (_first_index_terms(mol, r, l, "j") + _first_index_terms(mol, l, r, "j"))
+    ref_k = sum(_first_index_terms(mol, x, y, "k") for x, y in ((l, r), (r, l), (r.T, l.T), (l.T, r.T)))
+    ref_m = 4 * _first_index_terms(mol, anti, anti, "k")
+    de = mi.grad2e_pairs(mol, [(0.7, l, r)], [(-0.3, l, r), (0.2, anti, anti)])
+    assert abs(de - (0.7 * ref_j - 0.3 * ref_k + 0.2 * ref_m)).max() < 1e-10
+    assert abs(de.sum(axis=0)).max() < 1e-10
+    # the single-pair case is grad2e
+    dm = scf.RHF(_mol("cc-pvdz")).run().make_rdm1()
+    mol2 = _mol("cc-pvdz")
+    assert abs(mi.grad2e_pairs(mol2, [(0.5, dm, dm)], [(-0.25, dm, dm)]) - mi.grad2e(mol2, dm, dm, 1.0, 0.5)).max() < 1e-12
+    # long-range operator
+    with mol.with_range_coulomb(0.4):
+        ref_lr = sum(_first_index_terms(mol, x, y, "k") for x, y in ((l, r), (r, l), (r.T, l.T), (l.T, r.T)))
+    assert abs(mi.grad2e_pairs(mol, (), [(1.0, l, r)], omega=0.4) - ref_lr).max() < 1e-10
+
+
 def _pyscf_grad2e(mol, dm, unrestricted):
     vj, vk = rhf_grad.get_jk(mol, dm)
     vhf = vj[0] + vj[1] - vk if unrestricted else vj - 0.5 * vk

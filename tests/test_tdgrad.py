@@ -46,25 +46,32 @@ def test_rks_td_gradients_match_pyscf(xc, method, singlet):
     mf.kernel()
     td = _td(mf, method, singlet)
     g = td.Gradients()
-    assert isinstance(g, tdgrad._MojoTDGradMixin)
+    assert isinstance(g, tdgrad._MojoTDGradMixin) and g._direct_2e()
     de = g.kernel(state=2)
     ref = tdrks.Gradients(td).kernel(state=2)
     assert abs(de - ref).max() < 1e-11
+    # the derivative J/K matrices of pyscf's driver (no pair kernel) give the same
+    g = td.Gradients()
+    g._direct_2e = lambda: False
+    assert abs(g.kernel(state=2) - ref).max() < 1e-11
     # the native XC contraction ran
     res = tdgrad.tdrks_xc_kernel(g, mf.xc, np.eye(mol.nao), np.eye(mol.nao), singlet=singlet)
     assert res is not None and res[0].shape == (4, mol.nao, mol.nao)
 
 
-@pytest.mark.parametrize("xc, method", [("b3lyp", "TDDFT"), ("pbe", "TDA")])
+@pytest.mark.parametrize("xc, method", [("b3lyp", "TDDFT"), ("pbe", "TDA"), ("wb97x", "TDA")])
 def test_uks_td_gradients_match_pyscf(xc, method):
     mol = gto.M(atom=WATER, basis="def2-svp", charge=1, spin=1, verbose=0)
     mf = mojoscf.dft.accelerate(dft.UKS(mol, xc=xc))
     mf.conv_tol = 1e-11
     mf.kernel()
     td = _td(mf, method)
-    de = td.Gradients().kernel(state=2)
+    g = td.Gradients()
+    assert g._direct_2e()
+    de = g.kernel(state=2)
     ref = tduks.Gradients(td).kernel(state=2)
     assert abs(de - ref).max() < 1e-11
+    assert abs(g.kernel(state=2, atmlst=[0, 2]) - ref[[0, 2]]).max() < 1e-11
 
 
 def test_tdhf_gradients_match_pyscf():
@@ -77,8 +84,22 @@ def test_tdhf_gradients_match_pyscf():
     td.conv_tol = 1e-10
     td.kernel()
     g = td.Gradients()
-    assert isinstance(g, tdgrad._MojoTDGradMixin)
+    assert isinstance(g, tdgrad._MojoTDGradMixin) and g._direct_2e()
     assert abs(g.kernel(state=1) - tdrhf.Gradients(td).kernel(state=1)).max() < 1e-11
+    # UHF (TDHF of a doublet)
+    from pyscf.grad import tduhf
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=1, spin=1, verbose=0)
+    mf = mojoscf.UHF(mol)
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    td = mojoscf.tdscf.TDDFT(mf)
+    td.nstates = 3
+    td.conv_tol = 1e-10
+    td.kernel()
+    g = td.Gradients()
+    assert g._direct_2e()
+    assert abs(g.kernel(state=1) - tduhf.Gradients(td).kernel(state=1)).max() < 1e-11
 
 
 def test_meta_gga_keeps_pyscf_xc_contraction():

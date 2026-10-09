@@ -584,6 +584,52 @@ def grad2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14, omega=0.0):
     return de
 
 
+def hess2e(mol, dm_j, dm_k, j_factor=1.0, k_factor=1.0, tol=1e-14, omega=0.0):
+    """Second derivatives (natm, natm, 3, 3) of the two-electron energy of :func:`grad2e` at fixed densities.
+
+    ``E2 = 1/2 sum_ijkl (ij|kl) G_ijkl`` with G as in :func:`grad2e` (RHF:
+    ``hess2e(mol, D, D, 1, 0.5)``; UHF: ``hess2e(mol, Da + Db, (Da, Db))``):
+    the two-electron part of pyscf's partial Hessian (``ej - ek`` of
+    ``hessian.rhf._partial_hess_ejk``), from the second-derivative integrals
+    contracted as they are produced.  ``omega`` > 0: erf(omega r12) / r12.
+    """
+    nao = mol.nao_nr()
+    dmj = np.ascontiguousarray(dm_j, dtype=np.float64).reshape(nao, nao)
+    dmk = np.ascontiguousarray(dm_k, dtype=np.float64).reshape(-1, nao, nao)
+    hess = np.zeros((mol.natm, mol.natm, 3, 3))
+    get_extension().hess2e(basis_tables(mol), _boys_table(), dmj, dmk, float(j_factor), float(k_factor), float(tol),
+                           hess, _omega4c(omega))
+    return hess
+
+
+def grad2e_pairs(mol, j_pairs=(), k_pairs=(), tol=1e-14, omega=0.0):
+    """Nuclear gradient (natm, 3) of ``E = sum_p c_p sum (ij|kl) L_ij R_kl + sum_q c_q sum (ij|kl) A_jk B_il``.
+
+    ``j_pairs``: ``(c, L, R)`` with symmetric L, R (Coulomb-type products);
+    ``k_pairs``: ``(c, A, B)`` with A, B both symmetric or both antisymmetric
+    (exchange-type products).  The derivative integrals are contracted as they
+    are produced, with the eight-fold permutational symmetry (``grad2e``
+    generalised to several density pairs: the two-electron term of
+    excited-state gradients).  ``omega`` > 0: erf(omega r12) / r12.
+    """
+    nao = mol.nao_nr()
+
+    def stack(pairs, k):
+        if not pairs:
+            return np.zeros((0, nao, nao))
+        return np.ascontiguousarray([np.asarray(p[k], dtype=np.float64).reshape(nao, nao) for p in pairs])
+
+    jl, jr, kl, kr = stack(j_pairs, 1), stack(j_pairs, 2), stack(k_pairs, 1), stack(k_pairs, 2)
+    jc = np.array([float(p[0]) for p in j_pairs], dtype=np.float64)
+    kc = np.array([float(p[0]) for p in k_pairs], dtype=np.float64)
+    de = np.zeros((mol.natm, 3))
+    if not len(jc) and not len(kc):
+        return de
+    get_extension().grad2e_pairs(basis_tables(mol), _boys_table(), jl, jr, jc, kl, kr, kc, float(tol), de,
+                                 _omega4c(omega))
+    return de
+
+
 def _syrk_full(a_t):
     """``A^T A`` for the (k, n) array ``a_t``, Fortran-ordered to avoid a copy (BLAS ``dsyrk``, both triangles returned)."""
     from scipy.linalg import blas as sblas

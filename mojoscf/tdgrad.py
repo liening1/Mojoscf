@@ -11,9 +11,17 @@ equations.  This module keeps pyscf's driver (``grad_elec``) and replaces:
   response densities from one Mojo pass, libxc for vxc/fxc/kxc, and the
   potential and gradient matrices of the four weight sets from one pass each
   (LDA and GGA; meta-GGA keeps pyscf's code);
-* ``get_jk``/``get_j``/``get_k`` by the Mojo derivative J/K matrices
-  (exact integrals; :func:`mojoscf.grad._jk_ip1`, non-symmetric densities
-  included);
+* the two-electron term: pyscf contracts the derivative J/K matrices of its
+  four densities per spin (``td_grad.get_jk``; one of them antisymmetric)
+  with the same densities.  That term is the nuclear derivative of
+  E = 1/4 sum_t [c_J sum (ij|kl) D_t,ij B_t,kl - c_K sum (ij|kl) D_t,jk B_t,il],
+  B_t the matrix pyscf contracts with the derivative matrices of D_t, so
+  here the derivative matrices are not formed: the requests made inside
+  ``grad_elec`` are recorded (zeros returned) and the term is added from one
+  eight-fold-symmetric pass over the derivative integrals
+  (:func:`mojoscf.integrals.grad2e_pairs`, long-range exchange included).
+  Other ``get_jk``/``get_j``/``get_k`` calls get the Mojo derivative J/K
+  matrices (:func:`mojoscf.grad._jk_ip1`, non-symmetric densities included);
 * the Z-vector response runs through the accelerated SCF object's
   ``gen_response`` (Mojo J/K and XC kernels) as before.
 """
@@ -195,10 +203,106 @@ class _XCKernel:
         return False
 
 
+class _Recorder:
+    """The derivative J/K requests of pyscf's TD gradient driver, recorded instead of computed.
+
+    ``calls`` holds ``(densities, with_j, with_k, omega)``; the requests return
+    zeros, so pyscf's two-electron contraction contributes nothing and
+    :func:`_two_electron_term` adds it.
+    """
+
+    def __init__(self, unrestricted):
+        self.unrestricted = unrestricted
+        self.calls = []
+
+    def take(self, mol, dm, with_j, with_k, omega):
+        """Record a request with the four densities per spin of the driver (three without exchange); False
+        for any other request."""
+        dm = np.asarray(dm)
+        nao = mol.nao_nr()
+        n = (4 if with_k else 3) * (2 if self.unrestricted else 1)
+        if dm.shape != (n, nao, nao) or not np.isrealobj(dm) or (omega or 0) < 0:
+            return False
+        if omega and (not with_k or with_j or not self.calls):
+            return False
+        if not omega and self.calls:
+            return False
+        self.calls.append((np.array(dm), with_j, with_k, float(omega or 0.0)))
+        return True
+
+
+def _contractions(dms, unrestricted):
+    """The matrices B_t pyscf's ``grad_elec`` contracts with the derivative J/K matrices of its densities
+    D_t = (oo0, Z + Z^T, X+Y + (X+Y)^T, X-Y - (X-Y)^T) (per spin for UHF/UKS; the last one absent without
+    exchange)."""
+    n = 4 if len(dms) in (4, 8) else 3
+    out = []
+    for s in range(2 if unrestricted else 1):
+        d = dms[s * n:(s + 1) * n]
+        if unrestricted:
+            b = [2.0 * d[0] + 0.5 * d[1], 0.5 * d[0], d[2]]
+        else:
+            b = [4.0 * d[0] + d[1], d[0], 2.0 * d[2]]
+        if n == 4:
+            b.append(d[3] if unrestricted else 2.0 * d[3])
+        out.append((d, b))
+    return out
+
+
+def _two_electron_term(td_grad, rec):
+    """The two-electron term of pyscf's TD gradient for the recorded requests (natm, 3).
+
+    pyscf adds sum_(i on A) sum_j V_t,ij B_t,ij with V_t = c_J J'[D_t] - c_K K'[D_t]
+    (UHF/UKS: J' of the spin-summed densities, K' per spin), J', K' the
+    derivative matrices with respect to the first index.  Summed over t this
+    is the nuclear derivative of E = 1/4 sum_t (c_J E_J[D_t, B_t] - c_K
+    E_K[D_t, B_t]) with E_J[R, S] = sum (ij|kl) R_ij S_kl and E_K[R, S] =
+    sum (ij|kl) R_jk S_il: the derivative matrices with respect to the other
+    indices give the same contractions with the roles exchanged, which the
+    driver's expression contains, as it is the derivative of a Lagrangian.
+    """
+    from pyscf.scf import hf
+
+    mf = td_grad.base._scf
+    mol = td_grad.mol
+    unrestricted = rec.unrestricted
+    singlet = True if unrestricted else td_grad.base.singlet
+    first = rec.calls[0]
+    blocks = _contractions(first[0], unrestricted)
+    kfac = 1.0
+    if isinstance(mf, hf.KohnShamDFT):
+        omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, mol.spin)
+        kfac = hyb
+    jpairs = []
+    nt = len(blocks[0][0])
+    for t in range(min(nt, 3)):
+        if not singlet and t == 2:
+            continue
+        if unrestricted:
+            d = sum(blk[0][t] for blk in blocks)
+            b = sum(blk[1][t] for blk in blocks)
+            jpairs.append((0.25, d, b))
+        else:
+            jpairs.append((0.5, blocks[0][0][t], blocks[0][1][t]))
+    de = np.zeros((mol.natm, 3))
+    for dms, with_j, with_k, omega in rec.calls:
+        coef = kfac
+        if omega:
+            coef = alpha - hyb
+        kpairs = []
+        if with_k and coef != 0:
+            for d, b in _contractions(dms, unrestricted):
+                kpairs += [(-0.25 * coef, d[t], b[t]) for t in range(len(d))]
+        de += integrals.grad2e_pairs(mol, jpairs if (with_j and not omega) else (), kpairs, omega=omega)
+    return de
+
+
 class _MojoTDGradMixin:
-    """In front of pyscf's TDHF/TDDFT gradient classes: Mojo derivative J/K and XC kernel contractions."""
+    """In front of pyscf's TDHF/TDDFT gradient classes: Mojo derivative integrals and XC kernel contractions."""
 
     __name_mixin__ = "Mojo"
+
+    _record_2e = None
 
     def _mojo_jk_ok(self, mol, dm, omega):
         if (omega or 0) < 0 or integrals.engine() != "mojo" or integrals.unsupported_reason(mol, two_electron=True):
@@ -208,10 +312,23 @@ class _MojoTDGradMixin:
         dm = np.asarray(dm)
         return dm.ndim >= 2 and np.isrealobj(dm)
 
+    def _recorded(self, mol, dm, with_j, with_k, omega):
+        """Zeros for a derivative J/K request of the driver that :func:`_two_electron_term` takes over."""
+        rec = self._record_2e
+        if rec is None or dm is None or not self._mojo_jk_ok(mol, dm, omega):
+            return None
+        if not rec.take(mol, dm, with_j, with_k, omega):
+            return None
+        shape = np.asarray(dm).shape[:-2] + (3,) + np.asarray(dm).shape[-2:]
+        return (np.zeros(shape) if with_j else None), (np.zeros(shape) if with_k else None)
+
     def get_jk(self, mol=None, dm=None, hermi=0, omega=None):
         from .grad import _jk_ip1
 
         mol = self.mol if mol is None else mol
+        rec = self._recorded(mol, dm, True, True, omega)
+        if rec is not None:
+            return rec
         if dm is None or not self._mojo_jk_ok(mol, dm, omega):
             return super().get_jk(mol, dm, hermi, omega)
         return _jk_ip1(mol, np.asarray(dm), omega=omega)
@@ -220,6 +337,9 @@ class _MojoTDGradMixin:
         from .grad import _jk_ip1
 
         mol = self.mol if mol is None else mol
+        rec = self._recorded(mol, dm, True, False, omega)
+        if rec is not None:
+            return rec[0]
         if dm is None or not self._mojo_jk_ok(mol, dm, omega):
             return super().get_j(mol, dm, hermi, omega)
         return _jk_ip1(mol, np.asarray(dm), with_k=False, omega=omega)[0]
@@ -228,13 +348,53 @@ class _MojoTDGradMixin:
         from .grad import _jk_ip1
 
         mol = self.mol if mol is None else mol
+        rec = self._recorded(mol, dm, False, True, omega)
+        if rec is not None:
+            return rec[1]
         if dm is None or not self._mojo_jk_ok(mol, dm, omega):
             return super().get_k(mol, dm, hermi, omega)
         return _jk_ip1(mol, np.asarray(dm), with_j=False, omega=omega)[1]
 
+    def _direct_2e(self):
+        """Whether the two-electron term can come from :func:`_two_electron_term`: pyscf's TDHF/TDDFT
+        gradient driver of an RHF/UHF/RKS/UKS reference, with this class's derivative J/K."""
+        from pyscf.grad import tdrhf, tdrks, tduhf, tduks
+        from pyscf.scf import hf
+
+        cls = type(self)
+        if {"get_jk", "get_j", "get_k", "grad_elec"} & self.__dict__.keys():
+            return False
+        if cls.get_jk is not _MojoTDGradMixin.get_jk or cls.get_k is not _MojoTDGradMixin.get_k:
+            return False
+        mro = cls.__mro__
+        nxt = next((c for c in mro[mro.index(_MojoTDGradMixin) + 1:] if "grad_elec" in c.__dict__), None)
+        if nxt not in (tdrhf.Gradients, tdrks.Gradients, tduhf.Gradients, tduks.Gradients):
+            return False
+        mf = self.base._scf
+        if isinstance(mf, hf.KohnShamDFT):
+            omega = mf._numint.rsh_and_hybrid_coeff(mf.xc, self.mol.spin)[0]
+            if omega < 0:
+                return False
+        return True
+
     def grad_elec(self, *args, **kwargs):
+        from pyscf.scf import uhf
+
+        rec = None
+        if self._direct_2e():
+            rec = _Recorder(isinstance(self.base._scf, uhf.UHF))
         with _XCKernel():
-            return super().grad_elec(*args, **kwargs)
+            self._record_2e = rec
+            try:
+                de = super().grad_elec(*args, **kwargs)
+            finally:
+                self._record_2e = None
+        if rec is not None and rec.calls:
+            # pyscf's signature: grad_elec(xy, singlet, atmlst=None)
+            atmlst = kwargs.get("atmlst", args[2] if len(args) > 2 else None)
+            de2 = _two_electron_term(self, rec)
+            de = de + (de2 if atmlst is None else de2[list(atmlst)])
+        return de
 
 
 def accelerate(g):

@@ -378,6 +378,69 @@ def _df_jk_reason(hessobj, mo_coeff, mo_occ):
     return None
 
 
+def _exact_jk_reason(hessobj, mo_coeff, mo_occ):
+    """Why :func:`exact_jk_partial` cannot handle ``hessobj`` (None if it can): exact integrals with pyscf's
+    ``get_jk``, closed or high-spin open shells, no solvent model or NLC."""
+    from pyscf.scf import hf, rohf, uhf
+
+    from . import dft
+
+    mf = hessobj.base
+    if integrals.engine() != "mojo":
+        return "the Mojo integral engine is not selected"
+    if not dft.exact_jk_applies(mf):
+        return "not exact integrals with pyscf's get_jk"
+    if isinstance(mf, rohf.ROHF) or not isinstance(mf, (hf.RHF, uhf.UHF)):
+        return "only RHF/RKS and UHF/UKS references"
+    try:
+        from pyscf.solvent._attach_solvent import _Solvation
+
+        if isinstance(mf, _Solvation):
+            return "solvent models"
+    except ImportError:  # pragma: no cover
+        pass
+    if isinstance(mf, hf.KohnShamDFT) and mf.do_nlc():
+        return "NLC functionals"
+    if _hess_exchange_terms(mf) is None:
+        return "short-range operator (omega < 0)"
+    if not np.isrealobj(mo_coeff):
+        return "complex orbitals"
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    full = 1.0 if unrestricted else 2.0
+    occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
+    if any(not np.all((o == 0) | (o == full)) for o in occs):
+        return "fractional occupations"
+    return None
+
+
+def exact_jk_partial(hessobj, mo_coeff, mo_occ, tol=1e-14):
+    """Coulomb/exchange part of the partial Hessian with exact integrals (natm, natm, 3, 3), or None.
+
+    The second derivatives of E_J - sum_t c_t E_K(omega_t) at fixed density
+    (pyscf's ``ej - hyb ek - (alpha - hyb) ek_lr`` of ``_partial_hess_ejk``)
+    from :func:`mojoscf.integrals.hess2e`: one pass over the unique shell
+    quartets per exchange operator, the second-derivative integrals contracted
+    with the density products as they are produced.
+    """
+    if _exact_jk_reason(hessobj, mo_coeff, mo_occ) is not None:
+        return None
+    mf = hessobj.base
+    mol = hessobj.mol
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    cs = [np.asarray(c) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff)]
+    occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
+    dms = [(c[:, o > 0] * o[o > 0]) @ c[:, o > 0].T for c, o in zip(cs, occs)]
+    dmj = dms[0] + dms[1] if unrestricted else dms[0]
+    kscale = 1.0 if unrestricted else 0.5
+    terms = _hess_exchange_terms(mf)
+    kfull = sum(c for c, omega in terms if omega == 0)
+    de2 = integrals.hess2e(mol, dmj, np.array(dms), 1.0, kscale * kfull, tol=tol)
+    for c, omega in terms:
+        if omega:
+            de2 += integrals.hess2e(mol, dmj, np.array(dms), 0.0, kscale * c, tol=tol, omega=omega)
+    return de2
+
+
 class _KChannel:
     """Occupied orbitals of one spin and their exchange intermediates for :func:`df_jk_terms`."""
 
@@ -952,6 +1015,9 @@ class _MojoHessMixin:
         if getattr(self, "grid_response", False):
             return super().partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, verbose)
         jk = df_jk_terms(self, mo_coeff, mo_occ, with_h1=False)
+        if jk is None:
+            jk = exact_jk_partial(self, mo_coeff, mo_occ)
+            jk = None if jk is None else (jk,)
         if jk is not None:
             de2 = _hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
             return de2[np.ix_(atm, atm)]
