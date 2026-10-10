@@ -10,6 +10,10 @@ terms in the effective potential and the nuclear gradient.
                     sum_vxy L_uvxy psi_v psi_x psi_y, per atom
     ontop_paaa_core the AO-active-active-active block of the on-top
                     potential, sum_p phi_mu v_Pi psi_u psi_v psi_w
+    ontop_density_core
+                    the spin densities of a CASSCF-like state, core part
+                    from the core density and active part from the active
+                    orbitals, with the on-top pair density, in one pass
 
 The blocks, the shell selection and the AO values are those of
 ``numint.mojo``.  Per block the active orbitals are one GEMM, psi = C_sub^T
@@ -31,6 +35,7 @@ from _mojo.numint import (
     eval_block,
     prune_rows,
     gather_rows,
+    gather_block,
     _rcuts,
     _ncomp,
     _store_pts,
@@ -328,5 +333,150 @@ def ontop_paaa_core(
             v += pacc[unsafe_offset=w2 * total + i]
         paaa_out[unsafe_offset=i] = v
     _ = accl^
+    _ = grid^
+    _ = rcut^
+
+
+def ontop_density_core(
+    blas: Blas, basis: Basis, ngrid: Int, coords: F64Ptr, nderiv: Int, has_core: Int, dmc: F64Ptr, ncas: Int,
+    mo: F64Ptr, dma: F64Ptr, lt: F64Ptr, pi_deriv: Int, rho_out: F64Ptr, pi_out: F64Ptr, rhoc_out: F64Ptr,
+) raises:
+    """In one pass over the grid: rho_out[s][c][p] (s = alpha, beta; c = 0 the density and, for ``nderiv`` 1,
+    c = 1..3 its gradient) of D_s = Dc / 2 + C dma[s] C^T (``dmc`` the core density 2 C_core C_core^T,
+    nao x nao, when ``has_core``; C = ``mo``, nao x ncas; ``dma`` (2, ncas, ncas) the active spin 1-RDMs),
+    pi_out[c][p] the on-top pair density rho_a rho_b + 1/2 sum_uvxy psi_u psi_v psi_x psi_y L_uvxy and,
+    for ``pi_deriv`` 1, its gradient (``lt`` the transposed cumulant, as in ``ontop_pi_core``), and
+    rhoc_out[p] the core density.
+
+    Per block one GEMM for the core density, Y = Dc_sub phi (rho_c = phi . Y, grad rho_c = 2 d_c phi . Y),
+    and one per component for the active orbitals, psi_c = C_sub^T d_c phi; the active spin densities are
+    psi . (dma[s] psi) and their gradients 2 d_c psi . (dma[s] psi).  Against separate passes for the
+    densities and Pi the AO values are evaluated once and the second nrow x nrow GEMM is replaced by
+    ncas-sized products.
+    """
+    var grid = Grid(ngrid, coords)
+    var rcut = _rcuts(basis, nderiv)
+    var nao = basis.nao
+    var ncomp = _ncomp(nderiv)
+    var nr = 1 if nderiv == 0 else 4
+    var npi = 1 if pi_deriv == 0 else 4
+    var n2 = ncas * ncas
+    var nblk = grid.nblk
+    var nworkers = max(1, min(parallelism_level(), nblk))
+
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm nblk, imm nao, imm ncomp, imm nderiv, imm nr, imm npi, imm has_core, imm dmc, imm ncas, imm n2, imm mo, imm dma, imm lt, imm pi_deriv, imm rho_out, imm pi_out, imm rhoc_out, imm ngrid, imm nworkers}:
+        var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
+        var bl = List[Float64](length=(ncomp * ncas + 2 * n2 + ncas + 4 + 8) * BLK + W, fill=0.0)
+        var psi = F64Ptr(unsafe_from_address=aligned_addr(bl))      # [comp][k][BLK]
+        var q = psi.unsafe_offset(ncomp * ncas * BLK)                 # [kl][BLK], then s[k][BLK]
+        var t = q.unsafe_offset(n2 * BLK)                             # [kl][BLK]
+        var z = t.unsafe_offset(n2 * BLK)                             # [k][BLK]: dma[s] psi
+        var rc = z.unsafe_offset(ncas * BLK)                          # [c][BLK]: core density and gradient
+        var rs = rc.unsafe_offset(4 * BLK)                            # [s][c][BLK]: spin densities
+        var it = 0
+        while True:
+            var blk = w + it * nworkers
+            it += 1
+            if blk >= nblk:
+                break
+            var sel = select_shells(basis, grid, blk, rcut, ws)
+            var nrow = sel[1]
+            var p0 = blk * BLK
+            var npt = min(BLK, ngrid - p0)
+            if nrow > 0:
+                eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
+                nrow = prune_rows(nrow, ncomp, ws)
+            if nrow == 0:
+                for sp in range(2):
+                    for c in range(nr):
+                        vfill(rho_out.unsafe_offset((sp * nr + c) * ngrid + p0), npt, 0.0)
+                for c in range(npi):
+                    vfill(pi_out.unsafe_offset(c * ngrid + p0), npt, 0.0)
+                vfill(rhoc_out.unsafe_offset(p0), npt, 0.0)
+                continue
+            var cs = nrow * BLK
+            var ao = ws.ao()
+            vfill(rc, 4 * BLK, 0.0)
+            if has_core == 1:
+                gather_block(dmc, nao, nrow, ws)
+                try:
+                    blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao, 0.0, ws.y())
+                except:
+                    pass
+                var yb = ws.y()
+                for c in range(nr):
+                    var ac = ao.unsafe_offset(c * cs)
+                    var fac = 1.0 if c == 0 else 2.0
+                    for v in range(NV):
+                        var acc = F64V(0.0)
+                        for i in range(nrow):
+                            acc += ac.unsafe_load[width=W](i * BLK + v * W) * yb.unsafe_load[width=W](i * BLK + v * W)
+                        rc.unsafe_store(c * BLK + v * W, acc * fac)
+            gather_rows(mo, ncas, ws)
+            for c in range(ncomp):
+                try:
+                    blas.gemm(True, False, ncas, BLK, nrow, 1.0, ws.dsub(), ao.unsafe_offset(c * cs), 0.0,
+                              psi.unsafe_offset(c * ncas * BLK))
+                except:
+                    pass
+            for sp in range(2):
+                var dm = dma.unsafe_offset(sp * n2)
+                for u in range(ncas):
+                    for v in range(NV):
+                        var acc = F64V(0.0)
+                        for x in range(ncas):
+                            acc += psi.unsafe_load[width=W](x * BLK + v * W) * dm[unsafe_offset=u * ncas + x]
+                        z.unsafe_store(u * BLK + v * W, acc)
+                for c in range(nr):
+                    var pc = psi.unsafe_offset(c * ncas * BLK)
+                    var fac = 1.0 if c == 0 else 2.0
+                    for v in range(NV):
+                        var acc = F64V(0.0)
+                        for u in range(ncas):
+                            acc += pc.unsafe_load[width=W](u * BLK + v * W) * z.unsafe_load[width=W](u * BLK + v * W)
+                        var r = rc.unsafe_load[width=W](c * BLK + v * W) * 0.5 + acc * fac
+                        rs.unsafe_store((sp * 4 + c) * BLK + v * W, r)
+                        _store_pts(rho_out.unsafe_offset((sp * nr + c) * ngrid + p0), v, npt, r)
+            for v in range(NV):
+                _store_pts(rhoc_out.unsafe_offset(p0), v, npt, rc.unsafe_load[width=W](v * W))
+            # the cumulant part of Pi, as ontop_pi_core
+            for k in range(ncas):
+                for l in range(ncas):
+                    var dst = q.unsafe_offset((k * ncas + l) * BLK)
+                    for v in range(NV):
+                        dst.unsafe_store(v * W, psi.unsafe_load[width=W](k * BLK + v * W)
+                                         * psi.unsafe_load[width=W](l * BLK + v * W))
+            try:
+                blas.gemm(False, False, n2, BLK, n2, 1.0, lt, q, 0.0, t)
+            except:
+                pass
+            for k in range(ncas):
+                for v in range(NV):
+                    var acc = F64V(0.0)
+                    for l in range(ncas):
+                        acc += psi.unsafe_load[width=W](l * BLK + v * W) * t.unsafe_load[width=W]((k * ncas + l) * BLK + v * W)
+                    q.unsafe_store(k * BLK + v * W, acc)
+            for c in range(npi):
+                var pc = psi.unsafe_offset(c * ncas * BLK)
+                var fac = 0.5 if c == 0 else 2.0
+                for v in range(NV):
+                    var acc = F64V(0.0)
+                    for k in range(ncas):
+                        acc += pc.unsafe_load[width=W](k * BLK + v * W) * q.unsafe_load[width=W](k * BLK + v * W)
+                    var ra0 = rs.unsafe_load[width=W](v * W)
+                    var rb0 = rs.unsafe_load[width=W](4 * BLK + v * W)
+                    var first = ra0 * rb0
+                    if c > 0:
+                        first = rs.unsafe_load[width=W](c * BLK + v * W) * rb0 + ra0 * rs.unsafe_load[width=W]((4 + c) * BLK + v * W)
+                    _store_pts(pi_out.unsafe_offset(c * ngrid + p0), v, npt, acc * fac + first)
+        _ = ws^
+        _ = bl^
+
+    var nthr = blas.serial_begin()
+    if nworkers == 1:
+        work(0)
+    else:
+        parallelize(work, nworkers)
+    blas.serial_end(nthr)
     _ = grid^
     _ = rcut^

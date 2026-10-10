@@ -64,6 +64,36 @@ def test_ontop_pair_density_matches_pyscf(o2, deriv):
     assert abs(pi - ref).max() < 1e-11 * max(1.0, abs(ref).max())
 
 
+@pytest.mark.parametrize("kind", [0, 1])
+def test_ontop_densities_match_separate_passes(o2, kind):
+    """The one-pass spin densities, core density and on-top pair density (with its gradient for GGA)
+    equal the density pass of mojoscf.dft plus pyscf's on-top pair density."""
+    from mojoscf import dft as mdft
+
+    mf, mc = o2
+    mol = mf.mol
+    ncore, ncas = mc.ncore, mc.ncas
+    casdm1s = np.asarray(direct_spin1.make_rdm1s(mc.ci[2], ncas, mc.nelecas))
+    casdm2 = direct_spin1.make_rdm12(mc.ci[2], ncas, mc.nelecas)[1]
+    cascm2 = _dms.dm2_cumulant(casdm2, casdm1s)
+    mo_core, mo_cas = mc.mo_coeff[:, :ncore], mc.mo_coeff[:, ncore:ncore + ncas]
+    coords = dft.gen_grid.Grids(mol).build().coords[::5]
+    rho, pi, rhoc = mpdft.ontop_densities(mol, coords, kind, mo_core, mo_cas, casdm1s, cascm2, kind)
+    dm1s = _dms.casdm1s_to_dm1s(mc, casdm1s)
+    ref = mdft._rho(mol, np.ascontiguousarray(coords), kind, np.ascontiguousarray(dm1s))
+    def close(a, b):
+        return abs(a - b).max() < 1e-13 * max(1.0, abs(b).max())
+
+    assert close(rho, ref)
+    refc = mdft._rho(mol, np.ascontiguousarray(coords), 0, np.ascontiguousarray((mo_core @ mo_core.T * 2)[None]))
+    assert close(rhoc, refc[0, 0])
+    refpi = mpdft.ontop_pair_density(mol, coords, mo_cas, cascm2, kind)
+    refpi[0] += ref[0, 0] * ref[1, 0]
+    if kind:
+        refpi[1:4] += ref[0, 1:4] * ref[1, 0] + ref[0, 0] * ref[1, 1:4]
+    assert close(pi, refpi)
+
+
 @pytest.mark.parametrize("otxc", ["tPBE", "ftPBE", "tBLYP", "tPBE0", "tM06L"])
 def test_energy_ot_matches_pyscf(o2, otxc):
     """The on-top energy of each state equals pyscf's, translated and fully translated GGAs, a

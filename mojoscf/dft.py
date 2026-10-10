@@ -581,6 +581,95 @@ def _install_grad_vxc():
 _install_grad_vxc()
 
 
+def group_grids(mol, coords, box_size=None):
+    """pyscf's ``gen_grid.arg_group_grids``: the order that groups the grid points ``coords`` by boxes of
+    about ``box_size`` bohr (spatially compact blocks for screening), the same permutation.
+
+    pyscf ranks the boxes with ``numpy.unique(axis=0)`` on the (n, 3) box
+    indices, a sort of structured rows that took 0.2 s for the 270,000
+    points of [Fe(H2O)6]2+ (pyscf rebuilds the grid of MC-PDFT for every
+    state).  The lexicographic order of the rows is that of one integer key,
+    so a stable argsort of the key gives the same order.
+    """
+    from pyscf.dft import gen_grid
+
+    if box_size is None:
+        box_size = gen_grid.GROUP_BOX_SIZE
+    atom_coords = mol.atom_coords()
+    boundary = [atom_coords.min(axis=0) - gen_grid.GROUP_BOUNDARY_PENALTY,
+                atom_coords.max(axis=0) + gen_grid.GROUP_BOUNDARY_PENALTY]
+    boxes = ((boundary[1] - boundary[0]) * (1.0 / box_size)).round().astype(int)
+    box_size = (boundary[1] - boundary[0]) / boxes
+    box_ids = np.floor((coords - boundary[0]) * (1.0 / box_size)).astype(np.int64)
+    np.maximum(box_ids, -1, out=box_ids)
+    np.minimum(box_ids, boxes, out=box_ids)
+    n1, n2 = int(boxes[1]) + 2, int(boxes[2]) + 2
+    key = ((box_ids[:, 0] + 1) * n1 + (box_ids[:, 1] + 1)) * n2 + (box_ids[:, 2] + 1)
+    return key.argsort(kind="stable")
+
+
+def _install_group_grids():
+    """``gen_grid.arg_group_grids`` (used by ``Grids.build``) as :func:`group_grids`."""
+    from pyscf.dft import gen_grid
+
+    orig = gen_grid.arg_group_grids
+    if getattr(orig, "_mojoscf_orig", None) is not None:
+        return
+
+    def arg_group_grids(mol, coords, box_size=gen_grid.GROUP_BOX_SIZE):
+        return group_grids(mol, coords, box_size)
+
+    arg_group_grids.__doc__ = orig.__doc__
+    arg_group_grids._mojoscf_orig = orig
+    gen_grid.arg_group_grids = arg_group_grids
+
+
+_install_group_grids()
+
+
+def becke_setup(grids):
+    """``(adj, use_adj, scheme)``: the radii adjustment a_AB (natm, natm) and the smoothing scheme
+    (0 original Becke, 1 Stratmann) of pyscf's ``grad.rks.grids_response_becke`` for ``grids``, or None
+    for partitions the Mojo kernel does not cover (LKO, custom schemes)."""
+    from pyscf.dft import gen_grid, radi
+
+    if grids.becke_scheme == gen_grid.original_becke:
+        scheme = 0
+    elif grids.becke_scheme == gen_grid.stratmann:
+        scheme = 1
+    else:
+        return None
+    mol = grids.mol
+    natm = mol.natm
+    if grids.radii_adjust == radi.treutler_atomic_radii_adjust:
+        rad = np.sqrt(grids.atomic_radii[mol.atom_charges()]) + 1e-200
+    elif grids.radii_adjust == radi.becke_atomic_radii_adjust:
+        rad = grids.atomic_radii[mol.atom_charges()] + 1e-200
+    else:
+        return np.zeros((natm, natm)), 0, scheme
+    rr = rad.reshape(-1, 1) * (1.0 / rad)
+    a = 0.25 * (rr.T - rr)
+    a[a < -0.5] = -0.5
+    a[a > 0.5] = 0.5
+    return np.ascontiguousarray(a), 1, scheme
+
+
+def becke_response(mol, setup, coords, vol, owner, eot=None):
+    """Becke weights ``w0`` of the points ``coords`` (quadrature weights ``vol``) of the grid of atom
+    ``owner`` and, with the energy density ``eot``, ``de`` (natm, 3) = sum_r eot(r) dw(r)/dR: pyscf's
+    ``grids_response_becke`` (``w0``, and its ``w1`` contracted with ``eot``) from the Mojo kernel
+    (``setup`` from :func:`becke_setup`)."""
+    adj, use_adj, scheme = setup
+    coords = np.ascontiguousarray(coords, dtype=np.float64)
+    vol = np.ascontiguousarray(vol, dtype=np.float64)
+    w0 = np.empty(vol.size)
+    de = np.zeros((mol.natm, 3))
+    e = np.zeros(1) if eot is None else np.ascontiguousarray(eot, dtype=np.float64)
+    get_extension().becke_response(np.ascontiguousarray(mol.atom_coords(), dtype=np.float64), adj, int(use_adj),
+                                   int(scheme), coords, vol, int(owner), e, 0 if eot is None else 1, w0, de)
+    return w0, de
+
+
 class _MojoDFObject:
     """In front of pyscf's ``df.DF`` (:data:`MojoDF`, the ``with_df`` of the objects mojoscf accelerates):
     ``get_jk`` from the Mojo DF kernel for real symmetric densities, the tensor in memory or on disk

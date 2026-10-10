@@ -33,7 +33,8 @@ from _mojo.gradients import grad2e_core, grad2e_pairs_core, hess2e_core, grad2c_
 from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
 from _mojo.pcm import pcm_ds_core, pcm_pair_core
 from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core, xc_hess_core, xc_h1_core
-from _mojo.pdft import ontop_pi_core, ontop_grad_core, ontop_paaa_core
+from _mojo.pdft import ontop_pi_core, ontop_grad_core, ontop_paaa_core, ontop_density_core
+from _mojo.grids import becke_response_core
 
 comptime VERSION = "0.12.0"
 
@@ -94,6 +95,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_ontop_pi]("ontop_pi", docstring="ontop_pi(basis, coords, deriv, mo_cas, lt, pi, seq_path, seq_prefix): cumulant part of the MC-PDFT on-top pair density (deriv 0) and its gradient (deriv 1) into pi (1 or 4, ngrid), active orbitals mo_cas (nao, ncas), lt (ncas^2, ncas^2) the transposed 2-RDM cumulant.")
         m.def_function[py_ontop_grad]("ontop_grad", docstring="ontop_grad(basis, coords, wpi, mo_cas, lmat, de, seq_path, seq_prefix): on-top pair-density term of the MC-PDFT nuclear gradient at fixed grids (natm, 3) for weighted v_Pi wpi (ngrid), active orbitals mo_cas (nao, ncas), lmat (ncas^2, ncas^2) the 2-RDM cumulant.")
         m.def_function[py_ontop_paaa]("ontop_paaa", docstring="ontop_paaa(basis, coords, wpi, mo_cas, paaa, seq_path, seq_prefix): paaa (nao, ncas^3) = sum_p phi_mu wpi psi_u psi_v psi_w, the AO-active-active-active block of the MC-PDFT on-top potential.")
+        m.def_function[py_ontop_density]("ontop_density", docstring="ontop_density(basis, coords, deriv, has_core, dm_core, mo_cas, casdm1s, lt, pi_deriv, rho, pi, rho_core, seq_path, seq_prefix): spin densities rho (2, ncomp, ngrid) of Dc/2 + C casdm1s[s] C^T, the on-top pair density pi (1 or 4, ngrid) and the core density rho_core (ngrid), in one pass.")
+        m.def_function[py_becke_response]("becke_response", docstring="becke_response(atm, adj, use_adj, scheme, coords, vol, owner, eot, mode, w0, de): Becke weights w0 of the grid of atom owner and, for mode 1, de (natm, 3) = sum_r eot(r) dw(r)/dR, as pyscf's grids_response_becke (scheme 0 original Becke, 1 Stratmann; adj the radii adjustment when use_adj).")
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
         m.def_function[py_pcm_ds]("pcm_ds", docstring="pcm_ds(table, coords, zeta, switch, norm, rvdw, with_d, s, d): pyscf's PCM S (and D) matrices (n, n).")
         m.def_function[py_pcm_pair]("pcm_pair", docstring="pcm_pair(table, coords, zeta, norm, kind, a, b, g): G_p = a_p sum_j dX_pj b_j - b_p sum_i a_i dX_ip for X = S (kind 0) or D (1), g (n, 3).")
@@ -852,6 +855,33 @@ def py_ontop_paaa(
     ontop_paaa_core(
         _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(wpi),
         Int(py=mo_cas.shape[1]), f64ptr(mo_cas), f64ptr(paaa),
+    )
+    _ = bs^
+    return PythonObject(None)
+
+
+def py_becke_response(
+    atm: PythonObject, adj: PythonObject, use_adj: PythonObject, scheme: PythonObject, coords: PythonObject,
+    vol: PythonObject, owner: PythonObject, eot: PythonObject, mode: PythonObject, w0: PythonObject,
+    de: PythonObject,
+) raises -> PythonObject:
+    becke_response_core(
+        Int(py=atm.shape[0]), f64ptr(atm), f64ptr(adj), Int(py=use_adj), Int(py=scheme), Int(py=coords.shape[0]),
+        f64ptr(coords), f64ptr(vol), Int(py=owner), f64ptr(eot), Int(py=mode), f64ptr(w0), f64ptr(de),
+    )
+    return PythonObject(None)
+
+
+def py_ontop_density(
+    basis: PythonObject, coords: PythonObject, deriv: PythonObject, has_core: PythonObject, dm_core: PythonObject,
+    mo_cas: PythonObject, casdm1s: PythonObject, lt: PythonObject, pi_deriv: PythonObject, rho: PythonObject,
+    pi: PythonObject, rho_core: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    ontop_density_core(
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv), Int(py=has_core),
+        f64ptr(dm_core), Int(py=mo_cas.shape[1]), f64ptr(mo_cas), f64ptr(casdm1s), f64ptr(lt), Int(py=pi_deriv),
+        f64ptr(rho), f64ptr(pi), f64ptr(rho_core),
     )
     _ = bs^
     return PythonObject(None)

@@ -981,7 +981,14 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
 
     Every term contributes to one matrix M_P per auxiliary function (the
     gradient is sum d(mu nu|P) [O M_P O^T]_mu nu - 1/2 sum d(P|Q) W_PQ) and
-    to W, as :func:`grad2e_df_casscf` does for the CASSCF energy.
+    to W, as :func:`grad2e_df_casscf` does for the CASSCF energy.  X stays in
+    packed form; the exchange part of a J/K term only needs X on the support
+    of its matrices, X_P[S1, S2] (S the rows where Y is nonzero): with
+    A_P = X_P[S1, S2] Y2 and C_P = Y1 X_P[S1, S2] it adds -f/2 (C_P Y2 + its
+    transpose) to M_P and -f/2 (t + t^T), t_PQ = sum A_P C_Q, to W.  The
+    Lagrange terms of the state-averaged CASSCF gradient have block-sparse
+    Y (core, active and the rotated blocks), so this is a fraction of the
+    (naux m)^2 work on the full matrices.
     """
     from pyscf.df.grad.rhf import _gen_metric_solver
 
@@ -1005,56 +1012,89 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
     omega = _omega(mol, 0.0)
     ext.df_grad_rhs(tables, aux_tables, table, np.zeros(npair), orb, blk, rhoj, xs, seq_path, seq_prefix, omega)
     solve = _gen_metric_solver(int2c2e(auxmol, omega))
-    a2 = lib.unpack_tril(xs[0]).reshape(naux, m * m)
-    x = lib.unpack_tril(solve(xs[0]))                                    # (naux, m, m)
+    ap = xs[0]                                                           # A, packed lower triangles
+    xp = solve(ap)                                                       # X = V^-1 A, packed
     xs = None
-    mmat = np.zeros((naux, m, m))
+    ii, jj = np.indices((m, m))
+    tri = np.maximum(ii, jj) * (np.maximum(ii, jj) + 1) // 2 + np.minimum(ii, jj)
+
+    def xblock(rows, cols):                                              # X_P[rows, cols] for all P
+        return xp[:, tri[np.ix_(rows, cols)]]
+
+    def pack_sym(y):                                                     # lower triangle of symmetric y
+        return lib.pack_tril(np.ascontiguousarray(y))
+
+    def pack_dot(y):                                                     # sum_ij A_ij y_ij = ap @ pack_dot(y)
+        w = lib.pack_tril(np.ascontiguousarray(y + y.T))
+        w[np.arange(m) * (np.arange(m) + 1) // 2 + np.arange(m)] *= 0.5
+        return w
+
+    def support(y):
+        return np.flatnonzero(np.abs(y).max(axis=1) > 0)
+
+    mpk = np.zeros((naux, m * (m + 1) // 2))                             # (M + M^T) / 2, packed
+
+    def add_block(vals, rows, cols, diag_weight):
+        """mpk[P, tri(r, c)] += w vals[P, r, c] over the block, w = 1 off the diagonal, diag_weight on it.
+        Within the entries with r >= c (and within those with r < c) every packed index occurs once, so
+        two fancy-index additions do it."""
+        r, c = rows[:, None], cols[None, :]
+        idx = tri[np.ix_(rows, cols)].ravel()
+        vals = vals.reshape(naux, -1)
+        lower = (r >= c).ravel()
+        diag = (r == c).ravel()
+        if diag.any():
+            vals = vals.copy()
+            vals[:, diag] *= diag_weight
+        for sel in (lower, ~lower):
+            if sel.any():
+                mpk[:, idx[sel]] += vals[:, sel]
+
     wmat = np.zeros((naux, naux))
-
-    def right(b, y):                                                     # b_P y for all P, one GEMM
-        return lib.dot(b.reshape(naux * m, m), y).reshape(naux, m, m)
-
-    def left(y, b):                                                      # y b_P for all P, one GEMM
-        return lib.dot(y, np.ascontiguousarray(b.transpose(1, 0, 2)).reshape(m, naux * m)).reshape(
-            m, naux, m).transpose(1, 0, 2)
-
     for f, y1, y2 in jk_terms:
         y1 = np.asarray(y1, dtype=np.float64)
         y2 = np.asarray(y2, dtype=np.float64)
-        c1 = solve(a2 @ y1.ravel())
-        c2 = solve(a2 @ y2.ravel())
-        mmat += f * (c2[:, None, None] * y1 + c1[:, None, None] * y2)
-        xy1 = right(x, y1)
-        xy2 = right(x, y2)
-        y1xy2 = left(y1, xy2)                                              # Y1 X_P Y2
-        mmat -= 0.5 * f * (y1xy2 + y1xy2.transpose(0, 2, 1))
-        # Tr(X_P Y2 X_Q Y1) = sum_ij (X_P Y2)_ij (Y1 X_Q)_ij, Y1 X_Q = (X_Q Y1)^T
-        t = lib.dot(xy2.reshape(naux, m * m), np.ascontiguousarray(xy1.transpose(0, 2, 1)).reshape(naux, m * m).T)
-        wmat += f * (np.outer(c1, c2) + np.outer(c2, c1)) - 0.5 * f * (t + t.T)
-        xy1 = xy2 = y1xy2 = t = None
+        c1 = solve(ap @ pack_dot(y1))
+        c2 = solve(ap @ pack_dot(y2))
+        cc = np.stack((c2, c1), axis=1)                                   # rank-2 updates as GEMMs
+        lib.dot(cc, np.stack((pack_sym(y1), pack_sym(y2))), f, mpk, 1.0)
+        lib.dot(cc, cc[:, ::-1].T.copy(), f, wmat, 1.0)
+        s1, s2 = support(y1), support(y2)
+        if len(s1) == 0 or len(s2) == 0:
+            continue
+        xb = xblock(s1, s2)                                              # (naux, n1, n2)
+        n1, n2 = len(s1), len(s2)
+        y1s = np.ascontiguousarray(y1[np.ix_(s1, s1)])
+        y2s = np.ascontiguousarray(y2[np.ix_(s2, s2)])
+        a = lib.dot(xb.reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)              # X_P Y2
+        c = lib.dot(y1s, np.ascontiguousarray(xb.transpose(1, 0, 2)).reshape(n1, naux * n2))
+        c = c.reshape(n1, naux, n2).transpose(1, 0, 2)                                  # Y1 X_P
+        b = lib.dot(np.ascontiguousarray(c).reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)  # Y1 X_P Y2
+        add_block(-0.5 * f * b, s1, s2, 2.0)
+        t = lib.dot(a.reshape(naux, n1 * n2), np.ascontiguousarray(c).reshape(naux, n1 * n2).T)
+        wmat -= 0.5 * f * (t + t.T)
+        xb = a = b = c = t = None
     for f, left, right, g in rdm2_terms:
         g = np.asarray(g, dtype=np.float64)
         n = g.shape[0]
         g2 = g.reshape(n * n, n * n)
-        xl = sum(x[:, np.asarray(i)[:, None], np.asarray(j)[None, :]] for i, j in left).reshape(naux, n * n)
-        xr = sum(x[:, np.asarray(i)[:, None], np.asarray(j)[None, :]] for i, j in right).reshape(naux, n * n)
+        xl = sum(xblock(np.asarray(i), np.asarray(j)) for i, j in left).reshape(naux, n * n)
+        xr = sum(xblock(np.asarray(i), np.asarray(j)) for i, j in right).reshape(naux, n * n)
         dl = (f * lib.dot(xr, g2.T)).reshape(naux, n, n)
         dr = (f * lib.dot(xl, g2)).reshape(naux, n, n)
         for i, j in left:
-            mmat[:, np.asarray(i)[:, None], np.asarray(j)[None, :]] += dl
+            add_block(0.5 * dl, np.asarray(i), np.asarray(j), 2.0)
         for i, j in right:
-            mmat[:, np.asarray(i)[:, None], np.asarray(j)[None, :]] += dr
+            add_block(0.5 * dr, np.asarray(i), np.asarray(j), 2.0)
         wl = lib.dot(lib.dot(xl, g2), xr.T)
         wmat += f * (wl + wl.T)
-    x = a2 = None
+    xp = ap = None
     de = np.zeros((auxmol.natm, 3))
     ext.grad2c(aux_tables, table, np.ascontiguousarray(wmat), de, omega)
     wmat = None
-    mpk = np.ascontiguousarray(lib.pack_tril((mmat + mmat.transpose(0, 2, 1)) * 0.5)[None])
-    mmat = None
     d3 = np.zeros((mol.natm, 3))
     ext.grad_df3c(
-        tables, aux_tables, table, np.zeros(naux), np.zeros(npair), 0.0, -1.0, mpk, orb, blk, float(tol), d3,
-        seq_path, seq_prefix, omega,
+        tables, aux_tables, table, np.zeros(naux), np.zeros(npair), 0.0, -1.0, np.ascontiguousarray(mpk[None]), orb,
+        blk, float(tol), d3, seq_path, seq_prefix, omega,
     )
     return de + d3

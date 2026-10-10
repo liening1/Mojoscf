@@ -11,21 +11,26 @@ density
 (L the cumulant of the active-space 2-RDM, with its gradient for the fully
 translated functionals), then translates (rho, Pi) to effective spin
 densities and calls libxc block by block.  :func:`energy_ot` computes the
-spin densities in one Mojo pass over the whole grid (:func:`mojoscf.dft._rho`)
-and the cumulant part of Pi in a second (``ontop_pi``: per block of 128
-points psi = C^T phi and t = L^T q with the pair products q_kl = psi_k psi_l,
-two GEMMs), then evaluates the translated functional with pyscf's
-``ot.eval_ot`` once on the whole grid.
+spin densities and Pi in one Mojo pass over the whole grid
+(:func:`ontop_densities`: per block of 128 points one GEMM for the core
+density, one for the active orbitals psi = C^T phi, the active densities
+and the cumulant contraction t = L^T q, q_kl = psi_k psi_l, from them;
+meta-GGAs take the density pass of :mod:`mojoscf.dft` and ``ontop_pi``),
+then evaluates the translated functional with pyscf's ``ot.eval_ot`` once
+on the whole grid.  pyscf rebuilds the grid for every state (``ot.reset``);
+the last build is reused while the molecule and grid settings are unchanged.
 
 The MC-PDFT nuclear gradient (``mc.nuc_grad_method()``, pyscf's
 ``grad.mcpdft``/``df.grad.mcpdft``) needs the effective potentials of the
 functional (``pdft_veff.kernel``: :func:`pdft_veff_kernel`) and the
 Hellmann-Feynman terms, whose grid part differentiates the on-top energy's
 integrand with respect to the orbitals, the grid points and the Becke
-weights (:func:`ontop_grad_terms`, inside :func:`hellmann_feynman_grad`);
-both run on the Mojo kernels for translated LDA and GGA functionals.  The
-response equations and the Lagrange terms are those of the state-averaged
-CASSCF gradient (:mod:`mojoscf.casscf` for density-fitted references).
+weights (:func:`ontop_grad_terms`, inside :func:`hellmann_feynman_grad`; the
+weight derivatives from the Becke kernel of :mod:`mojoscf.dft`, the Coulomb
+term from the Mojo derivative integrals); both run on the Mojo kernels for
+translated LDA and GGA functionals.  The response equations and the
+Lagrange terms are those of the state-averaged CASSCF gradient
+(:mod:`mojoscf.casscf` for density-fitted references).
 
 The replacements are installed when pyscf's modules are first imported
 (:func:`install_on_import`, called by ``import mojoscf``), so that mojoscf
@@ -62,6 +67,30 @@ def ontop_pair_density(mol, coords, mo_cas, cascm2, deriv=0):
     return out
 
 
+def ontop_densities(mol, coords, kind, mo_core, mo_cas, casdm1s, cascm2, pi_deriv=0):
+    """In one Mojo pass: the spin densities (2, 1 or 4, ngrid) of mo_core mo_core^T + mo_cas casdm1s[s]
+    mo_cas^T (``kind`` 0 LDA, 1 GGA: with gradients), the on-top pair density (1 or 4, ngrid) with the
+    cumulant ``cascm2`` (its gradient for ``pi_deriv`` 1, which needs ``kind`` 1) and the core density."""
+    if kind not in (0, 1) or (pi_deriv and kind != 1):
+        raise ValueError(f"kind {kind}, pi_deriv {pi_deriv}")
+    coords = np.ascontiguousarray(coords, dtype=np.float64).reshape(-1, 3)
+    mo_cas = np.ascontiguousarray(mo_cas, dtype=np.float64)
+    ncas = mo_cas.shape[1]
+    ngrid = coords.shape[0]
+    nao = mol.nao_nr()
+    has_core = mo_core.shape[1] > 0
+    dmc = np.ascontiguousarray(mo_core @ mo_core.T * 2) if has_core else np.zeros((nao, nao))
+    lt = np.ascontiguousarray(np.asarray(cascm2, dtype=np.float64).reshape(ncas * ncas, ncas * ncas).T)
+    rho = np.empty((2, (1, 4)[kind], ngrid))
+    pi = np.empty(((1, 4)[pi_deriv], ngrid))
+    rhoc = np.empty(ngrid)
+    path, prefix = worker_blas()
+    get_extension().ontop_density(integrals.basis_tables(mol), coords, int(kind), int(has_core), dmc, mo_cas,
+                                  np.ascontiguousarray(casdm1s, dtype=np.float64).reshape(2, ncas, ncas), lt,
+                                  int(pi_deriv), rho, pi, rhoc, path, prefix)
+    return rho, pi, rhoc
+
+
 def _mojo_ok(ot, casdm1s, casdm2, mo_coeff, hermi) -> bool:
     kind = dft._KINDS.get(ot.xctype)
     return (
@@ -72,6 +101,26 @@ def _mojo_ok(ot, casdm1s, casdm2, mo_coeff, hermi) -> bool:
         and integrals.engine() == "mojo"
         and dft.supported(ot.mol)
     )
+
+
+def _ot_grid(ot):
+    """Points and weights of the on-top functional's grid.  pyscf resets that grid before the energy of
+    every state (``ot.reset`` in ``energy_tot``), which rebuilds it each time; the last build is kept on
+    ``ot`` and reused while the molecule and the grid settings stay the same."""
+    g = ot.grids
+    if g.coords is not None:
+        return dft._grid(g)
+    mol = g.mol
+    radii = getattr(g, "atomic_radii", None)
+    key = (mol.atom_coords().tobytes(), mol.atom_charges().tobytes(), g.level, repr(g.atom_grid), g.radi_method,
+           g.prune, g.radii_adjust, None if radii is None else np.asarray(radii).tobytes(), g.becke_scheme,
+           getattr(g, "alignment", None), getattr(g, "symmetry", None))
+    cached = getattr(ot, "_mojoscf_grid", None)
+    if cached is not None and cached[0] == key:
+        return cached[1], cached[2]
+    coords, weights = dft._grid(g)
+    ot._mojoscf_grid = (key, coords, weights)
+    return coords, weights
 
 
 def energy_ot(ot, casdm1s, casdm2, mo_coeff, ncore, max_memory=2000, hermi=1):
@@ -87,15 +136,18 @@ def energy_ot(ot, casdm1s, casdm2, mo_coeff, ncore, max_memory=2000, hermi=1):
     mol = ot.mol
     ncas = casdm2.shape[0]
     cascm2 = _dms.dm2_cumulant(casdm2, casdm1s)
-    dm1s = _dms.casdm1s_to_dm1s(ot, casdm1s, mo_coeff=mo_coeff, ncore=ncore, ncas=ncas)
     mo_cas = mo_coeff[:, ncore:][:, :ncas]
-    coords, weights = dft._grid(ot.grids)
+    coords, weights = _ot_grid(ot)
     kind = dft._KINDS[ot.xctype]
-    rho = dft._rho(mol, coords, kind, np.ascontiguousarray(dm1s, dtype=np.float64))
-    pi = ontop_pair_density(mol, coords, mo_cas, cascm2, ot.Pi_deriv)
-    pi[0] += rho[0, 0] * rho[1, 0]
-    if ot.Pi_deriv:
-        pi[1:4] += rho[0, 1:4] * rho[1, 0] + rho[0, 0] * rho[1, 1:4]
+    if kind < 2:
+        rho, pi, _ = ontop_densities(mol, coords, kind, mo_coeff[:, :ncore], mo_cas, casdm1s, cascm2, ot.Pi_deriv)
+    else:
+        dm1s = _dms.casdm1s_to_dm1s(ot, casdm1s, mo_coeff=mo_coeff, ncore=ncore, ncas=ncas)
+        rho = dft._rho(mol, coords, kind, np.ascontiguousarray(dm1s, dtype=np.float64))
+        pi = ontop_pair_density(mol, coords, mo_cas, cascm2, ot.Pi_deriv)
+        pi[0] += rho[0, 0] * rho[1, 0]
+        if ot.Pi_deriv:
+            pi[1:4] += rho[0, 1:4] * rho[1, 0] + rho[0, 0] * rho[1, 1:4]
     eot = ot.eval_ot(rho, pi, dderiv=0, weights=weights)[0]
     return float(np.dot(eot, weights))
 
@@ -109,24 +161,49 @@ def _grad_ok(ot, mol) -> bool:
     )
 
 
+def _atom_grids(grids):
+    """Per atom: (atom, points, weights, w0, setup) of pyscf's ``grids_response_cc`` with the Becke
+    weights ``w0`` from the Mojo kernel (points grouped by boxes for the kernels' screening), or pyscf's
+    generator (``setup`` None, its weight derivatives ``w1`` in place of the points' quadrature
+    weights) for partitions the kernel does not cover."""
+    from pyscf.grad import rks as rks_grad
+
+    setup = dft.becke_setup(grids)
+    if setup is None:
+        for ia, (coords, w0, w1) in enumerate(rks_grad.grids_response_cc(grids)):
+            yield ia, np.ascontiguousarray(coords, dtype=np.float64), w1, np.asarray(w0, dtype=np.float64), None
+        return
+    mol = grids.mol
+    tab = grids.gen_atomic_grids(mol, grids.atom_grid, grids.radi_method, grids.level, grids.prune)
+    atm = mol.atom_coords()
+    for ia in range(mol.natm):
+        coords, vol = tab[mol.atom_symbol(ia)]
+        coords = coords + atm[ia]
+        idx = dft.group_grids(mol, coords)
+        coords, vol = np.ascontiguousarray(coords[idx]), np.ascontiguousarray(vol[idx])
+        yield ia, coords, vol, dft.becke_response(mol, setup, coords, vol, ia)[0], setup
+
+
 def ontop_grad_terms(ot, mol, mo_occ, occ, ncas, cascm2):
     """The on-top energy's integrand terms of pyscf's ``mcpdft_HellmanFeynman_grad``, each (natm, 3):
     the derivatives of the orbitals in rho and Pi (``de_xc``), of the grid points (``de_grid``) and of
     the Becke weights (``de_wgt``), for the occupied natural orbitals ``mo_occ`` (core then active,
     occupations ``occ``) and the spin-summed cumulant ``cascm2``.
 
-    For each atom's grid (pyscf's ``grids_response_cc``: points, weights and their derivatives) the
-    density (half per spin, as pyscf) and the on-top pair density come from the Mojo kernels and the
-    functional and its derivatives from ``ot.eval_ot``.  The density's orbital terms are pyscf's XC
-    gradient (``xc_grad_dm``) with the effective kernel v_rho + v_Pi rho/2, those of the cumulant part
-    of Pi come from ``ontop_grad``; a grid point moves with its atom, so the grid term of an atom is
-    minus the sum over all atoms of its points' orbital terms."""
-    from pyscf.grad import rks as rks_grad
-
+    For each atom's grid (pyscf's ``grids_response_cc``: its points and Becke weights) the density
+    (half per spin, as pyscf) and the on-top pair density come from the Mojo kernels and the functional
+    and its derivatives from ``ot.eval_ot``.  The density's orbital terms are pyscf's XC gradient
+    (``xc_grad_dm``) with the effective kernel v_rho + v_Pi rho/2, those of the cumulant part of Pi come
+    from ``ontop_grad``; a grid point moves with its atom, so the grid term of an atom is minus the sum
+    over all atoms of its points' orbital terms.  The weight derivatives contracted with the energy
+    density come from the Becke kernel (:func:`mojoscf.dft.becke_response`)."""
     natm, nao = mol.natm, mol.nao_nr()
     ncore = mo_occ.shape[1] - ncas
     dm1 = np.ascontiguousarray(((mo_occ * occ) @ mo_occ.T)[None])
     mo_cas = np.ascontiguousarray(mo_occ[:, ncore:])
+    mo_core = mo_occ[:, :ncore] * np.sqrt(np.asarray(occ[:ncore]) * 0.5)
+    half = np.diag(np.asarray(occ[ncore:], dtype=np.float64) * 0.5)
+    casdm1s = np.stack((half, half))
     lmat = np.ascontiguousarray(np.asarray(cascm2, dtype=np.float64).reshape(ncas * ncas, ncas * ncas))
     kind = dft._KINDS[ot.xctype]
     tabs = integrals.basis_tables(mol)
@@ -135,14 +212,14 @@ def ontop_grad_terms(ot, mol, mo_occ, occ, ncas, cascm2):
     no_orbs, no_occs = np.zeros((1, nao, 0)), np.zeros((1, 0))
     de_xc, de_grid, de_wgt = np.zeros((natm, 3)), np.zeros((natm, 3)), np.zeros((natm, 3))
     part, part_pi = np.empty((natm, 3)), np.empty((natm, 3))
-    for ia, (coords, w0, w1) in enumerate(rks_grad.grids_response_cc(ot.grids)):
-        coords = np.ascontiguousarray(coords, dtype=np.float64)
-        w0 = np.asarray(w0, dtype=np.float64)
-        rho = dft._rho(mol, coords, kind, dm1)[0] * 0.5
-        pi = ontop_pair_density(mol, coords, mo_cas, cascm2, 0)
-        pi[0] += rho[0] * rho[0]
-        eot, (vrho, vpi) = ot.eval_ot(np.stack((rho, rho)), pi, weights=w0)[:2]
-        de_wgt += np.tensordot(eot, w1, axes=(0, 2))
+    for ia, coords, vol, w0, setup in _atom_grids(ot.grids):
+        rho2, pi, _ = ontop_densities(mol, coords, kind, mo_core, mo_cas, casdm1s, cascm2, 0)
+        rho = rho2[0]
+        eot, (vrho, vpi) = ot.eval_ot(rho2, pi, weights=w0)[:2]
+        if setup is None:
+            de_wgt += np.tensordot(eot, vol, axes=(0, 2))
+        else:
+            de_wgt += dft.becke_response(ot.grids.mol, setup, coords, vol, ia, eot)[1]
         wv = np.array(vrho, dtype=np.float64).reshape(-1, w0.size)
         wv[0] += vpi[0] * rho[0]
         wv *= w0
@@ -156,11 +233,31 @@ def ontop_grad_terms(ot, mol, mo_occ, occ, ncas, cascm2):
     return de_xc, de_grid, de_wgt
 
 
+def _coulomb_gradient(mf, mol, dm, auxbasis_response):
+    """The gradient (natm, 3) of the Coulomb energy 1/2 Tr(D J[D]) as pyscf's MC-PDFT gradient forms it
+    from ``mf_grad.get_jk`` (with the auxiliary-basis response for density fitting), from the Mojo
+    derivative integrals: DF (pyscf's ``df.DF``) with the response, or exact integrals; None otherwise."""
+    from pyscf.df import df as pyscf_df
+
+    with_df = getattr(mf, "with_df", None)
+    if with_df is not None:
+        if not (auxbasis_response and isinstance(with_df, pyscf_df.DF) and getattr(with_df, "auxmol", None) is not None
+                and integrals.available(mol, two_electron=True)
+                and integrals.available(with_df.auxmol, two_electron=True)):
+            return None
+        return integrals.grad2e_df(mol, with_df.auxmol, dm, [], [], j_factor=1.0, k_factor=0.0)
+    if not integrals.available(mol, two_electron=True):
+        return None
+    return integrals.grad2e(mol, dm, dm, j_factor=1.0, k_factor=0.0)
+
+
 def hellmann_feynman_grad(mc, ot, veff1, veff2, mo_coeff=None, ci=None, atmlst=None, mf_grad=None, verbose=None,
                           max_memory=None, auxbasis_response=False):
     """pyscf's ``grad.mcpdft.mcpdft_HellmanFeynman_grad`` (the Hellmann-Feynman part of the MC-PDFT
-    gradient) with the on-top energy's grid terms from :func:`ontop_grad_terms`; everything else, and
-    meta-GGA and fully translated functionals altogether, as pyscf's."""
+    gradient) with the on-top energy's grid terms from :func:`ontop_grad_terms` and the Coulomb term
+    from the Mojo derivative integrals (:func:`_coulomb_gradient`; pyscf computed J and K of the
+    gradient for it); everything else, and meta-GGA and fully translated functionals altogether, as
+    pyscf's."""
     from pyscf.grad import mcpdft as mcpdft_grad
     from pyscf.lib import logger, tag_array
     from pyscf.mcpdft import _dms
@@ -213,24 +310,28 @@ def hellmann_feynman_grad(mc, ot, veff1, veff2, mo_coeff=None, ci=None, atmlst=N
     mo_coeff, ci, mo_occup = cas_natorb(mc, mo_coeff=mo_coeff, ci=ci)
     mo_occ = mo_coeff[:, :nocc]
     dm1 = dm_core + dm_cas
-    dm1 = tag_array(dm1, mo_coeff=mo_coeff, mo_occ=mo_occup)
-    vj = mf_grad.get_jk(dm=dm1)[0]
-    if auxbasis_response:
-        de_aux += ot_hyb * np.squeeze(vj.aux[:, :, atmlst, :])
+    de_j = _coulomb_gradient(mc._scf, mol, dm1, auxbasis_response)
+    if de_j is None:
+        dm1 = tag_array(dm1, mo_coeff=mo_coeff, mo_occ=mo_occup)
+        vj = mf_grad.get_jk(dm=dm1)[0]
+        if auxbasis_response:
+            de_aux += ot_hyb * np.squeeze(vj.aux[:, :, atmlst, :])
+    else:
+        de_aux += ot_hyb * de_j[atmlst]
     casdm1, casdm2 = mc.fcisolver.make_rdm12(ci, ncas, nelecas)
     cascm2 = _dms.dm2_cumulant(casdm2, casdm1)
     de_xc, de_grid, de_wgt = (x[atmlst] for x in ontop_grad_terms(ot, mol, mo_occ, mo_occup[:nocc], ncas, cascm2))
     t0 = logger.timer(mc, "PDFT HlFn quadrature (mojoscf)", *t0)
 
     def coul_term(p0, p1):
-        return np.tensordot(vj[:, p0:p1], dm1[p0:p1]) * 2
+        return 0.0 if de_j is not None else np.tensordot(vj[:, p0:p1], dm1[p0:p1]) * 2
 
     de_hcore, de_coul, _, de_nuc, de_renorm = mcpdft_grad.sum_terms(mf_grad, mol, atmlst, dm1, dme0, coul_term,
                                                                      np.zeros((3, mol.nao_nr())))
     de_hcore *= ot_hyb
     de_coul *= ot_hyb
     de = de_nuc + de_hcore + de_coul + de_renorm + de_xc + de_grid + de_wgt
-    if auxbasis_response:
+    if auxbasis_response or de_j is not None:
         de += de_aux
     if cas_hyb > 1e-11:
         de += de_cas
@@ -265,15 +366,24 @@ def pdft_veff_kernel(ot, dm1s, cascm2, mo_coeff, ncore, ncas, max_memory=2000, h
     nocc = ncore + ncas
     nmo = mo_coeff.shape[1]
     mo_cas = np.ascontiguousarray(mo_coeff[:, ncore:nocc])
-    dm_core = mo_coeff[:, :ncore] @ mo_coeff[:, :ncore].T
+    mo_core = mo_coeff[:, :ncore]
     dm1s = np.asarray(dm1s, dtype=np.float64)
-    dms = np.ascontiguousarray(np.stack((dm1s[0], dm1s[1], dm1s[0] + dm1s[1] - 2 * dm_core, 2 * dm_core)))
-    coords, weights = dft._grid(ot.grids)
+    coords, weights = _ot_grid(ot)
     kind = dft._KINDS[ot.xctype]
-    rho4 = dft._rho(mol, coords, kind, dms)
-    rho, rho_a, rho_c = rho4[:2], rho4[2], rho4[3]
-    pi = ontop_pair_density(mol, coords, mo_cas, cascm2, 0)
-    pi[0] += rho[0, 0] * rho[1, 0]
+    # the active spin 1-RDMs of dm1s (pyscf's core + mo_cas casdm1s mo_cas^T) for the one-pass kernel
+    proj = mo_cas.T @ mol.intor_symmetric("int1e_ovlp")
+    casdm1s = np.einsum("ui,sij,vj->suv", proj, dm1s, proj)
+    rec = (mo_core @ mo_core.T)[None] + np.einsum("iu,suv,jv->sij", mo_cas, casdm1s, mo_cas)
+    if abs(rec - dm1s).max() < 1e-10 * max(1.0, abs(dm1s).max()):
+        rho, pi, rho_c = ontop_densities(mol, coords, kind, mo_core, mo_cas, casdm1s, cascm2, 0)
+        rho_a = rho[0, 0] + rho[1, 0] - rho_c
+    else:
+        dm_core = mo_core @ mo_core.T
+        dms = np.ascontiguousarray(np.stack((dm1s[0], dm1s[1], dm1s[0] + dm1s[1] - 2 * dm_core, 2 * dm_core)))
+        rho4 = dft._rho(mol, coords, kind, dms)
+        rho, rho_a, rho_c = rho4[:2], rho4[2, 0], rho4[3, 0]
+        pi = ontop_pair_density(mol, coords, mo_cas, cascm2, 0)
+        pi[0] += rho[0, 0] * rho[1, 0]
     eot, (vrho, vpi) = ot.eval_ot(rho, pi, weights=weights)[:2]
     e_ot = float(np.dot(eot, weights))
     wv = np.array(vrho, dtype=np.float64).reshape(-1, weights.size) * weights
@@ -282,8 +392,8 @@ def pdft_veff_kernel(ot, dm1s, cascm2, mo_coeff, ncore, ncas, max_memory=2000, h
     wpi = np.ascontiguousarray(weights * vpi[0])
     # vhf_c and the active term: kernels v_Pi rho_c / 2 and v_Pi rho_a / 2 (LDA-like, w_0 halved)
     wl = np.empty((2, 1, weights.size))
-    np.multiply(wpi, rho_c[0], out=wl[0, 0])
-    np.multiply(wpi, rho_a[0], out=wl[1, 0])
+    np.multiply(wpi, rho_c, out=wl[0, 0])
+    np.multiply(wpi, rho_a, out=wl[1, 0])
     wl *= 0.25
     vc, va = dft._vmat(mol, coords, 0, wl)
     veff2 = _ERIS(mol, mo_coeff, ncore, ncas, paaa_only=paaa_only, aaaa_only=aaaa_only, jk_pc=jk_pc,

@@ -294,3 +294,47 @@ def test_diis_choice():
 def test_accelerate_rejects_hf():
     with pytest.raises(TypeError):
         mdft.accelerate(scf.RHF(gto.M(atom=WATER, basis="sto-3g", verbose=0)))
+
+
+def test_group_grids_matches_pyscf():
+    """The box grouping of the grid points (Grids.build's order) is pyscf's arg_group_grids permutation."""
+    from pyscf.dft import gen_grid
+
+    orig = getattr(gen_grid.arg_group_grids, "_mojoscf_orig", gen_grid.arg_group_grids)
+    mol = gto.M(atom="Fe 0 0 0; O 2.1 0 0; O 0 2.1 0; O 0 0 -2.1; H 2.7 0.8 0", basis="sto-3g", charge=2,
+                spin=1, verbose=0)
+    grids = dft.gen_grid.Grids(mol).build(sort_grids=False)
+    rng = np.random.default_rng(7)
+    for coords in (grids.coords, rng.uniform(-12, 12, (5000, 3))):
+        assert np.array_equal(mdft.group_grids(mol, coords), orig(mol, coords))
+
+
+@pytest.mark.parametrize("variant", ["treutler", "becke-radii", "no-adjust", "stratmann"])
+def test_becke_response_matches_pyscf(variant):
+    """Becke weights and their nuclear derivatives contracted with a density equal pyscf's
+    grids_response_cc for each atom's grid (radii adjustments and the Stratmann scheme)."""
+    from pyscf.dft import gen_grid, radi
+    from pyscf.grad import rks as rks_grad
+
+    mol = gto.M(atom="Fe 0 0 0; O 2.1 0 0.1; O 0 2.0 0; H 2.6 0.8 0; H 2.6 -0.8 0.2", basis="sto-3g",
+                charge=2, spin=0, verbose=0)
+    grids = dft.gen_grid.Grids(mol)
+    grids.level = 1
+    if variant == "becke-radii":
+        grids.radii_adjust = radi.becke_atomic_radii_adjust
+    elif variant == "no-adjust":
+        grids.radii_adjust = None
+    elif variant == "stratmann":
+        grids.becke_scheme = gen_grid.stratmann
+    setup = mdft.becke_setup(grids)
+    assert setup is not None
+    tab = grids.gen_atomic_grids(mol, grids.atom_grid, grids.radi_method, grids.level, grids.prune)
+    rng = np.random.default_rng(11)
+    for ia, (coords, w0, w1) in enumerate(rks_grad.grids_response_cc(grids)):
+        c, vol = tab[mol.atom_symbol(ia)]
+        assert np.allclose(c + mol.atom_coords()[ia], coords, atol=1e-14)
+        e = rng.uniform(-1, 1, len(w0))
+        w, de = mdft.becke_response(mol, setup, coords, vol, ia, e)
+        assert abs(w - w0).max() < 1e-12 * max(1.0, abs(w0).max())
+        ref = np.tensordot(e, w1, axes=(0, 2))
+        assert abs(de - ref).max() < 1e-10 * max(1.0, abs(ref).max()), (variant, ia)
