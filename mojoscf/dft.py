@@ -35,6 +35,7 @@ pyscf's.
 from __future__ import annotations
 
 import numpy as np
+from pyscf.df import df as pyscf_df
 from pyscf.dft import numint as pyscf_numint
 
 from . import integrals
@@ -580,33 +581,167 @@ def _install_grad_vxc():
 _install_grad_vxc()
 
 
+class _MojoDFObject:
+    """In front of pyscf's ``df.DF`` (:data:`MojoDF`, the ``with_df`` of the objects mojoscf accelerates):
+    ``get_jk`` from the Mojo DF kernel for real symmetric densities, the tensor in memory or on disk
+    (:func:`df_object_jk`).  pyscf code that calls the DF object directly, such as the orbital-Hessian
+    steps of DF-CASSCF, then runs on the same kernel as the SCF."""
+
+    __name_mixin__ = "Mojo"
+
+    def get_jk(self, dm, hermi=1, with_j=True, with_k=True, direct_scf_tol=1e-13, omega=None):
+        jk = df_object_jk(self, dm, hermi, with_j, with_k, omega)
+        if jk is not None:
+            return jk
+        return super().get_jk(dm, hermi, with_j, with_k, direct_scf_tol, omega)
+
+
+MojoDF = type("MojoDF", (_MojoDFObject, pyscf_df.DF), {"__module__": __name__})
+
+
+def mojo_df(with_df):
+    """Put :class:`_MojoDFObject` in front of a plain pyscf ``df.DF`` object (in place); returns it."""
+    if type(with_df) is pyscf_df.DF:
+        with_df.__class__ = MojoDF
+    return with_df
+
+
+def plain_df(with_df) -> bool:
+    """True for pyscf's own ``df.DF`` objects (with :class:`_MojoDFObject` in front or not), whose tensor
+    layout and J/K the Mojo kernels reproduce; False for other DF classes."""
+    return type(with_df) is pyscf_df.DF or type(with_df) is MojoDF
+
+
+def _available_memory() -> int:
+    """Bytes of memory the system has available (Linux ``MemAvailable``, else free pages; 0 if unknown)."""
+    import os
+
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def ondisk_tensor(with_df):
+    """The DF tensor of ``with_df`` that pyscf keeps on disk, memory-mapped read-only, or None.
+
+    Applies to one contiguous, uncompressed ``(naux, npair)`` HDF5 dataset
+    (what :func:`mojoscf.integrals.cholesky_eri_h5` and pyscf's
+    ``_compatible_format`` write) when the file fits in the memory the system
+    has available: the page cache then holds the file, which pyscf's
+    ``max_memory`` does not count, and every kernel reads the tensor as if it
+    were in memory.  pyscf's block format and larger files are streamed
+    instead (:func:`df_object_jk`).  The map is kept on the DF object until
+    its ``_cderi`` changes.
+    """
+    import h5py
+
+    cderi = with_df._cderi
+    if cderi is None or isinstance(cderi, np.ndarray):
+        return None
+    cached = getattr(with_df, "_mojo_mmap", None)
+    if cached is not None and cached[0] is cderi:
+        return cached[1]
+    name = cderi if isinstance(cderi, str) else getattr(cderi, "name", None)
+    if not isinstance(name, str) or not h5py.is_hdf5(name):
+        return None
+    with h5py.File(name, "r") as f:
+        dset = f.get(with_df._dataname)
+        if (not isinstance(dset, h5py.Dataset) or dset.ndim != 2 or dset.dtype != np.float64
+                or dset.chunks is not None or dset.compression is not None):
+            return None
+        offset = dset.id.get_offset()
+        shape = dset.shape
+    nao = with_df.mol.nao_nr()
+    if offset is None or shape[1] != nao * (nao + 1) // 2 or shape[0] * shape[1] * 8 > 0.8 * _available_memory():
+        return None
+    arr = np.memmap(name, dtype=np.float64, mode="r", offset=offset, shape=shape)
+    with_df._mojo_mmap = (cderi, arr)
+    return arr
+
+
+def _tensor_blocks(with_df):
+    """``with_df.loop`` blocks of a tensor on disk, sized to keep two of them (one read ahead) within
+    about 30% of the free memory and at least 32 auxiliary functions each."""
+    from pyscf import lib as pyscf_lib
+
+    nao = with_df.mol.nao_nr()
+    max_memory = with_df.max_memory - pyscf_lib.current_memory()[0]
+    return with_df.loop(max(32, int(max_memory * 0.3e6 / 8 / (nao * (nao + 1) // 2))))
+
+
+def _tags(dm):
+    mo_coeff = getattr(dm, "mo_coeff", None)
+    mo_occ = getattr(dm, "mo_occ", None)
+    if mo_coeff is None or mo_occ is None or np.asarray(mo_coeff).ndim != np.asarray(dm).ndim:
+        return None, None
+    return mo_coeff, mo_occ
+
+
+def df_object_jk(with_df, dm, hermi=1, with_j=True, with_k=True, omega=None):
+    """pyscf's ``with_df.get_jk(dm)`` from the Mojo DF kernel: the tensor in memory
+    (:func:`mojoscf.kernels.df_jk`) or on disk, streamed block by block
+    (:func:`mojoscf.kernels.df_jk_blocks`); a missing tensor is built where
+    pyscf would build it (:func:`mojoscf.integrals.build_df`).  For plain pyscf
+    ``df.DF`` objects and real symmetric densities; None otherwise (``omega``,
+    ``hermi=0``, ...)."""
+    from . import kernels
+
+    if omega or hermi != 1 or not np.isrealobj(dm) or not plain_df(with_df):
+        return None
+    if with_df._cderi is None and not integrals.build_df(with_df):
+        with_df.build()
+    cderi = with_df._cderi
+    nao = with_df.mol.nao_nr()
+    if cderi is None or np.asarray(dm).shape[-1] != nao:
+        return None
+    mo_coeff, mo_occ = _tags(dm)
+    if not isinstance(cderi, np.ndarray):
+        mapped = ondisk_tensor(with_df)
+        if mapped is None:
+            return kernels.df_jk_blocks(_tensor_blocks(with_df), np.asarray(dm), mo_coeff, mo_occ, with_j, with_k)
+        cderi = mapped
+    if cderi.ndim != 2 or cderi.dtype != np.float64 or cderi.shape[1] != nao * (nao + 1) // 2:
+        return None
+    return kernels.df_jk(cderi, np.asarray(dm), mo_coeff, mo_occ, with_j, with_k)
+
+
 def _df_tensor(mf, omega=0.0):
     """pyscf's in-core DF tensor ``(naux, nao*(nao+1)//2)`` of the density-fitted object ``mf``, or None.
 
-    A missing tensor is built with the Mojo integrals when pyscf would keep
-    it in core (``integrals.build_df``).  ``omega`` > 0 (the long-range
-    exchange of range-separated functionals) gives the tensor of pyscf's
+    A missing tensor is built with the Mojo integrals where pyscf would build
+    it (``integrals.build_df``).  ``omega`` > 0 (the long-range exchange of
+    range-separated functionals) gives the tensor of pyscf's
     ``with_df.range_coulomb(omega)`` (a context manager that sets the
     molecules' ``omega`` while it is open), built with the attenuated
-    integrals.  None for other DF classes, out-of-core tensors and
-    ``only_dfj`` objects.
+    integrals.  A tensor on disk is memory-mapped where that applies
+    (:func:`ondisk_tensor`).  None for other DF classes, tensors on disk that
+    cannot be mapped and ``only_dfj`` objects.
     """
-    from pyscf.df import df as pyscf_df
     from pyscf.df import df_jk
 
     if not isinstance(mf, df_jk._DFHF) or getattr(mf, "only_dfj", False):
         return None
     with_df = mf.with_df
-    if type(with_df) is not pyscf_df.DF:
+    if not plain_df(with_df):
         return None
     nao = mf.mol.nao_nr()
 
     def tensor(d):
-        if type(d) is not pyscf_df.DF:
+        if not plain_df(d):
             return None
         if d._cderi is None and not integrals.build_df(d):
             d.build()
         cderi = d._cderi
+        if not isinstance(cderi, np.ndarray):
+            cderi = ondisk_tensor(d)
         if isinstance(cderi, np.ndarray) and cderi.ndim == 2 and cderi.dtype == np.float64 and cderi.shape[1] == nao * (nao + 1) // 2:
             return cderi
         return None
@@ -630,11 +765,17 @@ def _df_jk(cderi, dm, with_j, with_k):
     """:func:`mojoscf.kernels.df_jk` for ``dm``, through its orbitals when it carries pyscf's tags."""
     from . import kernels
 
-    mo_coeff = getattr(dm, "mo_coeff", None)
-    mo_occ = getattr(dm, "mo_occ", None)
-    if mo_coeff is None or mo_occ is None or np.asarray(mo_coeff).ndim != np.asarray(dm).ndim:
-        mo_coeff = mo_occ = None
+    mo_coeff, mo_occ = _tags(dm)
     return kernels.df_jk(cderi, np.asarray(dm), mo_coeff, mo_occ, with_j, with_k)
+
+
+def _ondisk_df_jk(mf, dm, hermi, with_j, with_k, omega):
+    """J/K of the density-fitted object ``mf`` whose DF tensor is kept on disk (pyscf's choice when it does
+    not fit in memory, or a file named in ``_cderi_to_save``), streamed (:func:`df_object_jk`); None when
+    that does not apply."""
+    if getattr(mf, "only_dfj", False) or isinstance(mf.with_df._cderi, np.ndarray):
+        return None
+    return df_object_jk(mf.with_df, dm, hermi, with_j, with_k, omega)
 
 
 def hooked_jk(mf, hook, mol, dm, hermi, with_j, with_k, omega):
@@ -644,7 +785,8 @@ def hooked_jk(mf, hook, mol, dm, hermi, with_j, with_k, omega):
     The implementation behind ``hook`` (the next class in the MRO defining
     ``get_jk``) decides what is computed: pyscf's density-fitting one
     (``_DFHF``) gets :func:`mojoscf.kernels.df_jk` on the in-core DF tensor
-    (:func:`_df_tensor`), pyscf's exact one (``RHF``/``UHF``) gets
+    (:func:`_df_tensor`; a tensor on disk is streamed, :func:`_ondisk_df_jk`),
+    pyscf's exact one (``RHF``/``UHF``) gets
     :func:`exact_jk` (in-core ERIs or integral-direct); anything else,
     including a ``get_jk`` set on the instance, is left alone.
     """
@@ -656,7 +798,9 @@ def hooked_jk(mf, hook, mol, dm, hermi, with_j, with_k, omega):
     nxt = next((c for c in mro[mro.index(hook) + 1:] if "get_jk" in c.__dict__), None)
     if nxt is df_jk._DFHF:
         cderi = _incore_cderi(mf, mol, dm, hermi, omega)
-        return None if cderi is None else _df_jk(cderi, dm, with_j, with_k)
+        if cderi is None:
+            return _ondisk_df_jk(mf, dm, hermi, with_j, with_k, omega)
+        return _df_jk(cderi, dm, with_j, with_k)
     if nxt is None or nxt.__module__ not in ("pyscf.scf.hf", "pyscf.scf.uhf"):
         return None
     if (omega or 0) < 0 or hermi not in (0, 1):
@@ -877,6 +1021,8 @@ def accelerate(mf):
         from pyscf import lib
 
         lib.set_class(mf, (_MojoKSHook, type(mf)))
+    if getattr(mf, "with_df", None) is not None:
+        mojo_df(mf.with_df)
     from pyscf.qmmm import itrf
 
     if isinstance(mf, itrf.QMMMSCF):

@@ -2598,7 +2598,15 @@ def store_aux_batch(
 
 
 def int3c2e_core(
-    basis: Basis, aux: Basis, boys: BoysTable, dst: F64Ptr, pshell0: Int = 0, pshell1: Int = -1, omega: Float64 = 0.0
+    basis: Basis,
+    aux: Basis,
+    boys: BoysTable,
+    dst: F64Ptr,
+    pshell0: Int = 0,
+    pshell1: Int = -1,
+    omega: Float64 = 0.0,
+    ashell0: Int = 0,
+    ashell1: Int = -1,
 ):
     """(ab|P) into ``dst[P * npair + pair(a, b)]`` (naux x npair, pyscf's cderi layout before the Cholesky step).
 
@@ -2606,6 +2614,10 @@ def int3c2e_core(
 
     With a shell range [pshell0, pshell1) only those auxiliary shells are
     computed, into rows counted from the first function of ``pshell0``.
+    With a range [ashell0, ashell1) of AO shells only the pairs (i, j <= i)
+    with i in those shells are: the columns [c0, c1) of the full array
+    (c = i0 (i0 + 1) / 2 for the first AO i0 of ``ashell0`` and of
+    ``ashell1``), stored as a (naux, c1 - c0) array.
 
     A task is one bra shell a with all partners b <= a: its AO pairs
     (i in a, j <= i) form the contiguous column block
@@ -2616,8 +2628,6 @@ def int3c2e_core(
     built (in parallel) right before use.
     """
     var nbas = basis.nbas
-    var nao = basis.nao
-    var npair_ao = nao * (nao + 1) // 2
     var ht = HermTable(max(2 * basis.lmax, aux.lmax))
     var atab = aux_table(aux, ht)
     if omega > 0.0:
@@ -2635,12 +2645,16 @@ def int3c2e_core(
         wmax = max(wmax, (i1 * (i1 + 1) - i0 * (i0 + 1)) // 2)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
-    var s1 = nbas
-    while s1 > 0:
+    var as0 = ashell0
+    var as1 = nbas if ashell1 < 0 else ashell1
+    var cbase = basis.ao_loc[as0] * (basis.ao_loc[as0] + 1) // 2
+    var ld = basis.ao_loc[as1] * (basis.ao_loc[as1] + 1) // 2 - cbase     # row stride of dst
+    var s1 = as1
+    while s1 > as0:
         # shells [s0, s1) with at most PAIR_BLOCK pairs (at least one shell)
         var s0 = s1 - 1
         var npb = s0 + 1
-        while s0 > 0 and npb + s0 <= PAIR_BLOCK:
+        while s0 > as0 and npb + s0 <= PAIR_BLOCK:
             s0 -= 1
             npb += s0 + 1
         var sa = List[Int](capacity=npb)
@@ -2657,7 +2671,7 @@ def int3c2e_core(
         var nworkers = min(parallelism_level(), ntask)
         counter.store(0)
 
-        def work(w: Int) {imm basis, imm aux, imm boys, imm tab, imm atab, imm ht, imm dst, imm npair_ao, imm pcount, imm ntask, imm s0, imm s1, imm npfmax, imm wmax, imm ps0, imm ps1, imm plo, imm pkcls, imm nclass}:
+        def work(w: Int) {imm basis, imm aux, imm boys, imm tab, imm atab, imm ht, imm dst, imm ld, imm cbase, imm pcount, imm ntask, imm s0, imm s1, imm npfmax, imm wmax, imm ps0, imm ps1, imm plo, imm pkcls, imm nclass}:
             var ws = EriWork(tab.maxcomp, tab.maxlab, atab.maxcomp, atab.maxlab)
             var wb = EriBatch(atab.maxcomp, tab.maxcomp)
             var queue = KetQueue(nclass)
@@ -2708,7 +2722,7 @@ def int3c2e_core(
                             store_aux_batch(basis, atab, pshell, tab, queue.kets(kc), queue.cnt[kc], boys, ws, wb, i0, c0, wdt, pbuf)
                             queue.clear(kc)
                     for fp in range(npf):
-                        var drow = dst.unsafe_offset((p0 + fp) * npair_ao + c0)
+                        var drow = dst.unsafe_offset((p0 + fp) * ld + c0 - cbase)
                         var srow = pbuf.unsafe_offset(fp * wdt)
                         for c in range(wdt):
                             drow[unsafe_offset=c] = srow[unsafe_offset=c]

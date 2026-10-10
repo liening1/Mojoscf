@@ -357,15 +357,16 @@ class _Metric:
 
 def _df_jk_reason(hessobj, mo_coeff, mo_occ):
     """Why :func:`df_jk_terms` cannot handle ``hessobj`` (None if it can)."""
-    from pyscf.df import df as pyscf_df
     from pyscf.df import df_jk
     from pyscf.scf import hf, rohf, uhf
+
+    from . import dft
 
     mf = hessobj.base
     mol = hessobj.mol
     if integrals.engine() != "mojo":
         return "the Mojo integral engine is not selected"
-    if not isinstance(mf, df_jk._DFHF) or getattr(mf, "only_dfj", False) or type(mf.with_df) is not pyscf_df.DF:
+    if not isinstance(mf, df_jk._DFHF) or getattr(mf, "only_dfj", False) or not dft.plain_df(mf.with_df):
         return "not a density-fitted SCF (pyscf's DF class)"
     if getattr(hessobj, "auxbasis_response", 2) != 2:
         return "auxbasis_response below 2"

@@ -4,8 +4,10 @@ The systems are idealised geometries (``systems.py``): ferrocene, high-spin
 [Fe(H2O)6]2+ (alone and with a second shell of 12 waters), [Cu(NH3)4]2+,
 Ni(CO)4 and cisplatin (Pt with the def2 effective core potential), with
 def2 basis sets (an f shell on the metal already in def2-SVP).  "DF" runs use
-pyscf's default def2 JK-fitting basis, "direct" runs ``max_memory=1`` (the
-4-index integrals are recomputed every cycle), "in-core" stores them.  For
+pyscf's default def2 JK-fitting basis ("DF on disk": with pyscf's default
+``max_memory`` of 4000 MB, too little for the tensor, which pyscf then keeps
+in a file), "direct" runs ``max_memory=1`` (the 4-index integrals are
+recomputed every cycle), "in-core" stores them.  For
 each (system, driver) pair the script converges the SCF (conv_tol 1e-9; the
 same pyscf object, accelerated with ``mojoscf.accelerate`` for mojoscf) and
 then computes the gradient with ``nuc_grad_method()``.  Usage:
@@ -40,6 +42,9 @@ CASES = {
     "ni-svp-ic": ("Ni(CO)4 / def2-SVP (in-core)", NI4, "def2-svp", None, 0, 0, "rhf", "incore"),
     "fep-svp-df": ("Fe(II) porphine triplet / def2-SVP (DF, UHF)", 'porphyrin_atoms("Fe")', "def2-svp", None, 0, 2,
                    "uhf", "df"),
+    # the DF tensor (about 5 GB) does not fit in pyscf's default max_memory of 4000 MB: kept on disk
+    "fep-tz-disk": ("Fe(II) porphine triplet / def2-TZVP (DF on disk, UHF)", 'porphyrin_atoms("Fe")', "def2-tzvp",
+                    None, 0, 2, "uhf", "df-disk"),
 }
 
 WORKER = r'''
@@ -57,8 +62,10 @@ if driver == "mojoscf":
     mojoscf.UHF(gto.M(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)).run()  # start the runtime
 cls = scf.RHF if %(kind)r == "rhf" else scf.UHF
 mf = cls(mol)
-if %(mode)r == "df":
+if %(mode)r in ("df", "df-disk"):
     mf = mf.density_fit()
+    if %(mode)r == "df-disk":
+        mf.with_df.max_memory = 4000
 elif %(mode)r == "direct":
     mf.max_memory = 1
 mf.verbose = 0; mf.conv_tol = 1e-9; mf.max_cycle = 100

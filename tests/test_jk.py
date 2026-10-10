@@ -377,3 +377,79 @@ def test_scf_native_with_ecp(path, kind):
     assert ref.converged and mf.converged and mf.cycles == ref.cycles
     assert mf.scf_summary["mojoscf_veff_mode"] == {"df": 1, "incore": 2, "direct": 3}[path]
     assert abs(mf.e_tot - ref.e_tot) < 1e-9
+
+
+@pytest.mark.parametrize("unrestricted", [False, True])
+def test_df_tensor_on_disk(tmp_path, unrestricted, monkeypatch):
+    """A DF tensor pyscf keeps on disk (a named file, or too little memory): built with the Mojo integrals as
+    one contiguous dataset, memory-mapped for the native loop; pyscf's own block-format file is streamed
+    through the Mojo kernel instead.  Same tensor, J/K and SCF as pyscf."""
+    import mojoscf.dft as mdft
+
+    mol = gto.M(atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587", basis="def2-svp", charge=int(unrestricted),
+                spin=int(unrestricted), verbose=0)
+    cls, pcls = (mojoscf.UHF, scf.UHF) if unrestricted else (mojoscf.RHF, scf.RHF)
+    ref = pcls(mol).density_fit()
+    ref.with_df._cderi_to_save = str(tmp_path / "ref.h5")
+    ref.run(conv_tol=1e-10)
+    b = np.vstack(list(ref.with_df.loop(50)))
+    routed = []
+    orig = mdft.hooked_jk
+    monkeypatch.setattr(mdft, "hooked_jk", lambda *a: routed.append(orig(*a)) or routed[-1])
+    for mode in ("named", "memory", "pyscf file"):
+        mf = cls(mol).density_fit()
+        if mode == "named":
+            mf.with_df._cderi_to_save = str(tmp_path / "moj.h5")
+        elif mode == "memory":
+            mf.with_df.max_memory = 1        # pyscf's choice: on disk, in a temporary file
+        else:
+            mf.with_df._cderi = ref.with_df._cderi      # pyscf's block format: streamed
+        mf.run(conv_tol=1e-10)
+        assert mf.with_df._cderi is not None and not isinstance(mf.with_df._cderi, np.ndarray)
+        mapped = mdft.ondisk_tensor(mf.with_df)
+        if mode == "pyscf file":
+            assert mapped is None and mf.scf_summary["mojoscf_veff_mode"] == 0
+            assert routed and all(r is not None for r in routed)
+        else:
+            assert isinstance(mapped, np.memmap) and mf.scf_summary["mojoscf_veff_mode"] == 1
+            assert abs(np.asarray(mapped) - b).max() < 1e-10        # integrals as libcint to ~1e-14
+        assert abs(mf.e_tot - ref.e_tot) < 1e-9 and mf.cycles == ref.cycles
+        a = np.vstack(list(mf.with_df.loop(50)))
+        assert a.shape == b.shape and abs(a - b).max() < 1e-10
+        dm = mf.make_rdm1()
+        for d in (dm, np.asarray(dm) + 0.01):           # with and without orbital tags
+            j0, k0 = ref.get_jk(mol, d)
+            j1, k1 = mf.get_jk(mol, d)
+            assert abs(j1 - j0).max() < 1e-11 and abs(k1 - k0).max() < 1e-11
+            j1, k1 = kernels.df_jk_blocks(mf.with_df.loop(40), d)
+            assert abs(j1 - j0).max() < 1e-11 and abs(k1 - k0).max() < 1e-11
+        del routed[:]
+
+
+def test_df_object_get_jk_and_casscf(monkeypatch):
+    """The DF object of accelerated objects (MojoDF) gives with_df.get_jk from the Mojo kernel; pyscf code
+    that calls it directly, such as DF-CASSCF's orbital-Hessian steps, gets the same results as pyscf's."""
+    from pyscf import df, mcscf
+
+    import mojoscf.dft as mdft
+
+    mol = gto.M(atom="N 0 0 0; N 0 0 1.12", basis="cc-pvdz", verbose=0)
+    ref = scf.RHF(mol).density_fit().run(conv_tol=1e-11)
+    mf = mojoscf.accelerate(scf.RHF(mol).density_fit()).run(conv_tol=1e-11)
+    assert type(mf.with_df) is mdft.MojoDF and mdft.plain_df(mf.with_df)
+    assert type(mojoscf.RHF(mol).density_fit().with_df) is mdft.MojoDF
+    rng = np.random.default_rng(5)
+    d = rng.normal(size=(2, mol.nao, mol.nao))
+    d = d + d.transpose(0, 2, 1)
+    j0, k0 = ref.with_df.get_jk(d)
+    j1, k1 = mf.with_df.get_jk(d)
+    assert abs(j1 - j0).max() < 1e-10 and abs(k1 - k0).max() < 1e-10
+    a = rng.normal(size=(mol.nao, mol.nao))                  # non-symmetric: pyscf's code
+    assert abs(mf.with_df.get_jk(a, hermi=0)[1] - ref.with_df.get_jk(a, hermi=0)[1]).max() < 1e-10
+    calls = []
+    orig = mdft.df_object_jk
+    monkeypatch.setattr(mdft, "df_object_jk", lambda *a, **k: calls.append(1) or orig(*a, **k))
+    e0 = mcscf.CASSCF(ref, 6, 6).run().e_tot
+    mc = mcscf.CASSCF(mf, 6, 6).run()
+    assert calls and abs(mc.e_tot - e0) < 1e-8
+    assert isinstance(df.DF(mol), df.DF) and not mdft.plain_df(type("Other", (df.DF,), {})(mol))

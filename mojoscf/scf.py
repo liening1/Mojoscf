@@ -159,9 +159,12 @@ def _hook_eigh(mf, hook, h, s, overwrite=False, x=None):
 
 def _hook_density_fit(mf, hook, auxbasis, with_df, only_dfj):
     """``density_fit()`` of a hooked object: pyscf's, with :class:`_MojoDFHook` in front of its ``_DFHF``."""
+    from .dft import mojo_df
+
     dfmf = super(hook, mf).density_fit(auxbasis, with_df, only_dfj)
     if not isinstance(dfmf, _MojoDFHook):
         lib.set_class(dfmf, (_MojoDFHook, type(dfmf)))
+    mojo_df(dfmf.with_df)
     return dfmf
 
 
@@ -187,15 +190,19 @@ def native_veff(mf):
             return 0, None, f"mf.{name} is not pyscf's implementation"
     with_df = getattr(mf, "with_df", None)
     if with_df is not None:
-        from pyscf.df import df as pyscf_df
-
         if getattr(mf, "only_dfj", False):
             return 0, None, "only_dfj (exact exchange with DF Coulomb)"
-        if type(with_df) is not pyscf_df.DF:
+        from .dft import plain_df
+
+        if not plain_df(with_df):
             return 0, None, f"{type(with_df).__name__} is not the plain pyscf DF object"
         if with_df._cderi is None and not integrals.build_df(with_df):
             with_df.build()
         cderi = with_df._cderi
+        if not isinstance(cderi, np.ndarray):
+            from .dft import ondisk_tensor
+
+            cderi = ondisk_tensor(with_df)              # on disk: memory-mapped where that applies
         if (
             isinstance(cderi, np.ndarray) and cderi.ndim == 2 and cderi.dtype == np.float64
             and cderi.shape[1] == npair
@@ -537,9 +544,12 @@ class _MojoGlueMixin:
     scf = kernel
 
     def density_fit(self, auxbasis=None, with_df=None, only_dfj=False):
+        from .dft import mojo_df
+
         mf = super().density_fit(auxbasis, with_df, only_dfj)
         if not isinstance(mf, _MojoDFHook):
             lib.set_class(mf, (_MojoDFHook, type(mf)))
+        mojo_df(mf.with_df)
         return mf
 
     def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True, omega=None):
@@ -880,8 +890,11 @@ def accelerate(mf):
         lib.set_class(mf, (_MojoHFHook, type(mf)))
         _add_qmmm_hook(mf)
         from . import solvent
+        from .dft import mojo_df
 
         solvent.attach(mf)
+        if getattr(mf, "with_df", None) is not None:
+            mojo_df(mf.with_df)
         return mf
     mixin = _MojoUHFMixin if _is_uhf(mf) else _MojoRHFMixin
     cls = type(mf)
@@ -891,4 +904,8 @@ def accelerate(mf):
         _accelerated_classes[cls] = new_cls
     mf.__class__ = new_cls
     _add_qmmm_hook(mf)
+    if getattr(mf, "with_df", None) is not None:
+        from .dft import mojo_df
+
+        mojo_df(mf.with_df)
     return mf

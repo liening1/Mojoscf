@@ -341,14 +341,14 @@ class _MojoDFGradMixin(_MojoGrad1eMixin):
 
     def _direct_2e(self):
         """True for a plain pyscf DF object with the default options and no overridden J/K."""
-        from pyscf import df
+        from .dft import plain_df
 
         base = self.base
         with_df = getattr(base, "with_df", None)
         cls = type(self)
         pyscf_cls = self._pyscf_grad
         return (
-            type(with_df) is df.DF
+            plain_df(with_df)
             and not getattr(base, "only_dfj", False)
             and self.auxbasis_response
             and not getattr(with_df, "omega", None)

@@ -256,23 +256,7 @@ def df_jk(cderi, dm, mo_coeff=None, mo_occ=None, with_j=True, with_k=True, block
     vk = np.zeros((nset, nao, nao))
     orbs = ms = signs = None
     if with_k and mo_coeff is not None:
-        if mo_occ is None:
-            raise ValueError("mo_occ is required with mo_coeff")
-        c_all = np.asarray(mo_coeff, dtype=np.float64)
-        o_all = np.asarray(mo_occ, dtype=np.float64)
-        c_all = c_all.reshape(-1, c_all.shape[-2], c_all.shape[-1])
-        o_all = o_all.reshape(-1, o_all.shape[-1])
-        if c_all.shape[0] != nset or o_all.shape[0] != nset:
-            raise ValueError("mo_coeff/mo_occ must be stacked like dm")
-        orbs = np.zeros((nset, nao, nao))
-        signs = np.zeros((nset, nao))
-        ms = np.zeros(nset, dtype=np.int64)
-        for s in range(nset):
-            occ = o_all[s] > 0
-            m = int(occ.sum())
-            orbs[s, :, :m] = c_all[s][:, occ] * np.sqrt(o_all[s][occ])
-            signs[s, :m] = 1.0
-            ms[s] = m
+        orbs, ms, signs = _occupied_factors(nset, nao, mo_coeff, mo_occ)
     if block_mb is None:
         block_mb = df_block_mb()
     path, prefix = blas_args(nao)
@@ -281,6 +265,89 @@ def df_jk(cderi, dm, mo_coeff=None, mo_occ=None, with_j=True, with_k=True, block
         cderi, dms, orbs, ms, signs, vj, vk, bool(with_j), bool(with_k), int(block_mb), float(fact_tol),
         path, prefix, seq_path, seq_prefix,
     )
+    vj = vj.reshape(dm_in.shape) if with_j else None
+    vk = vk.reshape(dm_in.shape) if with_k else None
+    return vj, vk
+
+
+def _occupied_factors(nset, nao, mo_coeff, mo_occ):
+    """``(orbs, ms, signs)`` of the DF exchange kernel from pyscf's orbital tags: the occupied orbitals of
+    each set scaled by sqrt(occ), zero-padded to (nset, nao, nao)."""
+    if mo_occ is None:
+        raise ValueError("mo_occ is required with mo_coeff")
+    c_all = np.asarray(mo_coeff, dtype=np.float64)
+    o_all = np.asarray(mo_occ, dtype=np.float64)
+    c_all = c_all.reshape(-1, c_all.shape[-2], c_all.shape[-1])
+    o_all = o_all.reshape(-1, o_all.shape[-1])
+    if c_all.shape[0] != nset or o_all.shape[0] != nset:
+        raise ValueError("mo_coeff/mo_occ must be stacked like dm")
+    orbs = np.zeros((nset, nao, nao))
+    signs = np.zeros((nset, nao))
+    ms = np.zeros(nset, dtype=np.int64)
+    for s in range(nset):
+        occ = o_all[s] > 0
+        m = int(occ.sum())
+        orbs[s, :, :m] = c_all[s][:, occ] * np.sqrt(o_all[s][occ])
+        signs[s, :m] = 1.0
+        ms[s] = m
+    return orbs, ms, signs
+
+
+def _eigen_factors(dms, fact_tol):
+    """``(orbs, ms, signs)`` of symmetric densities without orbital tags, D_s = sum_k signs_k c_k c_k^T with
+    c_k = v_k sqrt|w_k| over the eigenpairs with |w_k| > ``fact_tol`` max|w| (the kernel's own
+    factorisation, done once here for all blocks of a tensor read from disk)."""
+    nset, nao, _ = dms.shape
+    orbs = np.zeros((nset, nao, nao))
+    signs = np.zeros((nset, nao))
+    ms = np.zeros(nset, dtype=np.int64)
+    for s in range(nset):
+        w, v = np.linalg.eigh(dms[s])
+        keep = np.abs(w) > fact_tol * np.abs(w).max(initial=0.0)
+        m = int(keep.sum())
+        orbs[s, :, :m] = v[:, keep] * np.sqrt(np.abs(w[keep]))
+        signs[s, :m] = np.sign(w[keep])
+        ms[s] = m
+    return orbs, ms, signs
+
+
+def df_jk_blocks(blocks, dm, mo_coeff=None, mo_occ=None, with_j=True, with_k=True, block_mb=None, fact_tol=1e-14):
+    """:func:`df_jk` summed over blocks of auxiliary functions.
+
+    ``blocks`` yields ``(naux_b, npair)`` pieces of the DF tensor (pyscf's
+    ``DF.loop`` for a tensor stored on disk); J and K are sums over the
+    auxiliary functions.  The densities are factorised once for all blocks
+    (through their orbitals with ``mo_coeff``/``mo_occ``).
+    """
+    dm_in = np.asarray(dm, dtype=np.float64)
+    dms = np.ascontiguousarray(dm_in.reshape(-1, dm_in.shape[-1], dm_in.shape[-1]))
+    nset, nao, _ = dms.shape
+    orbs = ms = signs = None
+    if with_k:
+        if mo_coeff is not None:
+            orbs, ms, signs = _occupied_factors(nset, nao, mo_coeff, mo_occ)
+        else:
+            orbs, ms, signs = _eigen_factors(dms, fact_tol)
+    if block_mb is None:
+        block_mb = df_block_mb()
+    path, prefix = blas_args(nao)
+    seq_path, seq_prefix = worker_blas()
+    vj = np.zeros((nset, nao, nao))
+    vk = np.zeros((nset, nao, nao))
+    bj = np.empty_like(vj)
+    bk = np.empty_like(vk)
+    for blk in blocks:
+        blk = _c(blk)
+        if blk.ndim != 2 or blk.shape[1] != nao * (nao + 1) // 2:
+            raise ValueError("DF blocks must have shape (naux_b, nao*(nao+1)//2)")
+        get_extension().df_jk(
+            blk, dms, orbs, ms, signs, bj, bk, bool(with_j), bool(with_k), int(block_mb), float(fact_tol),
+            path, prefix, seq_path, seq_prefix,
+        )
+        if with_j:
+            vj += bj
+        if with_k:
+            vk += bk
     vj = vj.reshape(dm_in.shape) if with_j else None
     vk = vk.reshape(dm_in.shape) if with_k else None
     return vj, vk

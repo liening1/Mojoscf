@@ -76,6 +76,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_hess2e]("hess2e", docstring="hess2e(basis, table, dmj, dmk, jfac, kfac, tol, hess, omega): second derivatives (natm, natm, 3, 3) of the two-electron energy at fixed densities.")
         m.def_function[py_grad2e]("grad2e", docstring="grad2e(basis, table, dmj, dmk, jfac, kfac, tol, de, omega): two-electron energy gradient (natm, 3) (omega > 0: erf(omega r) / r).")
         m.def_function[py_int3c2e_block]("int3c2e_block", docstring="int3c2e_block(basis, auxbasis, table, s0, s1, out): (ab|P) for the auxiliary shells [s0, s1), (np, npair).")
+        m.def_function[py_int3c2e_cols]("int3c2e_cols", docstring="int3c2e_cols(basis, auxbasis, table, a0, a1, out, omega): (ab|P) for the AO pairs (i, j <= i) with i in the AO shells [a0, a1): the pack_tril columns [c0, c1) as (naux, c1 - c0).")
         m.def_function[py_df_grad_rhs]("df_grad_rhs", docstring="df_grad_rhs(basis, auxbasis, table, dm_tril, orbs, blk, rho, q, seq_path, seq_prefix, omega): fit right-hand sides of the DF gradient.")
         m.def_function[py_grad_df3c]("grad_df3c", docstring="grad_df3c(basis, auxbasis, table, coef, dpack, jfac, kfac, xs, cns, blk, tol, de, seq_path, seq_prefix, omega): three-centre term of the DF gradient.")
         m.def_function[py_grad2c]("grad2c", docstring="grad2c(auxbasis, table, w, de, omega): d/dR of -1/2 sum (P|Q) W_PQ.")
@@ -599,6 +600,20 @@ def py_int3c2e_block(
     var aux = _basis(auxbasis)
     var boys = _boys(table)
     int3c2e_core(bs, aux, boys, f64ptr(dst), Int(py=s0), Int(py=s1))
+    _ = bs^
+    _ = aux^
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_int3c2e_cols(
+    basis: PythonObject, auxbasis: PythonObject, table: PythonObject, a0: PythonObject, a1: PythonObject,
+    dst: PythonObject, omega: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var aux = _basis(auxbasis)
+    var boys = _boys(table)
+    int3c2e_core(bs, aux, boys, f64ptr(dst), 0, -1, Float64(py=omega), Int(py=a0), Int(py=a1))
     _ = bs^
     _ = aux^
     _ = boys^

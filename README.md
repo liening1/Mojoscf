@@ -266,6 +266,28 @@ gradients.
   spins in one GEMM per auxiliary function (a larger M) measured no gain:
   these shapes run at about 54 GFLOPS per core in OpenBLAS whether 94, 186 or
   372 orbitals are transformed.
+* **DF tensors on disk.**  pyscf keeps the DF tensor in an HDF5 file when it
+  does not fit in 90% of `max_memory` (4000 MB by default; Fe(II)
+  porphine/def2-TZVP needs about 7 GB) or when a file is named in
+  `with_df._cderi_to_save`, and then reads it block by block in every J/K
+  build.  mojoscf builds that file with the Mojo integrals (blocks of AO
+  shells, `integrals.int3c2e_cols`, written as the columns of one contiguous
+  dataset, the layout of pyscf's `_compatible_format`) and maps it into
+  memory when it fits in the memory the system has available: the page
+  cache then holds it (pyscf's `max_memory` does not count the page cache),
+  and the native loop and the response, stability and Hessian kernels read
+  it as an in-memory tensor.  Larger files, and pyscf's own block-format
+  files, are streamed through the J/K kernel (`kernels.df_jk_blocks`, each
+  block read while the previous one is processed).  Ferrocene/def2-TZVP with
+  `max_memory=1000`: building the file 5.1 s (pyscf) against 2.9 s, one J/K
+  2.05 s against 0.50 s, the SCF 33.0 s against 7.4 s (4.5x, as with the
+  tensor in memory; streaming instead of mapping: 21.8 s).
+* **The DF object.**  The `with_df` of accelerated objects (and of
+  `mojoscf.RHF(mol).density_fit()`) is a `mojoscf.dft.MojoDF`, pyscf's
+  `df.DF` whose `get_jk` runs the Mojo kernel (in memory, mapped or
+  streamed), so pyscf code that calls the DF object directly, such as the
+  orbital-Hessian steps of DF-CASSCF (`mcscf.CASSCF` of a density-fitted
+  reference), gets it too.
 * **Segmented basis sets** (def2) consist largely of single-primitive shells,
   where vectorising over the primitive quartets of one shell quartet leaves
   most SIMD lanes empty.  The drivers therefore batch kets as SIMD lanes
@@ -1147,11 +1169,11 @@ but slow for more than a few dozen orbitals.
 | `eig` (`x^T F x`, `dsyevd`, back-transform) | NumPy + LAPACK            | Mojo + LAPACK via `dlopen`           |
 | `get_occ`, `make_rdm1`, `energy_elec`, `get_grad`, norms | NumPy          | Mojo (+ BLAS `dgemm`)                |
 | convergence test, bookkeeping, logging       | Python                    | Mojo (log lines via one callback)    |
-| J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q GEMMs in worker threads (one BLAS thread each), threaded `dsyrk` |
+| J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q GEMMs in worker threads (one BLAS thread each), `dsyrk` updates; a tensor on disk memory-mapped or streamed block by block |
 | J/K, in-core 8-fold ERIs (`_vhf.incore`)    | C (`libcvhf`, OpenMP)     | Mojo (`_mojo/erijk.mojo`), 1.6-1.8x faster |
 | J/K, direct SCF (integrals every cycle)     | C (libcint + `libcvhf`)   | Mojo (`_mojo/directjk.mojo`): Mojo integrals, libcvhf's screening, incremental build |
 | J/K outside the SCF loop (`mf.get_jk`/`get_j`/`get_k`, hence `get_veff`, `get_fock`: CASSCF core Fock, `pyscf.prop` response equations, `newton()`) | as in the loop, pyscf's | the same Mojo kernels as in the loop (DF tensor, in-core ERIs, integral-direct) for the objects mojoscf accelerates (also ROHF/ROKS and symmetry-adapted ones); a `get_jk` of a subclass is kept |
-| two-electron integrals (3-index DF tensor, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
+| two-electron integrals (3-index DF tensor in memory or on disk, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
 | one-electron integrals (`get_hcore`, `get_ovlp`) | C (libcint)          | unchanged (`attach(mf)` uses the Mojo engine) |
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |
 | Kohn-Sham XC (`NumInt.nr_rks`/`nr_uks`, LDA/GGA/meta-GGA), with `mojoscf.dft.accelerate` | Python loop over blocks: C AO values, NumPy/C GEMMs, libxc per block | Mojo (`_mojo/numint.mojo`): two passes over the grid (densities; potential matrix) around one libxc call; screened shells per block of 128 points, SIMD AO values, per-block GEMMs; pyscf's grids and libxc |
@@ -1222,8 +1244,8 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   of the density) with symmetric real densities, and their response
   kernels; non-local correlation (`nlc`) and the grid response of the
   gradient (`grid_response = True`) use pyscf's code, as do
-  short-range-only (`omega < 0`) exchange and DF objects other than plain
-  in-core `pyscf.df.DF`.
+  short-range-only (`omega < 0`) exchange and DF objects other than pyscf's
+  plain `df.DF` (in memory or on disk).
 * **Excited states**: `mojoscf.tdscf` (what `mf.TDA()`, `mf.TDDFT()` and
   `mf.CasidaTDDFT()` of accelerated objects create) builds the response of
   RHF/UHF/RKS/UKS references with in-core density fitting or exact integrals
@@ -1244,9 +1266,12 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   direct SCF, with the same incremental update and `direct_scf_tol`
   screening).  With the Mojo integral engine (the default) energies agree
   with pyscf's to about 1e-12 Eh instead of round-off, because the integrals
-  themselves differ at the 1e-14 level.  Range separation, `only_dfj`, DF
-  tensors on disk and overridden `get_jk`/`get_veff` fall back to calling
-  `mf.get_veff`, as does direct SCF for molecules the engine does not support.
+  themselves differ at the 1e-14 level.  A DF tensor on disk is used
+  memory-mapped where it fits in the available memory.  Range separation,
+  `only_dfj`, DF tensors on disk that are streamed and overridden
+  `get_jk`/`get_veff` fall back to calling `mf.get_veff` (still with the Mojo
+  J/K where pyscf's own `get_jk` would run), as does direct SCF for molecules
+  the engine does not support.
   `mf.scf_summary["mojoscf_veff_mode"]` reports which path ran (1 = DF,
   2 = in-core ERIs, 3 = integral-direct, 0 = pyscf callback).
 * Only CDIIS is native.  EDIIS/ADIIS, DIIS objects assigned to `mf.diis`,
@@ -1275,13 +1300,14 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
 * Nuclear gradients are native for RHF and UHF, and for RKS/UKS objects
   accelerated with `mojoscf.dft.accelerate` (LDA, GGA, meta-GGA, global and
   range-separated hybrids), with exact or density-fitted
-  (in-core `pyscf.df.DF`, auxiliary-basis response included) two-electron
+  (pyscf's `df.DF`, auxiliary-basis response included; the gradient
+  recomputes its integrals, so the tensor may be on disk) two-electron
   integrals.
 * Analytical Hessians: `mf.Hessian()` of accelerated RKS/UKS objects and of
   the mojoscf RHF/UHF classes keeps pyscf's driver; the XC terms are native
   for LDA, GGA and meta-GGA, the Coulomb/exchange terms and the CPHF
-  operator for density-fitted references (in-core `pyscf.df.DF`,
-  `auxbasis_response = 2`) and exact integrals (in-core or
+  operator for density-fitted references (pyscf's `df.DF` with the tensor
+  in memory or memory-mapped, `auxbasis_response = 2`) and exact integrals (in-core or
   integral-direct), global and range-separated hybrids; NLC, solvent
   models, objects with their own `get_jk` and short-range operators with
   omega < 0 run pyscf's code for the parts they touch.

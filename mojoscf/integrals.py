@@ -13,6 +13,7 @@ the corresponding ``mol.intor`` calls (which use libcint):
 ``int3c2e(mol, aux)``   ``df.incore.aux_e2(mol, aux, aosym="s2ij").T``
 ``int2c2e(aux)``        ``aux.intor("int2c2e")``
 ``cholesky_eri(mol)``   ``df.incore.cholesky_eri(mol, ...)``
+``cholesky_eri_h5``     ``df.outcore.cholesky_eri(mol, file, ...)``
 ======================  =============================================
 
 Spherical and Cartesian (``mol.cart``) basis sets are supported for angular
@@ -44,8 +45,10 @@ __all__ = [
     "int2e_s8",
     "int2e",
     "int3c2e",
+    "int3c2e_cols",
     "int2c2e",
     "cholesky_eri",
+    "cholesky_eri_h5",
     "attach",
     "build_df",
     "get_jk",
@@ -256,6 +259,18 @@ def int3c2e(mol, auxmol, omega=None):
     return out
 
 
+def int3c2e_cols(mol, auxmol, a0, a1, omega=None):
+    """The columns of :func:`int3c2e` for the AO pairs (i, j <= i) with i in the shells [a0, a1): the
+    ``pack_tril`` columns [c0, c1), c = i (i + 1) / 2 for the first AO i of ``a0`` and of ``a1``."""
+    omega = _omega(mol, omega)
+    loc = mol.ao_loc_nr()
+    c0, c1 = loc[a0] * (loc[a0] + 1) // 2, loc[a1] * (loc[a1] + 1) // 2
+    out = np.empty((auxmol.nao_nr(), c1 - c0))
+    get_extension().int3c2e_cols(basis_tables(mol, allow_omega=True), basis_tables(auxmol, allow_omega=True),
+                                 _boys_table(), int(a0), int(a1), out, omega)
+    return out
+
+
 def int2c2e(auxmol, omega=None):
     """``(P|Q)`` as a dense ``(naux, naux)`` matrix (``omega`` as in :func:`int3c2e`)."""
     omega = _omega(auxmol, omega)
@@ -304,12 +319,70 @@ def cholesky_eri(mol, auxbasis="weigend+etb", auxmol=None, lindep=None, omega=No
         return lib.dot(v.T, j3c)
 
 
-def build_df(with_df) -> bool:
-    """Build ``with_df._cderi`` in core with the Mojo engine, as ``pyscf.df.DF.build`` would.
+def cholesky_eri_h5(mol, erifile, auxmol=None, auxbasis="weigend+etb", dataname="j3c", max_memory=2000,
+                    lindep=None, omega=None):
+    """pyscf's DF tensor on disk with the integrals from the Mojo engine; returns ``erifile``.
 
-    Follows pyscf's decision: only when the tensor fits in 90% of the free
-    memory and no file storage was requested.  Returns False (leaving the
-    object untouched) otherwise, or when the molecule is not supported.
+    One contiguous ``(naux, npair)`` HDF5 dataset ``dataname``, the layout of
+    ``pyscf.df.outcore.cholesky_eri`` (``DF._compatible_format``), which
+    ``DF.loop`` reads and which can be memory-mapped (:func:`mojoscf.dft.ondisk_tensor`).
+    Each block of AO shells is computed (:func:`int3c2e_cols`), transformed
+    with the Cholesky factor of the metric (or its eigen-decomposition, as
+    :func:`cholesky_eri`) and written as its columns; ``max_memory`` (MB)
+    bounds the block.
+    """
+    import scipy.linalg
+    from pyscf.df.incore import LINEAR_DEP_THR
+    from pyscf.df.outcore import _create_h5file
+    from scipy.linalg import blas as sblas
+
+    if auxmol is None:
+        auxmol = df_addons.make_auxmol(mol, auxbasis)
+    if lindep is None:
+        lindep = LINEAR_DEP_THR
+    omega = _omega(mol, omega)
+    j2c = int2c2e(auxmol, omega)
+    low = eig = None
+    try:
+        low = scipy.linalg.cholesky(j2c, lower=True)
+    except scipy.linalg.LinAlgError:
+        w, v = scipy.linalg.eigh(j2c)
+        keep = w > lindep
+        eig = v[:, keep] / np.sqrt(w[keep])
+    j2c = None
+    naux = auxmol.nao_nr()
+    loc = mol.ao_loc_nr()
+    first = loc * (loc + 1) // 2                     # first pack_tril column of each shell (and the end)
+    ncol_max = max(int(max(max_memory, 200) * 0.12e6 / 8 / naux), 1)   # integrals and result of a block
+    feri = _create_h5file(erifile, dataname)
+    try:
+        dset = feri.create_dataset(dataname, (naux if eig is None else eig.shape[1], first[-1]), "f8")
+        a0 = 0
+        while a0 < mol.nbas:
+            a1 = a0 + 1
+            while a1 < mol.nbas and first[a1 + 1] - first[a0] <= ncol_max:
+                a1 += 1
+            j3c = int3c2e_cols(mol, auxmol, a0, a1, omega)
+            if low is not None:
+                dat = sblas.dtrsm(1.0, low, j3c.T, side=1, lower=1, trans_a=1, overwrite_b=1).T
+            else:
+                dat = lib.dot(eig.T, j3c)
+            dset[:, first[a0]:first[a1]] = dat
+            j3c = dat = None
+            a0 = a1
+    finally:
+        feri.close()
+    return erifile
+
+
+def build_df(with_df) -> bool:
+    """Build ``with_df._cderi`` with the Mojo engine where ``pyscf.df.DF.build`` would build it.
+
+    Follows pyscf's decision: in core when the tensor fits in 90% of the free
+    memory and no file was named in ``_cderi_to_save``, otherwise on disk
+    (:func:`cholesky_eri_h5`, in that file or a temporary one, as pyscf).
+    Returns False (leaving the object untouched) when the molecule is not
+    supported and for long-range tensors that do not fit in memory.
     """
     from pyscf import lib as pyscf_lib
 
@@ -320,8 +393,6 @@ def build_df(with_df) -> bool:
         return False
     if unsupported_reason(mol, two_electron=True, allow_omega=omega > 0) is not None or engine() != "mojo":
         return False
-    if isinstance(getattr(with_df, "_cderi_to_save", None), str):
-        return False
     auxmol = with_df.auxmol
     if auxmol is None:
         auxmol = df_addons.make_auxmol(mol, with_df.auxbasis)
@@ -329,10 +400,20 @@ def build_df(with_df) -> bool:
         return False
     nao = mol.nao_nr()
     max_memory = with_df.max_memory - pyscf_lib.current_memory()[0]
-    if nao * (nao + 1) // 2 * auxmol.nao_nr() * 8 / 1e6 >= 0.9 * max_memory:
+    named = isinstance(getattr(with_df, "_cderi_to_save", None), str)
+    if nao * (nao + 1) // 2 * auxmol.nao_nr() * 8 / 1e6 < 0.9 * max_memory and not named:
+        with_df.auxmol = auxmol
+        with_df._cderi = cholesky_eri(mol, auxmol=auxmol, omega=omega)
+        return True
+    if omega:
         return False
+    if with_df._cderi_to_save is None:
+        with_df._cderi_to_save = pyscf_lib.NamedTemporaryFile(dir=pyscf_lib.param.TMPDIR)
+    cderi = with_df._cderi_to_save
+    cholesky_eri_h5(mol, cderi if named else cderi.name, auxmol=auxmol, dataname=with_df._dataname,
+                    max_memory=max_memory)
     with_df.auxmol = auxmol
-    with_df._cderi = cholesky_eri(mol, auxmol=auxmol, omega=omega)
+    with_df._cderi = cderi
     return True
 
 

@@ -217,3 +217,20 @@ def test_large_l_against_small_l_pairs():
     )
     eri = mi.int2e_s8(mol, schwarz_tol=0.0)
     assert abs(eri - mol.intor("int2e", aosym="s8")).max() < 1e-12
+
+
+def test_int3c2e_column_blocks():
+    """(ab|P) for AO-shell ranges (the pack_tril column blocks the on-disk DF tensor is built from)."""
+    from pyscf.df import addons
+
+    mol = _mol("def2-svp")
+    auxmol = addons.make_auxmol(mol, "def2-universal-jkfit")
+    full = mi.int3c2e(mol, auxmol)
+    loc = mol.ao_loc_nr()
+    for a0, a1 in ((0, mol.nbas), (0, 1), (3, 7), (mol.nbas - 2, mol.nbas)):
+        c0, c1 = loc[a0] * (loc[a0] + 1) // 2, loc[a1] * (loc[a1] + 1) // 2
+        blk = mi.int3c2e_cols(mol, auxmol, a0, a1)
+        assert blk.shape == (auxmol.nao_nr(), c1 - c0)
+        assert abs(blk - full[:, c0:c1]).max() < 1e-14
+    lr = mi.int3c2e(mol, auxmol, 0.3)
+    assert abs(mi.int3c2e_cols(mol, auxmol, 2, 9, omega=0.3) - lr[:, loc[2] * (loc[2] + 1) // 2:loc[9] * (loc[9] + 1) // 2]).max() < 1e-14
