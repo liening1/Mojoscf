@@ -70,7 +70,10 @@ def ontop_pair_density(mol, coords, mo_cas, cascm2, deriv=0):
 def ontop_densities(mol, coords, kind, mo_core, mo_cas, casdm1s, cascm2, pi_deriv=0):
     """In one Mojo pass: the spin densities (2, 1 or 4, ngrid) of mo_core mo_core^T + mo_cas casdm1s[s]
     mo_cas^T (``kind`` 0 LDA, 1 GGA: with gradients), the on-top pair density (1 or 4, ngrid) with the
-    cumulant ``cascm2`` (its gradient for ``pi_deriv`` 1, which needs ``kind`` 1) and the core density."""
+    cumulant ``cascm2`` (its gradient for ``pi_deriv`` 1, which needs ``kind`` 1) and the core density.
+    With ``casdm1s`` (nst, 2, ncas, ncas) and ``cascm2`` (nst, ncas, ncas, ncas, ncas) the same for nst
+    states at once (leading axis nst on the densities and Pi), the AO values and the core density
+    computed once."""
     if kind not in (0, 1) or (pi_deriv and kind != 1):
         raise ValueError(f"kind {kind}, pi_deriv {pi_deriv}")
     coords = np.ascontiguousarray(coords, dtype=np.float64).reshape(-1, 3)
@@ -78,16 +81,22 @@ def ontop_densities(mol, coords, kind, mo_core, mo_cas, casdm1s, cascm2, pi_deri
     ncas = mo_cas.shape[1]
     ngrid = coords.shape[0]
     nao = mol.nao_nr()
+    casdm1s = np.asarray(casdm1s, dtype=np.float64)
+    single = casdm1s.ndim == 3
+    dma = np.ascontiguousarray(casdm1s.reshape(-1, 2, ncas, ncas))
+    nst = dma.shape[0]
+    cm2 = np.asarray(cascm2, dtype=np.float64).reshape(nst, ncas * ncas, ncas * ncas)
+    lt = np.ascontiguousarray(cm2.transpose(0, 2, 1))
     has_core = mo_core.shape[1] > 0
     dmc = np.ascontiguousarray(mo_core @ mo_core.T * 2) if has_core else np.zeros((nao, nao))
-    lt = np.ascontiguousarray(np.asarray(cascm2, dtype=np.float64).reshape(ncas * ncas, ncas * ncas).T)
-    rho = np.empty((2, (1, 4)[kind], ngrid))
-    pi = np.empty(((1, 4)[pi_deriv], ngrid))
+    rho = np.empty((nst, 2, (1, 4)[kind], ngrid))
+    pi = np.empty((nst, (1, 4)[pi_deriv], ngrid))
     rhoc = np.empty(ngrid)
     path, prefix = worker_blas()
-    get_extension().ontop_density(integrals.basis_tables(mol), coords, int(kind), int(has_core), dmc, mo_cas,
-                                  np.ascontiguousarray(casdm1s, dtype=np.float64).reshape(2, ncas, ncas), lt,
+    get_extension().ontop_density(integrals.basis_tables(mol), coords, int(kind), int(has_core), dmc, mo_cas, dma, lt,
                                   int(pi_deriv), rho, pi, rhoc, path, prefix)
+    if single:
+        return rho[0], pi[0], rhoc
     return rho, pi, rhoc
 
 
@@ -123,14 +132,24 @@ def _ot_grid(ot):
     return coords, weights
 
 
+def _state_key(casdm1s, casdm2, mo_coeff):
+    return hash((np.asarray(casdm1s).tobytes(), np.asarray(casdm2).tobytes(), np.asarray(mo_coeff).tobytes()))
+
+
 def energy_ot(ot, casdm1s, casdm2, mo_coeff, ncore, max_memory=2000, hermi=1):
     """pyscf's ``otfnal.energy_ot`` (the on-top energy of one state) with the spin densities and the
     on-top pair density from the Mojo kernels and the translated functional evaluated once on the
-    whole grid."""
+    whole grid; energies computed ahead for all states (:func:`prefetch_energies`) are taken from
+    ``ot``."""
     from pyscf.mcpdft import _dms
 
     if ot.xctype == "HF":
         return 0.0
+    cache = getattr(ot, "_mojoscf_eot", None)
+    if cache:
+        e = cache.pop(_state_key(casdm1s, casdm2, mo_coeff), None)
+        if e is not None:
+            return e
     if not _mojo_ok(ot, casdm1s, casdm2, mo_coeff, hermi):
         return _orig["energy_ot"](ot, casdm1s, casdm2, mo_coeff, ncore, max_memory=max_memory, hermi=hermi)
     mol = ot.mol
@@ -150,6 +169,32 @@ def energy_ot(ot, casdm1s, casdm2, mo_coeff, ncore, max_memory=2000, hermi=1):
             pi[1:4] += rho[0, 1:4] * rho[1, 0] + rho[0, 0] * rho[1, 1:4]
     eot = ot.eval_ot(rho, pi, dderiv=0, weights=weights)[0]
     return float(np.dot(eot, weights))
+
+
+def prefetch_energies(mc, mo_coeff, ci):
+    """The on-top energies of all states of ``mc`` in one Mojo pass (the AO values, the core density and
+    the active orbitals once; per state the active densities and the cumulant), kept on ``mc.otfnal``
+    for the per-state calls of :func:`energy_ot` that pyscf's ``compute_pdft_energy_`` makes next."""
+    from pyscf.mcpdft import _dms
+
+    ot = mc.otfnal
+    nroots = getattr(mc.fcisolver, "nroots", 1)
+    kind = dft._KINDS.get(ot.xctype)
+    if nroots < 2 or kind is None or kind > 1 or ot.xctype == "HF":
+        return
+    dm1s = [np.asarray(mc.make_one_casdm1s(ci, state=i)) for i in range(nroots)]
+    dm2 = [np.asarray(mc.make_one_casdm2(ci, state=i)) for i in range(nroots)]
+    if not all(_mojo_ok(ot, a, b, mo_coeff, 1) for a, b in zip(dm1s, dm2)):
+        return
+    ncore, ncas = mc.ncore, mc.ncas
+    cm2 = np.stack([_dms.dm2_cumulant(b, a) for a, b in zip(dm1s, dm2)])
+    coords, weights = _ot_grid(ot)
+    rho, pi, _ = ontop_densities(ot.mol, coords, kind, mo_coeff[:, :ncore], mo_coeff[:, ncore:ncore + ncas],
+                                 np.stack(dm1s), cm2, ot.Pi_deriv)
+    ot._mojoscf_eot = {
+        _state_key(a, b, mo_coeff): float(np.dot(ot.eval_ot(rho[i], pi[i], dderiv=0, weights=weights)[0], weights))
+        for i, (a, b) in enumerate(zip(dm1s, dm2))
+    }
 
 
 def _grad_ok(ot, mol) -> bool:
@@ -422,13 +467,16 @@ _orig = {}
 
 
 def install():
-    """Replace pyscf's ``otfnal.energy_ot``, ``pdft_veff.kernel`` and
-    ``grad.mcpdft.mcpdft_HellmanFeynman_grad`` (idempotent); the originals stay as ``_mojoscf_orig``."""
+    """Replace pyscf's ``otfnal.energy_ot``, ``pdft_veff.kernel``, ``grad.mcpdft.mcpdft_HellmanFeynman_grad``
+    and wrap ``mcpdft._PDFT.compute_pdft_energy_`` (:func:`prefetch_energies`) (idempotent); the originals
+    stay as ``_mojoscf_orig``."""
     from pyscf.grad import mcpdft as mcpdft_grad
+    from pyscf.mcpdft import mcpdft as mcpdft_mod
     from pyscf.mcpdft import otfnal, pdft_veff
 
     _patch_otfnal(otfnal)
     _patch_veff(pdft_veff)
+    _patch_mcpdft(mcpdft_mod)
     _patch_grad(mcpdft_grad)
 
 
@@ -442,6 +490,30 @@ def _patch_otfnal(otfnal):
 
     mojo_energy_ot._mojoscf_orig = _orig["energy_ot"]
     otfnal.otfnal.energy_ot = mojo_energy_ot
+
+
+def _patch_mcpdft(mcpdft_mod):
+    cls = mcpdft_mod._PDFT
+    fn = cls.compute_pdft_energy_
+    if getattr(fn, "_mojoscf_orig", None) is not None:
+        return
+
+    def compute_pdft_energy_(self, mo_coeff=None, ci=None, ot=None, otxc=None, grids_level=None, grids_attr=None,
+                             dump_chk=True, verbose=None, **kwargs):
+        if ot is None and otxc is None and grids_level is None and not grids_attr:
+            try:
+                prefetch_energies(self, self.mo_coeff if mo_coeff is None else mo_coeff, self.ci if ci is None else ci)
+            except Exception:
+                self.otfnal._mojoscf_eot = None
+        try:
+            return fn(self, mo_coeff=mo_coeff, ci=ci, ot=ot, otxc=otxc, grids_level=grids_level, grids_attr=grids_attr,
+                      dump_chk=dump_chk, verbose=verbose, **kwargs)
+        finally:
+            self.otfnal._mojoscf_eot = None
+
+    compute_pdft_energy_.__doc__ = fn.__doc__
+    compute_pdft_energy_._mojoscf_orig = fn
+    cls.compute_pdft_energy_ = compute_pdft_energy_
 
 
 def _patch_veff(pdft_veff):
@@ -470,7 +542,7 @@ def _patch_grad(mcpdft_grad):
 
 
 _TARGETS = {"pyscf.mcpdft.otfnal": _patch_otfnal, "pyscf.mcpdft.pdft_veff": _patch_veff,
-            "pyscf.grad.mcpdft": _patch_grad}
+            "pyscf.mcpdft.mcpdft": _patch_mcpdft, "pyscf.grad.mcpdft": _patch_grad}
 
 
 class _InstallOnImport(importlib.abc.MetaPathFinder):

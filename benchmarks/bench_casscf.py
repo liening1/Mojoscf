@@ -20,10 +20,13 @@ CASCI on the state-averaged orbitals (DF integrals from
 the nuclear gradient of the state-specific CASSCF of the lowest state
 (``mc.nuc_grad_method()``: :class:`mojoscf.casscf.Gradients` for mojoscf);
 ``--sa-grad`` adds the state-averaged gradient of the lowest state after
-the state-averaged CASSCF.  Usage:
+the state-averaged CASSCF.  ``--pdft`` instead runs MC-PDFT (``mcpdft.CASSCF``
+with the tPBE on-top functional) on the same state-averaged CASSCF: the
+CASSCF, the MC-PDFT energies of all states and the MC-PDFT gradient of the
+lowest state (:mod:`mojoscf.mcpdft` for mojoscf).  Usage:
 
     python benchmarks/bench_casscf.py [--cases a,b,...] [--heavy] [--tuned-pyscf] [--nevpt2] [--sa-grad] [--grad]
-                                      [--list]
+                                      [--pdft] [--list]
 """
 from __future__ import annotations
 
@@ -72,6 +75,19 @@ if %(grad)r:
                           nao=mol.nao_nr(), conv=bool(mc.converged))))
     sys.exit()
 nstates = %(nstates)d
+if %(pdft)r:
+    from pyscf import mcpdft
+    mc = mcpdft.CASSCF(mf, "tPBE", ncas, nelecas)
+    if nstates > 1:
+        mc = mc.state_average_([1.0 / nstates] * nstates)
+    mc.conv_tol = 1e-8
+    t0 = time.perf_counter(); mc.optimize_mcscf_(mo); tcas = time.perf_counter() - t0
+    t0 = time.perf_counter(); mc.compute_pdft_energy_(dump_chk=False); tpdft = time.perf_counter() - t0
+    epdft = [float(e) for e in mc.e_states]
+    t0 = time.perf_counter(); de = mc.nuc_grad_method().kernel(state=0); tpgrad = time.perf_counter() - t0
+    print(json.dumps(dict(tscf=tscf, tcas=tcas, tpdft=tpdft, tpgrad=tpgrad, epdft=epdft, de=de.tolist(),
+                          ncas=int(ncas), nelecas=int(nelecas), nao=mol.nao_nr(), conv=bool(mc.converged))))
+    sys.exit()
 mc = mcscf.CASSCF(mf, ncas, nelecas)
 if nstates > 1:
     mc = mc.state_average_([1.0 / nstates] * nstates)
@@ -97,11 +113,11 @@ print(json.dumps(dict(tscf=tscf, tcas=tcas, ecas=mc.e_tot, ncas=int(ncas), nelec
 '''
 
 
-def run(case, driver, bench_dir, env=None, nevpt2=False, grad=False, sa_grad=False):
+def run(case, driver, bench_dir, env=None, nevpt2=False, grad=False, sa_grad=False, pdft=False):
     _, atoms, basis, charge, spin, ao_labels, nstates = CASES[case]
     code = WORKER % dict(bench_dir=bench_dir, atoms=atoms, basis=basis, charge=charge, spin=spin,
                          ao_labels=ao_labels, nstates=nstates, driver=driver, nevpt2=nevpt2, grad=grad,
-                         sa_grad=sa_grad)
+                         sa_grad=sa_grad, pdft=pdft)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env=None if env is None else {**os.environ, **env})
     if out.returncode != 0:
@@ -118,6 +134,7 @@ def main():
     ap.add_argument("--nevpt2", action="store_true", help="also time NEVPT2 of the three lowest states")
     ap.add_argument("--grad", action="store_true", help="time the state-specific CASSCF gradient instead")
     ap.add_argument("--sa-grad", action="store_true", help="also time the state-averaged gradient of state 0")
+    ap.add_argument("--pdft", action="store_true", help="time MC-PDFT (tPBE) energies and gradient instead")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list:
@@ -140,6 +157,26 @@ def main():
             cas = f"({ref['nelecas']},{ref['ncas']})"
             print(f"{CASES[key][0]:38s} {ref['nao']:4d} {cas:>7s} | {ref['tgrad']:10.1f}{tcol} {moj['tgrad']:8.1f} "
                   f"{ref['tgrad'] / moj['tgrad']:4.1f}x | {dg:8.1e} {gmax:7.1e}", flush=True)
+        return
+    if args.pdft:
+        print(f"{'system':38s} {'nao':>4s} {'CAS':>7s} {'SA':>3s} | {'CASSCF pyscf':>12s}{tuned} {'mojoscf':>8s} "
+              f"{'x':>5s} | {'PDFT E pyscf':>12s}{tuned} {'mojoscf':>8s} {'x':>5s} {'|dE|':>7s} | "
+              f"{'PDFT grad pyscf':>15s}{tuned} {'mojoscf':>8s} {'x':>5s} {'max|dg|':>8s}")
+        for key in keys:
+            ref = run(key, "pyscf", bench_dir, pdft=True)
+            tun = run(key, "pyscf", bench_dir, {"OPENBLAS_THREAD_TIMEOUT": "16"}, pdft=True) if args.tuned_pyscf else None
+            moj = run(key, "mojoscf", bench_dir, pdft=True)
+            cas = f"({ref['nelecas']},{ref['ncas']})"
+            flag = "" if ref["conv"] and moj["conv"] else "  NOT CONVERGED"
+            de = max(abs(a - b) for a, b in zip(ref["epdft"], moj["epdft"]))
+            dg = max(abs(a - b) for ra, rb in zip(ref["de"], moj["de"]) for a, b in zip(ra, rb))
+
+            def col(k, width):
+                tcol = f" {tun[k]:7.1f}" if tun else ""
+                return f"{ref[k]:{width}.1f}{tcol} {moj[k]:8.1f} {ref[k] / moj[k]:4.1f}x"
+
+            print(f"{CASES[key][0]:38s} {ref['nao']:4d} {cas:>7s} {CASES[key][6]:3d} | {col('tcas', 12)} | "
+                  f"{col('tpdft', 12)} {de:7.1e} | {col('tpgrad', 15)} {dg:8.1e}{flag}", flush=True)
         return
     nev = f" | {'NEVPT2 pyscf':>12s}{tuned} {'mojoscf':>8s} {'x':>5s} {'|dE2|':>7s}" if args.nevpt2 else ""
     nev += f" | {'SA grad pyscf':>13s}{tuned} {'mojoscf':>8s} {'x':>5s} {'max|dg|':>8s}" if args.sa_grad else ""

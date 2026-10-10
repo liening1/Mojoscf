@@ -109,11 +109,16 @@ def test_energy_ot_matches_pyscf(o2, otxc):
         assert abs(e - e0) < 1e-9, (otxc, state, e, e0)
 
 
-def test_mcpdft_energies(o2_pdft):
+def test_mcpdft_energies(o2_pdft, monkeypatch):
     """mcpdft.CASSCF on the accelerated reference: the same MC-PDFT state energies as pyscf's on-top
-    code on the same CASSCF solution."""
+    code on the same CASSCF solution, all states from one density pass."""
     mc = o2_pdft
+    calls = []
+    orig = mpdft.ontop_densities
+    monkeypatch.setattr(mpdft, "ontop_densities", lambda *a, **k: calls.append(1) or orig(*a, **k))
     mc.compute_pdft_energy_()
+    assert len(calls) == 1 and not mc.otfnal._mojoscf_eot
+    monkeypatch.undo()
     e = np.asarray(mc.e_states)
     with pytest.MonkeyPatch.context() as m:
         m.setattr(otfnal.otfnal, "energy_ot", _orig_energy_ot())
