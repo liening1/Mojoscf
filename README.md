@@ -363,18 +363,30 @@ accelerated reference two of its parts come from `mojoscf.casscf`:
   papa = (pu|qv) with the active orbitals u, v: 3.6 s per macro iteration
   for [Fe(H2O)6]2+/def2-SVP, a sixth of its time.  mojoscf transforms once
   with the Mojo kernel and keeps (Q|pq) in memory for the macro iteration
-  (naux nmo^2 doubles, 0.23 GB here) when it fits in `max_memory`; `j_pc`,
-  `k_pc`, `ppaa`, `papa` and the core potential (2J - K of the core
-  density, in the MO basis) come from it: 0.5 s.
+  (naux nmo^2 doubles, 0.23 GB here) when it fits in `max_memory`.  The
+  same pass (`kernels.casscf_mo`) forms `j_pc`, `k_pc` and the core
+  potential (2J - K of the core density, in the MO basis; K as a rank-ncore
+  SYRK of each B_Q while it is in cache), `ppaa` and `papa` come from the
+  kept tensor: 0.34 s.  Within a CASSCF `kernel` each macro iteration's
+  tensor reuses the memory of the previous one: pyscf drops its integrals
+  before it builds the next, but under Python < 3.13 the `locals()`
+  snapshots it hands to its schedulers keep them alive, so a second tensor
+  would be allocated (twice the memory, and on the 3.3 GB tensor of iron
+  porphyrin/def2-SVP the fresh pages cost 1 to 2 s per macro iteration).
 * **The J/K of the orbital-Hessian steps** (`update_jk_in_ah`), two thirds
   of pyscf's time.  pyscf builds Coulomb and exchange matrices in the AO
   basis for two densities of rank 2 ncore and 2 ncore + 2 ncas (1.1 s per
   step with `df_jk.get_jk`, 0.2 s with the Mojo DF kernel) and keeps only
   the active rows of the first and the core-noncore block of the second.
-  mojoscf computes just these rows in the MO basis from the kept tensor: J
-  from rho_Q = sum_rs B_Q,rs X_rs, K as sum_Q (B_Q[rows] X) B_Q with per-Q
-  GEMMs in worker threads on views of the tensor (`kernels.df_sandwich`):
-  62 ms per step.
+  mojoscf computes just these rows in the MO basis from the kept tensor,
+  in one pass over it (`kernels.casscf_ah`).  The first density has only
+  the core-noncore blocks of the rotation R, so B_Q[occ, :] X3 is two thin
+  GEMMs with R (4 nocc ncore nvir flops instead of 2 nocc nmo^2 for a dense
+  X), the exchange rows follow with one GEMM per four auxiliary functions
+  (their B_Q[:, x] are rows of one strided matrix), the active-core block
+  from the symmetry of B X3 B, and J from rho_Q = sum_rs B_Q,rs X_rs with
+  the same B_Q: 34 ms per step (62 ms with two dense sandwich products; on
+  iron porphyrin 0.72 s instead of 1.36 s).
 
 **NEVPT2** builds its integrals with `mojoscf.casscf.nevpt2_eris`.  pyscf transforms the DF
 tensor four times (once over all orbital pairs, for `ppaa`) and stores
@@ -1426,7 +1438,7 @@ but slow for more than a few dozen orbitals.
 | TDA/TDDFT/TDHF response, exact integrals | AO transition densities through `get_jk` with `hermi=0` (`_vhf.incore` or libcint + `libcvhf` direct) and the XC kernel | in-core ERIs transformed once to (ov) x (ov) matrices (GEMMs per iteration), or J/K of all transition densities in one integral-direct pass (antisymmetric parts K only); long-range exchange from erf-attenuated Mojo integrals |
 | excited-state gradients (`pyscf.grad.tdrks`/`tduks`/`tdrhf`), exact integrals | derivative J/K of four densities (libcint `int2e_ip1`, `libcvhf`), `_contract_xc_kernel` (Python loops, AO second/third derivatives), Z-vector through `gen_response` | Mojo: the two-electron term as one 8-fold pass over the derivative integrals contracted with density pairs (`grad2e_pairs_core`, also long-range), the XC-kernel contractions in grid passes, Z-vector through the Mojo J/K and XC kernels; pyscf's driver |
 | SCF stability analysis (`mf.stability()`) | orbital Hessian one vector per Davidson call, AO densities through `gen_response` | the TDDFT operators above for all vectors of an iteration (`lib.davidson1`); pyscf's Fock blocks, preconditioner and rotation |
-| DF-CASSCF integrals and orbital Hessian (`mcscf.df._ERIS`, `update_jk_in_ah`) | per macro iteration (Q|pq) for all MO pairs written to a temporary HDF5 file and read back for `ppaa`/`papa`; two AO J/K builds per orbital-Hessian step (rank 2 ncore densities, `df_jk.get_jk`) | Mojo transform (`df_mo`), (Q|pq) kept in memory for the macro iteration: `j_pc`, `k_pc`, `ppaa`, `papa` and the core potential from it, the orbital-Hessian J/K only for the rows pyscf uses, in the MO basis (`df_sandwich` on views of the tensor); pyscf's driver, FCI solver and orbital optimiser |
+| DF-CASSCF integrals and orbital Hessian (`mcscf.df._ERIS`, `update_jk_in_ah`) | per macro iteration (Q|pq) for all MO pairs written to a temporary HDF5 file and read back for `ppaa`/`papa`; two AO J/K builds per orbital-Hessian step (rank 2 ncore densities, `df_jk.get_jk`) | Mojo transform with the core terms in the same pass (`casscf_mo`: `j_pc`, `k_pc`, the core potential with a rank-ncore SYRK per auxiliary function), (Q|pq) kept in memory for the macro iteration (its memory reused by the next one within a `kernel`) for `ppaa`, `papa`; the orbital-Hessian J/K only for the rows pyscf uses, in the MO basis in one pass (`casscf_ah`: the core-noncore structure of the rotation, the exchange rows from one GEMM per four auxiliary functions); pyscf's driver, FCI solver and orbital optimiser |
 | DF-NEVPT2 integrals (`mrpt.dfnevpt2._ERIS`) and its Sijrs, Srsi, Srs subspaces | four `with_df.ao2mo` transforms (the full (Q|pq) for `ppaa`), (cv|cv) as an (ncore nvir)^2 matrix in memory or on disk; three-index `einsum` contractions | two partial Mojo transforms ((Q|up), (Q|cv)); (pq|uv) from the AO matrices sum_Q E_Q (Q|uv), one per active pair; Sijrs from the DF factors one core orbital at a time (no (cv|cv) matrix; pairs j <= i only); the Srsi and Srs contractions as GEMMs |
 | DF-CASSCF nuclear gradient (`mc.nuc_grad_method()`, state-specific) | the DF gradient J/K of the core and active densities (libcint three-centre derivative integrals, auxiliary response) and the active 2-RDM terms (`solve_df_rdm2`, `grad_elec_dferi`, auxiliary response) in separate passes | one pass of the Mojo DF gradient kernels: in the basis of the core and active natural orbitals the Coulomb, exchange and 2-RDM terms of E2(Dc + Da) - E2(Da) + E_aa form one matrix per auxiliary function and the metric terms one W; Mojo one-electron derivative integrals; pyscf's generalized Fock matrix |
 | SA-CASSCF nuclear gradient (`mc.nuc_grad_method().kernel(state=i)` after `mc.state_average_`): the Lagrange terms (`df.grad.sacasscf.Lorb_dot_dgorb_dx`, `Lci_dot_dgci_dx`) | per term a DF gradient J/K of four (orbital term) or two (CI term) densities and one or two further passes for the active 2-RDM terms (`solve_df_rdm2`, `grad_elec_dferi`), each with its auxiliary response | one pass of the Mojo DF gradient kernels per term (`integrals.grad2e_df_terms`): Coulomb, exchange and 2-RDM terms with one rotated orbital in the basis [C_core, C_act, C_core L, C_act L] (orbital term) or with the symmetrised transition densities (CI term); pyscf's generalized Fock matrices and response solver |

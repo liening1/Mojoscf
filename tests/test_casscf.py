@@ -52,6 +52,38 @@ def test_update_jk_in_ah_matches_pyscf(o2):
     assert abs(va - va0).max() < 1e-10 and abs(vc - vc0).max() < 1e-10
 
 
+@pytest.mark.parametrize("nq,nmo,ncore,ncas", [(7, 23, 6, 4), (9, 30, 10, 6), (1, 8, 2, 2), (6, 15, 3, 12),
+                                               (5, 19, 0, 3), (4, 17, 5, 0), (3, 9, 9, 0)])
+def test_casscf_ah_kernel(nq, nmo, ncore, ncas):
+    """kernels.casscf_ah equals the dense (2J - K) rows for any core/active/virtual split (chunks of Q included)."""
+    from mojoscf import kernels
+
+    rng = np.random.default_rng(nq + nmo)
+    b = rng.standard_normal((nq, nmo, nmo))
+    b = b + b.transpose(0, 2, 1)
+    r = rng.standard_normal((nmo, nmo))
+    r = r - r.T
+    casdm1 = rng.standard_normal((ncas, ncas))
+    casdm1 = casdm1 + casdm1.T
+    nocc = ncore + ncas
+    x3 = np.zeros((nmo, nmo))
+    x3[:ncore, ncore:] = r[:ncore, ncore:]
+    x3 = x3 + x3.T
+    sa = casdm1 @ r[ncore:nocc]
+    x4 = np.zeros((nmo, nmo))
+    x4[ncore:nocc] = sa
+    x34 = 2 * x3 + x4 + x4.T
+
+    def vjk(x):
+        rho = np.einsum("qrs,rs->q", b, x)
+        return 2 * np.einsum("q,qpr->pr", rho, b) - np.einsum("qpr,rs,qst->pt", b, x, b)
+
+    v3, v34 = kernels.casscf_ah(b, ncore, ncas, r[:ncore, ncore:], sa)
+    assert v3.shape == (ncas, nmo) and v34.shape == (ncore, nmo - ncore)
+    assert np.allclose(v3, vjk(x3)[ncore:nocc], rtol=0, atol=1e-11)
+    assert np.allclose(v34, vjk(x34)[:ncore, ncore:], rtol=0, atol=1e-11)
+
+
 @pytest.mark.parametrize("case", ["n2", "o2", "n2-sa"])
 def test_dfcasscf_energy(case, monkeypatch):
     """pyscf's DF-CASSCF of an accelerated reference builds its integrals with mojoscf.casscf and its
@@ -72,13 +104,22 @@ def test_dfcasscf_energy(case, monkeypatch):
     ref_mf = make(mol).density_fit().run(conv_tol=1e-11)
     e0 = casscf(ref_mf).e_tot
     mf = mojoscf.accelerate(make(mol).density_fit()).run(conv_tol=1e-11)
-    built, ah = [], []
+    built, bufs, ah = [], [], []
     orig = mcas.make_eris
-    monkeypatch.setattr(mcas, "make_eris", lambda *a: built.append(orig(*a)) or built[-1])
+
+    def make_eris(*a):
+        built.append(orig(*a))
+        bufs.append(getattr(built[-1], "bmo", None))
+        return built[-1]
+
+    monkeypatch.setattr(mcas, "make_eris", make_eris)
     orig_ah = mcas.ERIS.update_jk_in_ah
     monkeypatch.setattr(mcas.ERIS, "update_jk_in_ah", lambda self, *a: ah.append(1) or orig_ah(self, *a))
     mc = casscf(mf)
-    assert built and all(isinstance(e, mcas.ERIS) and e.bmo is not None for e in built)
+    assert len(built) > 1 and all(isinstance(e, mcas.ERIS) for e in built) and all(b is not None for b in bufs)
+    # within the kernel each macro iteration's integrals take over the previous tensor
+    assert all(b is bufs[0] for b in bufs) and built[-1].bmo is bufs[0]
+    assert all(e.bmo is None for e in built[:-1]) and not mcas._SLOTS
     assert ah
     assert abs(mc.e_tot - e0) < 1e-8
 

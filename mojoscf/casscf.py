@@ -19,6 +19,8 @@ memory-mapped) when they fit in ``max_memory``, and keeps pyscf's otherwise.
 """
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 from pyscf import lib
 from pyscf.lib import logger
@@ -31,10 +33,12 @@ class ERIS:
     ``papa`` (nmo, ncas, nmo, ncas) and ``vhf_c`` (nmo, nmo), from the DF tensor ``cderi`` (naux, npair).
 
     With ``keep`` the MO-basis tensor ``bmo`` (naux, nmo, nmo) is kept for
-    :meth:`update_jk_in_ah` (``bcore``, ``bact``: views of its core and active rows).
+    :meth:`update_jk_in_ah` (``bcore``, ``bact``: views of its core and active rows),
+    in ``out`` when given.  The integrals of the next macro iteration of a
+    CASSCF ``kernel`` take it over (:class:`_TensorSlot`; ``bmo`` is None then).
     """
 
-    def __init__(self, casscf, mo, cderi, max_memory, keep=False):
+    def __init__(self, casscf, mo, cderi, max_memory, keep=False, out=None):
         log = logger.new_logger(casscf)
         t0 = (logger.process_clock(), logger.perf_counter())
         self._mo_in = mo
@@ -43,7 +47,7 @@ class ERIS:
         self.ncas = ncas = casscf.ncas
         self.bmo = self.bcore = self.bact = None
         if keep:
-            self._build_kept(mo, cderi, ncore, ncas)
+            self._build_kept(mo, cderi, ncore, ncas, out)
             log.timer("mojoscf DF-CASSCF integrals (MO-basis tensor kept)", *t0)
         else:
             self._build_blocked(mo, cderi, ncore, ncas, max_memory)
@@ -52,26 +56,24 @@ class ERIS:
             vj, vk = casscf.get_jk(casscf.mol, dm_core)
             self.vhf_c = mo.T @ (vj * 2 - vk) @ mo
 
-    def _build_kept(self, mo, cderi, ncore, ncas):
+    def _build_kept(self, mo, cderi, ncore, ncas, out=None):
         nmo = mo.shape[1]
         nocc = ncore + ncas
         naux = cderi.shape[0]
-        b = self.bmo = kernels.df_mo(cderi, mo, mo)                      # (Q|pq)
+        # (Q|pq) and, from the same pass, the core J/K: vhf_c = 2 J - K of the core density,
+        # J = sum_Q rho_Q B_Q (rho_Q the trace of the core block), K = sum_Q B_Q[c]^T B_Q[c]
+        b, d, vj, vk, kpc = kernels.casscf_mo(cderi, mo, ncore, out=out)
+        self.bmo = b
         self.bcore = b[:, :ncore]
         self.bact = b[:, ncore:nocc]
-        d = np.einsum("kii->ki", b)
         self.j_pc = d.T @ d[:, :ncore]
-        self.k_pc = np.ascontiguousarray(np.einsum("kij,kij->ij", self.bcore, self.bcore).T)
+        self.k_pc = np.ascontiguousarray(kpc.T)
         b2 = b.reshape(naux, nmo * nmo)
         baa = np.ascontiguousarray(self.bact[:, :, ncore:nocc]).reshape(naux, ncas * ncas)
         self.ppaa = lib.dot(b2.T, baa).reshape(nmo, nmo, ncas, ncas)
         pa = np.ascontiguousarray(self.bact.transpose(0, 2, 1)).reshape(naux, nmo * ncas)
         self.papa = lib.dot(pa.T, pa).reshape(nmo, ncas, nmo, ncas)
-        # vhf_c = 2 J - K of the core density in the MO basis: J from the core diagonals,
-        # K = sum_Q B_Q[:, c] B_Q[c, :] (the core columns picked by a selector)
-        rho = d[:, :ncore].sum(axis=1)
-        self.vhf_c = (rho @ b2).reshape(nmo, nmo) * 2
-        kernels.df_sandwich(b, np.eye(nmo, ncore), self.bcore, 1, -1.0, out=self.vhf_c)
+        self.vhf_c = vj * 2 - vk
 
     def _build_blocked(self, mo, cderi, ncore, ncas, max_memory):
         nmo = mo.shape[1]
@@ -110,32 +112,15 @@ class ERIS:
         core-noncore block of ``r``, and D4 = C (S + S^T) C^T, S = casdm1
         r[active] in the active rows, and returns ``va = casdm1 C_a^T (2J - K)[D3] C``
         and ``vc = C_c^T (2J - K)[2 D3 + D4] C_x``.  Only these rows of the
-        MO-basis matrices are needed: J from rho_Q = sum_rs B_Q,rs X_rs, K
-        from sum_Q (B_Q[rows] X) B_Q (:func:`mojoscf.kernels.df_sandwich`).
+        MO-basis matrices are needed, and X3 has only the core-noncore blocks:
+        :func:`mojoscf.kernels.casscf_ah` forms them in one pass over B_Q.
         """
         ncore, ncas = self.ncore, self.ncas
         nocc = ncore + ncas
-        naux, nmo = self.bmo.shape[:2]
         r = np.asarray(r, dtype=np.float64)
-        rc = np.zeros((ncore, nmo))
-        rc[:, ncore:] = r[:ncore, ncore:]
-        sa = np.asarray(casdm1, dtype=np.float64) @ r[ncore:nocc]
-        x3 = np.zeros((nmo, nmo))
-        x3[:ncore] = rc
-        x3 += x3.T
-        x34 = x3 * 2
-        x34[ncore:nocc] += sa
-        x34[:, ncore:nocc] += sa.T
-        b2 = self.bmo.reshape(naux, nmo * nmo)
-        bc2 = b2[:, :ncore * nmo]
-        ba2 = b2[:, ncore * nmo:nocc * nmo]
-        rho3 = bc2 @ rc.ravel() * 2
-        rho34 = rho3 * 2 + ba2 @ sa.ravel() * 2
-        v3 = (rho3 @ ba2).reshape(ncas, nmo) * 2
-        v34 = (rho34 @ bc2).reshape(ncore, nmo) * 2
-        kernels.df_sandwich(self.bact, x3, self.bmo, 1, -1.0, out=v3)
-        kernels.df_sandwich(self.bcore, x34, self.bmo, 1, -1.0, out=v34)
-        return casdm1 @ v3, v34[:, ncore:]
+        casdm1 = np.asarray(casdm1, dtype=np.float64)
+        v3, v34 = kernels.casscf_ah(self.bmo, ncore, ncas, r[:ncore, ncore:], casdm1 @ r[ncore:nocc])
+        return casdm1 @ v3, v34
 
 
 def _memory_mb(nmo, ncore, ncas, naux, keep):
@@ -166,19 +151,57 @@ def _incore_tensor(mc, mo, with_df):
     return cderi
 
 
+class _TensorSlot:
+    """The MO-basis tensor of the last :class:`ERIS` built during a DF-CASSCF ``kernel``, handed to the
+    next one.  pyscf drops the integrals of a macro iteration (``eris = None``) right before it builds
+    the next, but under Python < 3.13 the frame's ``locals()`` snapshot (passed to the schedulers and
+    the callback) still holds them, so a new multi-GB tensor would be allocated next to the old one:
+    twice the memory, and fresh pages cost about as much as the transformation on some machines.  The
+    previous :class:`ERIS` loses its tensor (its ``update_jk_in_ah`` then runs pyscf's AO J/K)."""
+
+    def __init__(self):
+        self.buf = None
+        self.owner = None
+
+    def take(self, shape):
+        """The kept tensor if it has this shape (taken from its :class:`ERIS`), else None."""
+        buf, self.buf = self.buf, None
+        owner = self.owner() if self.owner is not None else None
+        self.owner = None
+        if buf is None or buf.shape != shape:
+            return None
+        if owner is not None and owner.bmo is buf:
+            owner.bmo = owner.bcore = owner.bact = None
+        return buf
+
+    def keep(self, eris):
+        self.buf = eris.bmo
+        self.owner = weakref.ref(eris)
+
+
+_SLOTS = weakref.WeakKeyDictionary()    # CASSCF object -> _TensorSlot while its kernel runs
+
+
 def make_eris(casscf, mo, with_df):
     """:class:`ERIS` for a :class:`~mojoscf.dft.MojoDF` whose tensor is in memory or memory-mapped and
     when the integrals fit in ``max_memory`` (the MO-basis tensor kept when it fits too); None otherwise
-    (pyscf's ``_ERIS`` then runs)."""
+    (pyscf's ``_ERIS`` then runs).  During a ``kernel`` the kept tensor reuses the previous one's memory
+    (:class:`_TensorSlot`)."""
     cderi = _incore_tensor(casscf, mo, with_df)
     if cderi is None:
         return None
     nmo = np.shape(mo)[1]
     naux = cderi.shape[0]
-    free = casscf.max_memory - lib.current_memory()[0]
+    slot = _SLOTS.get(casscf)
+    buf = slot.take((naux, nmo, nmo)) if slot is not None else None
+    free = casscf.max_memory - lib.current_memory()[0] + (buf.nbytes * 1e-6 if buf is not None else 0)
     keep = _memory_mb(nmo, casscf.ncore, casscf.ncas, naux, True)
     if keep < 0.8 * free:
-        return ERIS(casscf, mo, cderi, free - keep, keep=True)
+        eris = ERIS(casscf, mo, cderi, free - keep, keep=True, out=buf)
+        if slot is not None:
+            slot.keep(eris)
+        return eris
+    buf = None
     blocked = _memory_mb(nmo, casscf.ncore, casscf.ncas, naux, False)
     if blocked + nmo * nmo * 8e-6 * 64 > 0.8 * free:
         return None
@@ -639,6 +662,21 @@ def install():
 
         update_jk_in_ah._mojoscf_orig = own
         cls.update_jk_in_ah = update_jk_in_ah
+        own_kernel = cls.__dict__.get("kernel")
+
+        def kernel(self, *args, **kwargs):
+            run = own_kernel.__get__(self) if own_kernel is not None else super(cls, self).kernel
+            if self in _SLOTS:
+                return run(*args, **kwargs)
+            _SLOTS[self] = _TensorSlot()
+            try:
+                return run(*args, **kwargs)
+            finally:
+                _SLOTS.pop(self, None)
+
+        kernel.__doc__ = getattr(own_kernel or getattr(super(cls, cls), "kernel", None), "__doc__", None)
+        kernel._mojoscf_orig = own_kernel
+        cls.kernel = kernel
         own_grad = cls.__dict__.get("nuc_grad_method")
 
         def nuc_grad_method(self):

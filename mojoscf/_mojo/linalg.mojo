@@ -549,6 +549,59 @@ struct Blas(Movable):
             anyptr(al), b, anyptr(ldb), a, anyptr(lda), anyptr(be), c, anyptr(ldc),
         )
 
+    def gemm_ld(
+        self,
+        transa: Bool,
+        transb: Bool,
+        m: Int,
+        n: Int,
+        k: Int,
+        alpha: Float64,
+        a: F64Ptr,
+        lda: Int,
+        b: F64Ptr,
+        ldb: Int,
+        beta: Float64,
+        c: F64Ptr,
+        ldc: Int,
+    ) raises:
+        """``gemm`` on blocks of larger row-major matrices: rows of A, B and C start ``lda``, ``ldb`` and
+        ``ldc`` elements apart.  Without a library a serial loop (for callers on worker threads)."""
+        if m == 0 or n == 0:
+            return
+        if k == 0 or not self.handle:
+            for i in range(m):
+                var crow = c.unsafe_offset(i * ldc)
+                if beta == 0.0:
+                    vfill(crow, n, 0.0)
+                elif beta != 1.0:
+                    vscale(crow, n, beta)
+                for kk in range(k):
+                    var aik = alpha * (a[unsafe_offset=kk * lda + i] if transa else a[unsafe_offset=i * lda + kk])
+                    if aik == 0.0:
+                        continue
+                    if transb:
+                        for j in range(n):
+                            crow[unsafe_offset=j] += aik * b[unsafe_offset=j * ldb + kk]
+                    else:
+                        vaxpy(crow, n, aik, b.unsafe_offset(kk * ldb))
+            return
+        var ta = c_char(ord("T")) if transa else c_char(ord("N"))
+        var tb = c_char(ord("T")) if transb else c_char(ord("N"))
+        var mm = Int64(m)
+        var nn = Int64(n)
+        var kk = Int64(k)
+        var la = Int64(lda)
+        var lb = Int64(ldb)
+        var lc = Int64(ldc)
+        var al = alpha
+        var be = beta
+        var f = self.handle.value().get_function[NoneType](self.sym("dgemm"))
+        f(
+            anyptr(tb), anyptr(ta), anyptr(nn), anyptr(mm), anyptr(kk),
+            anyptr(al), b, anyptr(lb), a, anyptr(la), anyptr(be), c, anyptr(lc),
+        )
+
     def syrk_upper(self, n: Int, k: Int, alpha: Float64, a: F64Ptr, beta: Float64, c: F64Ptr) raises:
         """Symmetric rank-k update C (n x n) = alpha * A^T A + beta * C, A (k x n) row-major.
 

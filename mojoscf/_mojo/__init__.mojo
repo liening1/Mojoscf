@@ -24,7 +24,7 @@ from _mojo.kernels import (
 )
 from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
-from _mojo.dfmo import df_mo_core, df_sandwich_core, cphf_k_core
+from _mojo.dfmo import df_mo_core, df_sandwich_core, cphf_k_core, casscf_ah_core, casscf_mo_core
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
@@ -64,6 +64,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_df_jk]("df_jk", docstring="df_jk(cderi, dms, orbs_or_None, ms_or_None, signs_or_None, vj, vk, with_j, with_k, block_mb, fact_tol, path, prefix, seq_path, seq_prefix).")
         m.def_function[py_df_mo]("df_mo", docstring="df_mo(cderi, cl, cr, out, seq_path, seq_prefix): out[Q] = cl^T E_Q cr for the packed DF tensor (naux, npair), out (naux, nl, nr).")
         m.def_function[py_df_sandwich]("df_sandwich", docstring="df_sandwich(a, x, b, nvec, alpha, r, seq_path, seq_prefix, a_qstride, b_qstride): r (m*nvec, p) += alpha sum_Q reshape(a[Q] x, (m*nvec, k2)) b[Q] for a (nq, m, k1), x (k1, nvec*k2), b (nq, k2, p); a[Q], b[Q] start a_qstride, b_qstride elements apart.")
+        m.def_function[py_casscf_mo]("casscf_mo", docstring="casscf_mo(cderi, mo, ncore, dst, diag, vj, vk, kpc, seq_path, seq_prefix): dst[Q] = mo^T E_Q mo and the core terms of DF-CASSCF from the same pass: diag (naux, nmo), vj = sum_Q rho_Q L_Q, vk = sum_Q L_Q[c]^T L_Q[c], kpc = sum_Q L_Q[c]**2.")
+        m.def_function[py_casscf_ah]("casscf_ah", docstring="casscf_ah(b, ncore, ncas, rmat, sa, v3, v34, seq_path, seq_prefix): v3 (ncas, nmo), v34 (ncore, nmo - ncore) += the MO-basis (2J - K) rows of a CASSCF orbital-Hessian step for the DF tensor b (nq, nmo, nmo), the core-noncore rotation rmat and sa = casdm1 r[active].")
         m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r (nmo, nset, nocc) += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)) with xs (nmo, nset, nocc), the MO-basis exchange of the orbital-Hessian response.")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k, nanti): J/K from 8-fold packed ERIs (the last nanti densities antisymmetric: K only).")
         m.def_function[py_factorize_density]("factorize_density", docstring="factorize_density(dm, orb_out, sign_out, rel_tol, path, prefix) -> m.")
@@ -414,6 +416,30 @@ def py_df_sandwich(
         blas_seq, Int(py=a.shape[0]), f64ptr(a), Int(py=a.shape[1]), Int(py=a.shape[2]), f64ptr(x), nv,
         Int(py=b.shape[1]), f64ptr(b), Int(py=b.shape[2]), Float64(py=alpha), f64ptr(r),
         Int(py=a_qstride), Int(py=b_qstride),
+    )
+    return PythonObject(None)
+
+
+def py_casscf_mo(
+    cderi: PythonObject, mo: PythonObject, ncore: PythonObject, dst: PythonObject, diag: PythonObject,
+    vj: PythonObject, vk: PythonObject, kpc: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    casscf_mo_core(
+        blas_seq, f64ptr(cderi), Int(py=cderi.shape[0]), Int(py=mo.shape[0]), f64ptr(mo), Int(py=mo.shape[1]),
+        Int(py=ncore), f64ptr(dst), f64ptr(diag), f64ptr(vj), f64ptr(vk), f64ptr(kpc),
+    )
+    return PythonObject(None)
+
+
+def py_casscf_ah(
+    b: PythonObject, ncore: PythonObject, ncas: PythonObject, rmat: PythonObject, sa: PythonObject, v3: PythonObject,
+    v34: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    casscf_ah_core(
+        blas_seq, Int(py=b.shape[0]), Int(py=b.shape[1]), Int(py=ncore), Int(py=ncas), f64ptr(b), f64ptr(rmat),
+        f64ptr(sa), f64ptr(v3), f64ptr(v34),
     )
     return PythonObject(None)
 

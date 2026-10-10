@@ -416,6 +416,55 @@ def df_sandwich(a, x, b, nvec, alpha=1.0, out=None):
     return out
 
 
+def casscf_mo(cderi, mo, ncore, out=None):
+    """:func:`df_mo` with ``mo`` on both sides and the core terms of DF-CASSCF from the same pass.
+
+    Returns ``(b, diag, vj, vk, kpc)``: ``b[Q] = mo^T E_Q mo`` (naux, nmo, nmo)
+    (in ``out`` if given), ``diag[Q] = diag(b[Q])``, ``vj = sum_Q rho_Q b[Q]``
+    with ``rho_Q = sum_{i < ncore} b[Q, i, i]``, ``vk = sum_Q b[Q, :ncore].T @
+    b[Q, :ncore]`` (nmo, nmo) and ``kpc = sum_Q b[Q, :ncore]**2`` (ncore, nmo).
+    """
+    cderi = _c(cderi)
+    mo = _c(mo)
+    nao, nmo = mo.shape
+    if cderi.ndim != 2 or cderi.shape[1] != nao * (nao + 1) // 2 or not 0 <= ncore <= nmo:
+        raise ValueError("cderi must have shape (naux, nao*(nao+1)//2) for mo (nao, nmo) and 0 <= ncore <= nmo")
+    shape = (cderi.shape[0], nmo, nmo)
+    if out is None:
+        out = np.empty(shape)
+    elif out.shape != shape or out.dtype != np.float64 or not out.flags.c_contiguous:
+        raise ValueError(f"out must be a C-contiguous float64 array of shape {shape}")
+    diag = np.empty((cderi.shape[0], nmo))
+    vj = np.empty((nmo, nmo))
+    vk = np.empty((nmo, nmo))
+    kpc = np.empty((ncore, nmo))
+    seq_path, seq_prefix = worker_blas()
+    get_extension().casscf_mo(cderi, mo, int(ncore), out, diag, vj, vk, kpc, seq_path, seq_prefix)
+    return out, diag, vj, vk, kpc
+
+
+def casscf_ah(b, ncore, ncas, rmat, sa):
+    """The MO-basis J/K rows of a CASSCF orbital-Hessian step: ``(v3, v34)``.
+
+    ``b`` is the DF tensor ``(naux, nmo, nmo)`` in the MO basis, ``rmat`` the
+    core-noncore block ``r[:ncore, ncore:]`` of the rotation and ``sa`` =
+    ``casdm1 @ r[ncore:nocc]`` (ncas, nmo).  With X3 = E_c rmat E_x^T + X3^T and
+    X34 = 2 X3 + E_a sa + sa^T E_a^T, ``v3`` = (2J - K)[X3][active, :] (ncas, nmo)
+    and ``v34`` = (2J - K)[X34][core, ncore:] (ncore, nmo - ncore).
+    """
+    b = _c(b)
+    nq, nmo = b.shape[:2]
+    rmat = _c(rmat)
+    sa = _c(sa)
+    if b.ndim != 3 or b.shape[2] != nmo or rmat.shape != (ncore, nmo - ncore) or sa.shape != (ncas, nmo):
+        raise ValueError(f"inconsistent shapes b {b.shape}, rmat {rmat.shape}, sa {sa.shape}")
+    v3 = np.zeros((ncas, nmo))
+    v34 = np.zeros((ncore, nmo - ncore))
+    seq_path, seq_prefix = worker_blas()
+    get_extension().casscf_ah(b, int(ncore), int(ncas), rmat, sa, v3, v34, seq_path, seq_prefix)
+    return v3, v34
+
+
 def cphf_k(lfull, lmo, loo, x, alpha=1.0, out=None):
     """``out (nset, nmo, nocc) += alpha * sum_Q L_Q (x_n (oo|Q) + E_o x_n^T (po|Q))``.
 
