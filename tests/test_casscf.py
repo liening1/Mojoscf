@@ -192,11 +192,22 @@ def test_rdm2_gradient_matches_pyscf(o2):
     assert abs(integrals.grad2e_df_rdm2(mf.mol, mf.with_df.auxmol, mo_cas, casdm2) - ref).max() < 1e-10
 
 
-def test_casscf_gradient_fallbacks(o2):
-    """State-averaged gradients and frozen orbitals keep pyscf's code."""
+def test_sa_casscf_gradient(o2):
+    """In pyscf's state-averaged DF-CASSCF gradient the state's own term comes from mojoscf.casscf.Gradients
+    (generalized Fock over all orbitals); the gradients equal pyscf's."""
+    from pyscf.df.grad import sacasscf as df_sacasscf_grad
+
     mf, _ = o2
-    sa = mcscf.CASSCF(mf, 6, 8).state_average_([0.5, 0.5])
-    assert not isinstance(sa.nuc_grad_method(), mcas._grad_class())
+    mc = mcscf.CASSCF(mf, 6, 8).state_average_([0.5, 0.5]).run(conv_tol=1e-11)
+    for state in (0, 1):
+        de = mc.nuc_grad_method().kernel(state=state)
+        ref = df_sacasscf_grad.Gradients.kernel._mojoscf_orig(mc.nuc_grad_method(), state=state)
+        assert abs(de - ref).max() < 1e-9
+
+
+def test_casscf_gradient_fallbacks(o2):
+    """Frozen orbitals keep pyscf's code."""
+    mf, _ = o2
     mc = mcscf.CASSCF(mf, 6, 8)
     mc.frozen = 1
     g = mc.nuc_grad_method()

@@ -339,8 +339,9 @@ def _grad_class():
         1/2 sum (uv|wx) G_uvwx with E2(D) = 1/2 Tr D (J - K/2)[D] and Dc, Da
         the core and active densities, comes from one pass of the Mojo DF
         gradient kernels (:func:`mojoscf.integrals.grad2e_df_casscf`, the
-        auxiliary-basis response included).  State-specific CASSCF; frozen
-        orbitals and the state-averaged case keep pyscf's code.
+        auxiliary-basis response included).  State-specific CASSCF, also the
+        state's own term inside pyscf's state-averaged gradient (its Lagrange
+        terms are pyscf's); frozen orbitals keep pyscf's code.
         """
 
         def _mojo_casscf_ok(self):
@@ -352,7 +353,6 @@ def _grad_class():
                 isinstance(with_df, dft.MojoDF)
                 and self.auxbasis_response
                 and getattr(mc, "frozen", None) is None
-                and not getattr(mc, "_tag_gfock_ov_nonzero", False)
                 and self._mojo_ok()
                 and self._mojo_2e_ok()
                 and integrals.available(with_df.auxmol or self._auxmol(), two_electron=True)
@@ -381,7 +381,9 @@ def _grad_class():
                 atmlst = range(mol.natm)
             ncore, ncas = mc.ncore, mc.ncas
             nocc = ncore + ncas
-            mo_occ = mo_coeff[:, :nocc]
+            # the generalized Fock matrix spans all orbitals for a state of a state average (pyscf's tag)
+            nocc_g = mo_coeff.shape[1] if getattr(mc, "_tag_gfock_ov_nonzero", False) else nocc
+            mo_occ = mo_coeff[:, :nocc_g]
             mo_core = mo_coeff[:, :ncore]
             mo_cas = mo_coeff[:, ncore:nocc]
             casdm1, casdm2 = mc.fcisolver.make_rdm12(ci, ncas, mc.nelecas)
@@ -390,12 +392,12 @@ def _grad_class():
             dm1 = dm_core + dm_cas
 
             # generalized Fock matrix, as pyscf's
-            aapa = mc.with_df.ao2mo((mo_cas, mo_cas, mo_occ, mo_cas), compact=False).reshape(ncas, ncas, nocc, ncas)
+            aapa = mc.with_df.ao2mo((mo_cas, mo_cas, mo_occ, mo_cas), compact=False).reshape(ncas, ncas, nocc_g, ncas)
             vj, vk = mc._scf.get_jk(mol, (dm_core, dm_cas))
             h1 = mc.get_hcore()
             vhf_c = vj[0] - vk[0] * 0.5
             vhf_a = vj[1] - vk[1] * 0.5
-            gfock = np.zeros((nocc, nocc))
+            gfock = np.zeros((nocc_g, nocc_g))
             gfock[:, :ncore] = mo_occ.T @ (h1 + vhf_c + vhf_a) @ mo_core * 2
             gfock[:, ncore:nocc] = mo_occ.T @ (h1 + vhf_c) @ mo_cas @ casdm1
             gfock[:, ncore:nocc] += np.einsum("uviw,vuwt->it", aapa, casdm2)
@@ -479,6 +481,31 @@ def install():
 
         nuc_grad_method._mojoscf_orig = own_grad
         cls.nuc_grad_method = nuc_grad_method
+    try:
+        from pyscf.df.grad import sacasscf as df_sacasscf_grad
+    except ImportError:  # pragma: no cover
+        df_sacasscf_grad = None
+    if df_sacasscf_grad is not None:
+        sa_cls = df_sacasscf_grad.Gradients
+        orig_sa_kernel = sa_cls.kernel
+
+        def sa_kernel(self, **kwargs):
+            # pyscf's kernel with the state's own gradient (get_ham_response, casscf_grad.Gradients
+            # inside) from Gradients
+            from . import dft
+
+            if not isinstance(getattr(self.base, "with_df", None), dft.MojoDF):
+                return orig_sa_kernel(self, **kwargs)
+            from pyscf.grad import casscf as casscf_grad
+            from pyscf.grad import sacasscf as sacasscf_grad
+
+            if kwargs.get("mf_grad") is None:
+                kwargs["mf_grad"] = df_sacasscf_grad.dfrhf_grad.Gradients(self.base._scf)
+            with lib.temporary_env(casscf_grad, Gradients=_grad_class()):
+                return sacasscf_grad.Gradients.kernel(self, **kwargs)
+
+        sa_kernel._mojoscf_orig = orig_sa_kernel
+        sa_cls.kernel = sa_kernel
     from pyscf.mrpt import dfnevpt2, nevpt2
 
     orig_nevpt2 = dfnevpt2._ERIS

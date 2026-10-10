@@ -42,9 +42,8 @@ CASES = {
     "cu4-svp": ("[Cu(NH3)4]2+ doublet / def2-SVP", CU4, "def2-svp", 2, 1, ["Cu 3d"], 5),
     "fe6-tzvp": ("[Fe(H2O)6]2+ quintet / def2-TZVP", FE6, "def2-tzvp", 2, 4, ["Fe 3d"], 5),
     "cu4-tzvp": ("[Cu(NH3)4]2+ doublet / def2-TZVP", CU4, "def2-tzvp", 2, 1, ["Cu 3d"], 5),
-    "fe6-12w": ("[Fe(H2O)6]2+ 12H2O quintet / def2-SVP", "solvated_ion_atoms()", "def2-svp", 2, 4, ["Fe 3d"], 5),
 }
-HEAVY = {"fe6-12w"}
+HEAVY: set[str] = set()     # cases left out unless --heavy
 
 WORKER = r'''
 import json, sys, time
