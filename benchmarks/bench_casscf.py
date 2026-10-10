@@ -18,10 +18,12 @@ strongly-contracted NEVPT2 (``mrpt.NEVPT``) of the three lowest states, a
 CASCI on the state-averaged orbitals (DF integrals from
 :func:`mojoscf.casscf.nevpt2_eris` for mojoscf).  ``--grad`` instead times
 the nuclear gradient of the state-specific CASSCF of the lowest state
-(``mc.nuc_grad_method()``: :class:`mojoscf.casscf.Gradients` for mojoscf).
-Usage:
+(``mc.nuc_grad_method()``: :class:`mojoscf.casscf.Gradients` for mojoscf);
+``--sa-grad`` adds the state-averaged gradient of the lowest state after
+the state-averaged CASSCF.  Usage:
 
-    python benchmarks/bench_casscf.py [--cases a,b,...] [--heavy] [--tuned-pyscf] [--nevpt2 | --grad] [--list]
+    python benchmarks/bench_casscf.py [--cases a,b,...] [--heavy] [--tuned-pyscf] [--nevpt2] [--sa-grad] [--grad]
+                                      [--list]
 """
 from __future__ import annotations
 
@@ -77,6 +79,9 @@ mc.conv_tol = 1e-8
 stats = {}
 mc.callback = lambda envs: stats.update(macro=envs["imacro"], jk=envs["totinner"])
 t0 = time.perf_counter(); mc.kernel(mo); tcas = time.perf_counter() - t0
+tsag, dsag = None, []
+if %(sa_grad)r:
+    t0 = time.perf_counter(); dsag = mc.nuc_grad_method().kernel(state=0).tolist(); tsag = time.perf_counter() - t0
 enev, tnev = [], None
 if %(nevpt2)r:
     from pyscf import mrpt
@@ -87,14 +92,16 @@ if %(nevpt2)r:
     enev = [float(mrpt.NEVPT(mc2, root=i).kernel()) for i in range(3)]
     tnev = time.perf_counter() - t0
 print(json.dumps(dict(tscf=tscf, tcas=tcas, ecas=mc.e_tot, ncas=int(ncas), nelecas=int(nelecas), nao=mol.nao_nr(),
-                      conv=bool(mc.converged), scf_conv=bool(mf.converged), tnev=tnev, enev=enev, **stats)))
+                      conv=bool(mc.converged), scf_conv=bool(mf.converged), tnev=tnev, enev=enev, tsag=tsag,
+                      dsag=dsag, **stats)))
 '''
 
 
-def run(case, driver, bench_dir, env=None, nevpt2=False, grad=False):
+def run(case, driver, bench_dir, env=None, nevpt2=False, grad=False, sa_grad=False):
     _, atoms, basis, charge, spin, ao_labels, nstates = CASES[case]
     code = WORKER % dict(bench_dir=bench_dir, atoms=atoms, basis=basis, charge=charge, spin=spin,
-                         ao_labels=ao_labels, nstates=nstates, driver=driver, nevpt2=nevpt2, grad=grad)
+                         ao_labels=ao_labels, nstates=nstates, driver=driver, nevpt2=nevpt2, grad=grad,
+                         sa_grad=sa_grad)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env=None if env is None else {**os.environ, **env})
     if out.returncode != 0:
@@ -110,6 +117,7 @@ def main():
                     help="also time pyscf with OPENBLAS_THREAD_TIMEOUT=16 (mojoscf's OpenBLAS spin-wait)")
     ap.add_argument("--nevpt2", action="store_true", help="also time NEVPT2 of the three lowest states")
     ap.add_argument("--grad", action="store_true", help="time the state-specific CASSCF gradient instead")
+    ap.add_argument("--sa-grad", action="store_true", help="also time the state-averaged gradient of state 0")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list:
@@ -134,14 +142,15 @@ def main():
                   f"{ref['tgrad'] / moj['tgrad']:4.1f}x | {dg:8.1e} {gmax:7.1e}", flush=True)
         return
     nev = f" | {'NEVPT2 pyscf':>12s}{tuned} {'mojoscf':>8s} {'x':>5s} {'|dE2|':>7s}" if args.nevpt2 else ""
+    nev += f" | {'SA grad pyscf':>13s}{tuned} {'mojoscf':>8s} {'x':>5s} {'max|dg|':>8s}" if args.sa_grad else ""
     print(f"{'system':38s} {'nao':>4s} {'CAS':>7s} {'SA':>3s} {'macro':>5s} {'AH J/K':>7s} | {'CASSCF pyscf':>12s}{tuned} "
           f"{'mojoscf':>8s} {'x':>5s} | {'SCF pyscf':>9s} {'mojoscf':>8s} | {'|dE|':>7s}{nev}")
     for key in keys:
         name, nstates = CASES[key][0], CASES[key][6]
-        ref = run(key, "pyscf", bench_dir, nevpt2=args.nevpt2)
-        tun = (run(key, "pyscf", bench_dir, {"OPENBLAS_THREAD_TIMEOUT": "16"}, nevpt2=args.nevpt2)
-               if args.tuned_pyscf else None)
-        moj = run(key, "mojoscf", bench_dir, nevpt2=args.nevpt2)
+        opts = dict(nevpt2=args.nevpt2, sa_grad=args.sa_grad)
+        ref = run(key, "pyscf", bench_dir, **opts)
+        tun = run(key, "pyscf", bench_dir, {"OPENBLAS_THREAD_TIMEOUT": "16"}, **opts) if args.tuned_pyscf else None
+        moj = run(key, "mojoscf", bench_dir, **opts)
         cas = f"({ref['nelecas']},{ref['ncas']})"
         flag = "" if ref["conv"] and moj["conv"] else "  NOT CONVERGED"
         tcol = f" {tun['tcas']:7.1f}" if tun else ""
@@ -150,6 +159,10 @@ def main():
             de2 = max(abs(a - b) for a, b in zip(ref["enev"], moj["enev"]))
             tnev = f" {tun['tnev']:7.1f}" if tun else ""
             nev = f" | {ref['tnev']:12.1f}{tnev} {moj['tnev']:8.1f} {ref['tnev'] / moj['tnev']:4.1f}x {de2:7.1e}"
+        if args.sa_grad:
+            dg = max(abs(a - b) for ra, rb in zip(ref["dsag"], moj["dsag"]) for a, b in zip(ra, rb))
+            tsag = f" {tun['tsag']:7.1f}" if tun else ""
+            nev += f" | {ref['tsag']:13.1f}{tsag} {moj['tsag']:8.1f} {ref['tsag'] / moj['tsag']:4.1f}x {dg:8.1e}"
         print(f"{name:38s} {ref['nao']:4d} {cas:>7s} {nstates:3d} {ref['macro']:2d}/{moj['macro']:<2d} "
               f"{ref['jk']:3d}/{moj['jk']:<3d} | {ref['tcas']:12.1f}{tcol} {moj['tcas']:8.1f} "
               f"{ref['tcas'] / moj['tcas']:4.1f}x | {ref['tscf']:9.1f} {moj['tscf']:8.1f} | "

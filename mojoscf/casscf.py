@@ -320,6 +320,176 @@ def srs(nevpt, dms, eris, verbose=None):
     mo_energy = np.asarray(nevpt.mo_energy)
     return pnev._norm_to_energy(norm, h, mo_energy[nocc:, None] + mo_energy[None, nocc:])
 
+def _sa_terms_ok(mc, auxbasis_response):
+    from . import dft
+
+    return (
+        auxbasis_response
+        and isinstance(getattr(mc, "with_df", None), dft.MojoDF)
+        and getattr(mc, "frozen", None) is None
+        and integrals.available(mc.mol, two_electron=True)
+        and integrals.available(mc.with_df.auxmol, two_electron=True)
+    )
+
+
+def lci_dot_dgci_dx(Lci, weights, mc, mo_coeff=None, ci=None, atmlst=None, mf_grad=None, eris=None, verbose=None,
+                    auxbasis_response=True):
+    """pyscf's ``df.grad.sacasscf.Lci_dot_dgci_dx`` (the CI Lagrange term of the state-averaged gradient) with
+    the two-electron part, the derivative of Tr(DT (J - K/2)[Dc]) + 1/2 sum (uv|wx) T_uvwx with the
+    symmetrised transition densities DT, T, from one pass of the Mojo DF gradient kernels
+    (:func:`mojoscf.integrals.grad2e_df_terms`); the generalized Fock and one-electron terms as pyscf's."""
+    from pyscf.df.grad import rhf as dfrhf_grad
+
+    if mo_coeff is None:
+        mo_coeff = mc.mo_coeff
+    if ci is None:
+        ci = mc.ci
+    if mf_grad is None:
+        mf_grad = dfrhf_grad.Gradients(mc._scf)
+    mol = mc.mol
+    ncore, ncas = mc.ncore, mc.ncas
+    nocc = ncore + ncas
+    nmo = mo_coeff.shape[1]
+    mo_occ = mo_coeff[:, :nocc]
+    mo_core = mo_coeff[:, :ncore]
+    mo_cas = mo_coeff[:, ncore:nocc]
+    casdm1, casdm2 = mc.fcisolver.trans_rdm12(Lci, ci, ncas, mc.nelecas)
+    casdm1 = casdm1 + casdm1.T
+    casdm2 = casdm2 + casdm2.transpose(1, 0, 3, 2)
+    dm_core = mo_core @ mo_core.T * 2
+    dm_cas = mo_cas @ casdm1 @ mo_cas.T
+    aapa = np.asarray(eris.ppaa)[:, ncore:nocc].transpose(2, 3, 0, 1)            # (u, v, i, w)
+    vj, vk = mc._scf.get_jk(mol, (dm_core, dm_cas))
+    h1 = mc.get_hcore()
+    vhf_c = vj[0] - vk[0] * 0.5
+    vhf_a = vj[1] - vk[1] * 0.5
+    gfock = np.zeros((nmo, nmo))
+    gfock[:, :nocc] = mo_coeff.T @ vhf_a @ mo_occ * 2
+    gfock[:, ncore:nocc] = mo_coeff.T @ (h1 + vhf_c) @ mo_cas @ casdm1
+    gfock[:, ncore:nocc] += np.einsum("uvpw,vuwt->pt", aapa, casdm2)
+    dme0 = mo_coeff @ ((gfock + gfock.T) * 0.5) @ mo_coeff.T
+    aapa = vj = vk = vhf_c = vhf_a = h1 = gfock = None
+
+    yc = np.zeros((nocc, nocc))
+    yc[:ncore, :ncore] = 2 * np.eye(ncore)
+    yt = np.zeros((nocc, nocc))
+    yt[ncore:, ncore:] = casdm1
+    a = np.arange(ncore, nocc)
+    max_memory = max(1000, mc.max_memory - lib.current_memory()[0])
+    de2 = integrals.grad2e_df_terms(mol, mc.with_df.auxmol, mo_occ, [(1.0, yt, yc)],
+                                    [(0.5, [(a, a)], [(a, a)], casdm2)], max_memory=max_memory)
+
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    aoslices = mol.aoslice_by_atom()
+    hcore_deriv = mf_grad.hcore_generator(mol)
+    s1 = mf_grad.get_ovlp(mol)
+    de = np.zeros((len(atmlst), 3))
+    for k, ia in enumerate(atmlst):
+        p0, p1 = aoslices[ia, 2:]
+        de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm_cas)
+        de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0[p0:p1]) * 2
+        de[k] += de2[ia]
+    return de
+
+
+def lorb_dot_dgorb_dx(Lorb, mc, mo_coeff=None, ci=None, atmlst=None, mf_grad=None, eris=None, verbose=None,
+                      auxbasis_response=True):
+    """pyscf's ``df.grad.sacasscf.Lorb_dot_dgorb_dx`` (the orbital Lagrange term of the state-averaged
+    gradient) with the two-electron part from one pass of the Mojo DF gradient kernels.
+
+    With the rotated orbitals CL = C Lorb it is the derivative of
+    d/de E(C + e CL): Tr(DL (J - K/2)[Dc]) + Tr(DLc (J - K/2)[Da]) (DL = DLc + DLa
+    the rotated core and active densities) and sum (uv|w'x) G_uvwx with one
+    index of each pair rotated, in the basis [C_core, C_act, CL_core, CL_act]
+    (:func:`mojoscf.integrals.grad2e_df_terms`); the generalized Fock and
+    one-electron terms as pyscf's."""
+    from pyscf.df.grad import rhf as dfrhf_grad
+
+    if mo_coeff is None:
+        mo_coeff = mc.mo_coeff
+    if ci is None:
+        ci = mc.ci
+    if mf_grad is None:
+        mf_grad = dfrhf_grad.Gradients(mc._scf)
+    mol = mc.mol
+    ncore, ncas = mc.ncore, mc.ncas
+    nocc = ncore + ncas
+    mo_core = mo_coeff[:, :ncore]
+    mo_cas = mo_coeff[:, ncore:nocc]
+    moL = mo_coeff @ Lorb
+    moL_core = moL[:, :ncore]
+    moL_cas = moL[:, ncore:nocc]
+    s0_inv = mo_coeff @ mo_coeff.T
+    casdm1, casdm2 = mc.fcisolver.make_rdm12(ci, ncas, mc.nelecas)
+    dm_core = mo_core @ mo_core.T * 2
+    dm_cas = mo_cas @ casdm1 @ mo_cas.T
+    dmL_core = moL_core @ mo_core.T * 2
+    dmL_cas = moL_cas @ casdm1 @ mo_cas.T
+    dmL_core += dmL_core.T
+    dmL_cas += dmL_cas.T
+    dm1L = dmL_core + dmL_cas
+    ppaa = np.asarray(eris.ppaa)
+    papa = np.asarray(eris.papa)
+    la = Lorb[:, ncore:nocc]
+    aapa = ppaa[:, ncore:nocc].transpose(2, 3, 0, 1)                             # (u, v, i, w)
+    aapaL = np.einsum("ipuv,px->uvix", ppaa, la)
+    k2 = np.einsum("iuqv,qx->vxiu", papa, la)
+    aapaL += k2 + k2.transpose(1, 0, 2, 3)
+    vj, vk = mc._scf.get_jk(mol, (dm_core, dm_cas))
+    vjL, vkL = mc._scf.get_jk(mol, (dmL_core, dmL_cas))
+    h1 = mc.get_hcore()
+    vhf_c = vj[0] - vk[0] * 0.5
+    vhf_a = vj[1] - vk[1] * 0.5
+    vhfL_c = vjL[0] - vkL[0] * 0.5
+    vhfL_a = vjL[1] - vkL[1] * 0.5
+    gfock = h1 @ dm1L
+    gfock += (vhf_c + vhf_a) @ dmL_core
+    gfock += (vhfL_c + vhfL_a) @ dm_core
+    gfock += vhfL_c @ dm_cas
+    gfock += vhf_c @ dmL_cas
+    gfock = s0_inv @ gfock
+    gfock += mo_coeff @ np.einsum("uviw,uvtw->it", aapaL, casdm2) @ mo_cas.T
+    gfock += mo_coeff @ np.einsum("uviw,vuwt->it", aapa, casdm2) @ moL_cas.T
+    dme0 = (gfock + gfock.T) / 2
+    aapa = aapaL = k2 = vj = vk = vjL = vkL = None
+
+    # two-electron part in the basis O = [C_core, C_act, CL_core, CL_act]
+    m = 2 * nocc
+    c = np.arange(ncore)
+    a = np.arange(ncore, nocc)
+    lc = nocc + c
+    la_idx = nocc + a
+    yc = np.zeros((m, m))
+    yc[c[:, None], c[None, :]] = 2 * np.eye(ncore)
+    ya = np.zeros((m, m))
+    ya[a[:, None], a[None, :]] = casdm1
+    ylc = np.zeros((m, m))
+    ylc[lc[:, None], c[None, :]] = 2 * np.eye(ncore)
+    ylc[c[:, None], lc[None, :]] = 2 * np.eye(ncore)
+    yla = np.zeros((m, m))
+    yla[la_idx[:, None], a[None, :]] = casdm1
+    yla[a[:, None], la_idx[None, :]] = casdm1.T
+    orbs = np.hstack([mo_core, mo_cas, moL_core, moL_cas])
+    max_memory = max(1000, mc.max_memory - lib.current_memory()[0])
+    de2 = integrals.grad2e_df_terms(
+        mol, mc.with_df.auxmol, orbs, [(1.0, ylc + yla, yc), (1.0, ylc, ya)],
+        [(1.0, [(a, a)], [(la_idx, a), (a, la_idx)], casdm2)], max_memory=max_memory,
+    )
+
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    aoslices = mol.aoslice_by_atom()
+    hcore_deriv = mf_grad.hcore_generator(mol)
+    s1 = mf_grad.get_ovlp(mol)
+    de = np.zeros((len(atmlst), 3))
+    for k, ia in enumerate(atmlst):
+        p0, p1 = aoslices[ia, 2:]
+        de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm1L)
+        de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0[p0:p1]) * 2
+        de[k] += de2[ia]
+    return de
+
 
 def _grad_class():
     """:class:`Gradients` (built on first use: it derives from pyscf's DF-CASSCF gradient class)."""
@@ -340,8 +510,9 @@ def _grad_class():
         the core and active densities, comes from one pass of the Mojo DF
         gradient kernels (:func:`mojoscf.integrals.grad2e_df_casscf`, the
         auxiliary-basis response included).  State-specific CASSCF, also the
-        state's own term inside pyscf's state-averaged gradient (its Lagrange
-        terms are pyscf's); frozen orbitals keep pyscf's code.
+        state's own term inside pyscf's state-averaged gradient (whose
+        Lagrange terms come from :func:`lorb_dot_dgorb_dx` and
+        :func:`lci_dot_dgci_dx`); frozen orbitals keep pyscf's code.
         """
 
         def _mojo_casscf_ok(self):
@@ -506,6 +677,20 @@ def install():
 
         sa_kernel._mojoscf_orig = orig_sa_kernel
         sa_cls.kernel = sa_kernel
+        orig_lorb, orig_lci = df_sacasscf_grad.Lorb_dot_dgorb_dx, df_sacasscf_grad.Lci_dot_dgci_dx
+
+        def Lorb_dot_dgorb_dx(Lorb, mc, *args, auxbasis_response=True, **kwargs):
+            if _sa_terms_ok(mc, auxbasis_response):
+                return lorb_dot_dgorb_dx(Lorb, mc, *args, **kwargs)
+            return orig_lorb(Lorb, mc, *args, auxbasis_response=auxbasis_response, **kwargs)
+
+        def Lci_dot_dgci_dx(Lci, weights, mc, *args, auxbasis_response=True, **kwargs):
+            if _sa_terms_ok(mc, auxbasis_response):
+                return lci_dot_dgci_dx(Lci, weights, mc, *args, **kwargs)
+            return orig_lci(Lci, weights, mc, *args, auxbasis_response=auxbasis_response, **kwargs)
+
+        Lorb_dot_dgorb_dx._mojoscf_orig, Lci_dot_dgci_dx._mojoscf_orig = orig_lorb, orig_lci
+        df_sacasscf_grad.Lorb_dot_dgorb_dx, df_sacasscf_grad.Lci_dot_dgci_dx = Lorb_dot_dgorb_dx, Lci_dot_dgci_dx
     from pyscf.mrpt import dfnevpt2, nevpt2
 
     orig_nevpt2 = dfnevpt2._ERIS

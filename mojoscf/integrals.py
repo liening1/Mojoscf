@@ -965,3 +965,96 @@ def grad2e_df_casscf(mol, auxmol, mo_core, mo_cas, casdm1, casdm2, max_memory=40
         seq_path, seq_prefix, omega,
     )
     return de + d3
+
+
+def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=4000, tol=1e-14):
+    """Nuclear gradient (natm, 3) of a sum of density-fitted two-electron energies, at fixed coefficients,
+    in one pass over the three-centre derivative integrals (auxiliary-basis response included).
+
+    ``orbs`` (nao, m) is a basis O; A_P = (P|ij) over it, X = V^-1 A.
+
+    * ``jk_terms``: ``(f, Y1, Y2)`` for f Tr(D1 (J - K/2)[D2]) with D = O Y O^T
+      (Y symmetric, m x m): f [rho1^T V^-1 rho2 - 1/2 sum_PQ Tr(A_P Y2 A_Q Y1) V^-1_PQ].
+    * ``rdm2_terms``: ``(f, left, right, G)`` for f sum_PQ L_P,uv V^-1_PQ R_Q,wx G_uvwx,
+      L_P,uv = sum over ``(i, j)`` in ``left`` of A_P[i_u, j_v] (``i``, ``j``
+      index arrays into O), R likewise from ``right``.
+
+    Every term contributes to one matrix M_P per auxiliary function (the
+    gradient is sum d(mu nu|P) [O M_P O^T]_mu nu - 1/2 sum d(P|Q) W_PQ) and
+    to W, as :func:`grad2e_df_casscf` does for the CASSCF energy.
+    """
+    from pyscf.df.grad.rhf import _gen_metric_solver
+
+    from ._backend import worker_blas
+
+    _check(mol, two_electron=True)
+    _check(auxmol, two_electron=True)
+    ext = get_extension()
+    table = _boys_table()
+    tables = basis_tables(mol)
+    aux_tables = basis_tables(auxmol)
+    seq_path, seq_prefix = worker_blas()
+    nao = mol.nao_nr()
+    naux = auxmol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    orb = np.ascontiguousarray(np.asarray(orbs, dtype=np.float64).reshape(1, nao, -1))
+    m = orb.shape[2]
+    blk = max(1, min(int(max_memory * 1e6 / 8 / 2 / npair), naux))
+    rhoj = np.empty(naux)
+    xs = np.empty((1, naux, m * (m + 1) // 2))
+    omega = _omega(mol, 0.0)
+    ext.df_grad_rhs(tables, aux_tables, table, np.zeros(npair), orb, blk, rhoj, xs, seq_path, seq_prefix, omega)
+    solve = _gen_metric_solver(int2c2e(auxmol, omega))
+    a2 = lib.unpack_tril(xs[0]).reshape(naux, m * m)
+    x = lib.unpack_tril(solve(xs[0]))                                    # (naux, m, m)
+    xs = None
+    mmat = np.zeros((naux, m, m))
+    wmat = np.zeros((naux, naux))
+
+    def right(b, y):                                                     # b_P y for all P, one GEMM
+        return lib.dot(b.reshape(naux * m, m), y).reshape(naux, m, m)
+
+    def left(y, b):                                                      # y b_P for all P, one GEMM
+        return lib.dot(y, np.ascontiguousarray(b.transpose(1, 0, 2)).reshape(m, naux * m)).reshape(
+            m, naux, m).transpose(1, 0, 2)
+
+    for f, y1, y2 in jk_terms:
+        y1 = np.asarray(y1, dtype=np.float64)
+        y2 = np.asarray(y2, dtype=np.float64)
+        c1 = solve(a2 @ y1.ravel())
+        c2 = solve(a2 @ y2.ravel())
+        mmat += f * (c2[:, None, None] * y1 + c1[:, None, None] * y2)
+        xy1 = right(x, y1)
+        xy2 = right(x, y2)
+        y1xy2 = left(y1, xy2)                                              # Y1 X_P Y2
+        mmat -= 0.5 * f * (y1xy2 + y1xy2.transpose(0, 2, 1))
+        # Tr(X_P Y2 X_Q Y1) = sum_ij (X_P Y2)_ij (Y1 X_Q)_ij, Y1 X_Q = (X_Q Y1)^T
+        t = lib.dot(xy2.reshape(naux, m * m), np.ascontiguousarray(xy1.transpose(0, 2, 1)).reshape(naux, m * m).T)
+        wmat += f * (np.outer(c1, c2) + np.outer(c2, c1)) - 0.5 * f * (t + t.T)
+        xy1 = xy2 = y1xy2 = t = None
+    for f, left, right, g in rdm2_terms:
+        g = np.asarray(g, dtype=np.float64)
+        n = g.shape[0]
+        g2 = g.reshape(n * n, n * n)
+        xl = sum(x[:, np.asarray(i)[:, None], np.asarray(j)[None, :]] for i, j in left).reshape(naux, n * n)
+        xr = sum(x[:, np.asarray(i)[:, None], np.asarray(j)[None, :]] for i, j in right).reshape(naux, n * n)
+        dl = (f * lib.dot(xr, g2.T)).reshape(naux, n, n)
+        dr = (f * lib.dot(xl, g2)).reshape(naux, n, n)
+        for i, j in left:
+            mmat[:, np.asarray(i)[:, None], np.asarray(j)[None, :]] += dl
+        for i, j in right:
+            mmat[:, np.asarray(i)[:, None], np.asarray(j)[None, :]] += dr
+        wl = lib.dot(lib.dot(xl, g2), xr.T)
+        wmat += f * (wl + wl.T)
+    x = a2 = None
+    de = np.zeros((auxmol.natm, 3))
+    ext.grad2c(aux_tables, table, np.ascontiguousarray(wmat), de, omega)
+    wmat = None
+    mpk = np.ascontiguousarray(lib.pack_tril((mmat + mmat.transpose(0, 2, 1)) * 0.5)[None])
+    mmat = None
+    d3 = np.zeros((mol.natm, 3))
+    ext.grad_df3c(
+        tables, aux_tables, table, np.zeros(naux), np.zeros(npair), 0.0, -1.0, mpk, orb, blk, float(tol), d3,
+        seq_path, seq_prefix, omega,
+    )
+    return de + d3

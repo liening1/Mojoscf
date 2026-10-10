@@ -192,17 +192,38 @@ def test_rdm2_gradient_matches_pyscf(o2):
     assert abs(integrals.grad2e_df_rdm2(mf.mol, mf.with_df.auxmol, mo_cas, casdm2) - ref).max() < 1e-10
 
 
-def test_sa_casscf_gradient(o2):
-    """In pyscf's state-averaged DF-CASSCF gradient the state's own term comes from mojoscf.casscf.Gradients
-    (generalized Fock over all orbitals); the gradients equal pyscf's."""
+def test_sa_casscf_gradient(o2, monkeypatch):
+    """pyscf's state-averaged DF-CASSCF gradient with the state's own term from mojoscf.casscf.Gradients
+    (generalized Fock over all orbitals) and the Lagrange terms from mojoscf.casscf equals pyscf's own."""
     from pyscf.df.grad import sacasscf as df_sacasscf_grad
 
     mf, _ = o2
     mc = mcscf.CASSCF(mf, 6, 8).state_average_([0.5, 0.5]).run(conv_tol=1e-11)
+    de = [mc.nuc_grad_method().kernel(state=state) for state in (0, 1)]
+    for name in ("Lorb_dot_dgorb_dx", "Lci_dot_dgci_dx"):
+        monkeypatch.setattr(df_sacasscf_grad, name, getattr(df_sacasscf_grad, name)._mojoscf_orig)
     for state in (0, 1):
-        de = mc.nuc_grad_method().kernel(state=state)
         ref = df_sacasscf_grad.Gradients.kernel._mojoscf_orig(mc.nuc_grad_method(), state=state)
-        assert abs(de - ref).max() < 1e-9
+        assert abs(de[state] - ref).max() < 1e-9
+
+
+def test_sa_lagrange_terms_match_pyscf(o2):
+    """The orbital and CI Lagrange terms of the state-averaged gradient equal pyscf's for arbitrary
+    multipliers."""
+    from pyscf.df.grad import sacasscf as df_sacasscf_grad
+
+    mf, _ = o2
+    mc = mcscf.CASSCF(mf, 6, 8).state_average_([0.5, 0.5]).run()
+    eris = mc.ao2mo(mc.mo_coeff)
+    rng = np.random.default_rng(5)
+    nmo = mc.mo_coeff.shape[1]
+    lorb = rng.standard_normal((nmo, nmo)) * 0.1
+    lorb -= lorb.T
+    ref = df_sacasscf_grad.Lorb_dot_dgorb_dx._mojoscf_orig(lorb, mc, eris=eris)
+    assert abs(mcas.lorb_dot_dgorb_dx(lorb, mc, eris=eris) - ref).max() < 1e-10
+    lci = [rng.standard_normal(c.shape) * 0.1 for c in mc.ci]
+    ref = df_sacasscf_grad.Lci_dot_dgci_dx._mojoscf_orig(lci, mc.weights, mc, eris=eris)
+    assert abs(mcas.lci_dot_dgci_dx(lci, mc.weights, mc, eris=eris) - ref).max() < 1e-10
 
 
 def test_casscf_gradient_fallbacks(o2):
