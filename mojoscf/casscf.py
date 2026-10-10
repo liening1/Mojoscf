@@ -23,7 +23,7 @@ import numpy as np
 from pyscf import lib
 from pyscf.lib import logger
 
-from . import kernels
+from . import integrals, kernels
 
 
 class ERIS:
@@ -321,6 +321,114 @@ def srs(nevpt, dms, eris, verbose=None):
     return pnev._norm_to_energy(norm, h, mo_energy[nocc:, None] + mo_energy[None, nocc:])
 
 
+def _grad_class():
+    """:class:`Gradients` (built on first use: it derives from pyscf's DF-CASSCF gradient class)."""
+    global Gradients
+    if Gradients is not None:
+        return Gradients
+    from pyscf.df.grad import casscf as df_casscf_grad
+
+    from . import grad
+
+    class _Gradients(grad._MojoGrad1eMixin, df_casscf_grad.Gradients):
+        """pyscf's DF-CASSCF nuclear gradient (``pyscf.df.grad.casscf``) with the Mojo kernels.
+
+        The generalized Fock matrix and the one-electron terms are pyscf's
+        expressions (derivative integrals from the Mojo engine); the
+        two-electron part, the derivative of E2(Dc + Da) - E2(Da) +
+        1/2 sum (uv|wx) G_uvwx with E2(D) = 1/2 Tr D (J - K/2)[D] and Dc, Da
+        the core and active densities, comes from one pass of the Mojo DF
+        gradient kernels (:func:`mojoscf.integrals.grad2e_df_casscf`, the
+        auxiliary-basis response included).  State-specific CASSCF; frozen
+        orbitals and the state-averaged case keep pyscf's code.
+        """
+
+        def _mojo_casscf_ok(self):
+            from . import dft
+
+            mc = self.base
+            with_df = getattr(mc, "with_df", None)
+            return (
+                isinstance(with_df, dft.MojoDF)
+                and self.auxbasis_response
+                and getattr(mc, "frozen", None) is None
+                and not getattr(mc, "_tag_gfock_ov_nonzero", False)
+                and self._mojo_ok()
+                and self._mojo_2e_ok()
+                and integrals.available(with_df.auxmol or self._auxmol(), two_electron=True)
+            )
+
+        def _auxmol(self):
+            with_df = self.base.with_df
+            if with_df.auxmol is None:
+                from pyscf.df import addons
+
+                return addons.make_auxmol(with_df.mol, with_df.auxbasis)
+            return with_df.auxmol
+
+        def grad_elec(self, mo_coeff=None, ci=None, atmlst=None, verbose=None):
+            if not self._mojo_casscf_ok():
+                return df_casscf_grad.grad_elec(self, mo_coeff, ci, atmlst, verbose)
+            mc = self.base
+            mol = self.mol
+            log = logger.new_logger(self, verbose)
+            t0 = (logger.process_clock(), logger.perf_counter())
+            if mo_coeff is None:
+                mo_coeff = mc.mo_coeff
+            if ci is None:
+                ci = mc.ci
+            if atmlst is None:
+                atmlst = range(mol.natm)
+            ncore, ncas = mc.ncore, mc.ncas
+            nocc = ncore + ncas
+            mo_occ = mo_coeff[:, :nocc]
+            mo_core = mo_coeff[:, :ncore]
+            mo_cas = mo_coeff[:, ncore:nocc]
+            casdm1, casdm2 = mc.fcisolver.make_rdm12(ci, ncas, mc.nelecas)
+            dm_core = mo_core @ mo_core.T * 2
+            dm_cas = mo_cas @ casdm1 @ mo_cas.T
+            dm1 = dm_core + dm_cas
+
+            # generalized Fock matrix, as pyscf's
+            aapa = mc.with_df.ao2mo((mo_cas, mo_cas, mo_occ, mo_cas), compact=False).reshape(ncas, ncas, nocc, ncas)
+            vj, vk = mc._scf.get_jk(mol, (dm_core, dm_cas))
+            h1 = mc.get_hcore()
+            vhf_c = vj[0] - vk[0] * 0.5
+            vhf_a = vj[1] - vk[1] * 0.5
+            gfock = np.zeros((nocc, nocc))
+            gfock[:, :ncore] = mo_occ.T @ (h1 + vhf_c + vhf_a) @ mo_core * 2
+            gfock[:, ncore:nocc] = mo_occ.T @ (h1 + vhf_c) @ mo_cas @ casdm1
+            gfock[:, ncore:nocc] += np.einsum("uviw,vuwt->it", aapa, casdm2)
+            dme0 = mo_occ @ ((gfock + gfock.T) * 0.5) @ mo_occ.T
+            aapa = vj = vk = vhf_c = vhf_a = h1 = gfock = None
+
+            # two-electron part, one pass over the three-centre derivative integrals
+            max_memory = max(1000, self.max_memory - lib.current_memory()[0])
+            de2 = integrals.grad2e_df_casscf(mol, self._auxmol(), mo_core, mo_cas, casdm1, casdm2,
+                                             max_memory=max_memory, tol=grad.grad_tol)
+
+            # one-electron part
+            hcore_deriv = self.hcore_generator(mol)
+            s1 = self.get_ovlp(mol)
+            aoslices = mol.aoslice_by_atom()
+            de = np.zeros((len(atmlst), 3))
+            for k, ia in enumerate(atmlst):
+                p0, p1 = aoslices[ia, 2:]
+                de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm1)
+                de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0[p0:p1]) * 2
+                de[k] += de2[ia]
+            log.timer("CASSCF nuclear gradients (mojoscf)", *t0)
+            return de
+
+    _Gradients.__name__ = _Gradients.__qualname__ = "Gradients"
+    _Gradients.__module__ = __name__
+    Gradients = _Gradients
+    return Gradients
+
+
+Gradients = None
+
+
 _installed = False
 
 
@@ -329,8 +437,9 @@ def install():
     objects (``pyscf.mcscf.df._ERIS``) and run the J/K of its orbital Hessian steps with
     :meth:`ERIS.update_jk_in_ah` when they have the MO-basis tensor (``_DFCASSCF.update_jk_in_ah``), and
     DF-NEVPT2 build its integrals with :func:`nevpt2_eris` (``pyscf.mrpt.dfnevpt2._ERIS``; the Sijrs,
-    Srsi and Srs subspaces of those integrals from :func:`sijrs`, :func:`srsi`, :func:`srs`).  Idempotent;
-    other DF objects keep pyscf's code."""
+    Srsi and Srs subspaces of those integrals from :func:`sijrs`, :func:`srsi`, :func:`srs`), and the DF-CASSCF
+    nuclear gradient (``_DFCASSCF.nuc_grad_method``) be :class:`Gradients`.  Idempotent; other DF objects keep
+    pyscf's code."""
     global _installed
     if _installed:
         return
@@ -357,6 +466,19 @@ def install():
 
         update_jk_in_ah._mojoscf_orig = own
         cls.update_jk_in_ah = update_jk_in_ah
+        own_grad = cls.__dict__.get("nuc_grad_method")
+
+        def nuc_grad_method(self):
+            from . import dft
+
+            if isinstance(getattr(self, "with_df", None), dft.MojoDF):
+                return _grad_class()(self)
+            if own_grad is not None:
+                return own_grad(self)
+            return super(cls, self).nuc_grad_method()
+
+        nuc_grad_method._mojoscf_orig = own_grad
+        cls.nuc_grad_method = nuc_grad_method
     from pyscf.mrpt import dfnevpt2, nevpt2
 
     orig_nevpt2 = dfnevpt2._ERIS

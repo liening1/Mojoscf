@@ -148,3 +148,56 @@ def test_nevpt2_energy(o2, monkeypatch):
     monkeypatch.setattr(nevpt2, "Sijrs", getattr(nevpt2.Sijrs, "_mojoscf_orig", nevpt2.Sijrs))
     e0 = mrpt.NEVPT(mc).kernel()
     assert abs(e1 - e0) < 1e-10
+
+
+@pytest.mark.parametrize("case", ["o2", "n2", "agh"])
+def test_casscf_gradient_matches_pyscf(case):
+    """mc.nuc_grad_method() of a DF-CASSCF on an accelerated reference is mojoscf's and gives pyscf's DF-CASSCF
+    gradient (open shell; an ECP atom)."""
+    from pyscf.df.grad import casscf as df_casscf_grad
+
+    if case == "o2":
+        mol = gto.M(atom="O 0 0 0; O 0 0.1 1.21", basis="cc-pvdz", spin=2, verbose=0)
+        make, ncas, nelecas = scf.ROHF, 6, 8
+    elif case == "n2":
+        mol = gto.M(atom="N 0 0 0; N 0.05 0 1.12", basis="cc-pvdz", verbose=0)
+        make, ncas, nelecas = scf.RHF, 6, 6
+    else:
+        mol = gto.M(atom="Ag 0 0 0; H 0 0 1.65", basis="def2-svp", verbose=0)
+        make, ncas, nelecas = scf.RHF, 2, 2
+    mf = mojoscf.accelerate(make(mol).density_fit()).run(conv_tol=1e-11)
+    mc = mcscf.CASSCF(mf, ncas, nelecas).run(conv_tol=1e-11)
+    g = mc.nuc_grad_method()
+    assert isinstance(g, mcas._grad_class())
+    de = g.kernel()
+    ref = df_casscf_grad.Gradients(mc).kernel()
+    assert abs(de - ref).max() < 1e-9
+
+
+def test_rdm2_gradient_matches_pyscf(o2):
+    """The active 2-RDM term (with the auxiliary-basis response) equals pyscf's grad_elec_dferi +
+    grad_elec_auxresponse_dferi."""
+    from pyscf.df.grad import casdm2_util
+
+    from mojoscf import integrals
+
+    mf, mc = o2
+    mc = mcscf.CASSCF(mf, 6, 8).run()
+    mo_cas = mc.mo_coeff[:, mc.ncore:mc.ncore + mc.ncas]
+    casdm2 = mc.fcisolver.make_rdm12(mc.ci, mc.ncas, mc.nelecas)[1]
+    g = mc.nuc_grad_method()
+    dfdm2 = casdm2_util.solve_df_rdm2(g, mo_cas=mo_cas, casdm2=casdm2)
+    ref = (casdm2_util.grad_elec_dferi(g, mo_cas=mo_cas, dfcasdm2=dfdm2)[0]
+           + casdm2_util.grad_elec_auxresponse_dferi(g, mo_cas=mo_cas, dfcasdm2=dfdm2)[0])
+    assert abs(integrals.grad2e_df_rdm2(mf.mol, mf.with_df.auxmol, mo_cas, casdm2) - ref).max() < 1e-10
+
+
+def test_casscf_gradient_fallbacks(o2):
+    """State-averaged gradients and frozen orbitals keep pyscf's code."""
+    mf, _ = o2
+    sa = mcscf.CASSCF(mf, 6, 8).state_average_([0.5, 0.5])
+    assert not isinstance(sa.nuc_grad_method(), mcas._grad_class())
+    mc = mcscf.CASSCF(mf, 6, 8)
+    mc.frozen = 1
+    g = mc.nuc_grad_method()
+    assert not g._mojo_casscf_ok()

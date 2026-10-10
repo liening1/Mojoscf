@@ -828,3 +828,140 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
         xs, cn, blk, float(tol), d3, seq_path, seq_prefix, omega,
     )
     return de + d3
+
+
+def grad2e_df_rdm2(mol, auxmol, orbs, dm2, max_memory=4000, tol=1e-14):
+    """Gradient (natm, 3) of the density-fitted energy ``E = 1/2 sum_uvwx (uv|wx) dm2[u,v,w,x]``.
+
+    ``(uv|wx) = sum_PQ (uv|P) V^-1_PQ (Q|wx)`` with the orbitals ``orbs``
+    (nao, n), at fixed orbitals and ``dm2`` (the active-space two-particle
+    density of pyscf's CASSCF, ``fcisolver.make_rdm12``), including the
+    response of the auxiliary basis: the 2-RDM part of pyscf's DF-CASSCF
+    gradient (``grad_elec_dferi`` and ``grad_elec_auxresponse_dferi``).
+    With X = V^-1 (P|uv) and G the 2-RDM symmetrised in uv and in wx,
+
+        dE = sum_{P, mu nu} d(mu nu|P) [C D_P C^T]_mu nu - 1/2 sum_PQ d(P|Q) W_PQ
+        D_P = sum_wx G_uvwx X_P,wx,   W = X G X^T
+
+    the exchange-type terms of :func:`grad2e_df` with D_P in place of the
+    fitted orbital products, so the same Mojo kernels evaluate it.
+    """
+    from pyscf.df.grad.rhf import _gen_metric_solver
+
+    from ._backend import worker_blas
+
+    _check(mol, two_electron=True)
+    _check(auxmol, two_electron=True)
+    ext = get_extension()
+    table = _boys_table()
+    tables = basis_tables(mol)
+    aux_tables = basis_tables(auxmol)
+    seq_path, seq_prefix = worker_blas()
+    nao = mol.nao_nr()
+    naux = auxmol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    c = np.ascontiguousarray(np.asarray(orbs, dtype=np.float64).reshape(1, nao, -1))
+    n = c.shape[2]
+    blk = max(1, min(int(max_memory * 1e6 / 8 / 2 / npair), naux))
+    rhoj = np.empty(naux)
+    xs = np.empty((1, naux, n * (n + 1) // 2))
+    omega = _omega(mol, 0.0)
+    ext.df_grad_rhs(tables, aux_tables, table, np.zeros(npair), c, blk, rhoj, xs, seq_path, seq_prefix, omega)
+    x = lib.unpack_tril(_gen_metric_solver(int2c2e(auxmol, omega))(xs[0])).reshape(naux, n * n)
+    g = np.asarray(dm2, dtype=np.float64).reshape(n, n, n, n)
+    g = g + g.transpose(1, 0, 2, 3)
+    g = (g + g.transpose(0, 1, 3, 2)) * 0.25
+    d = lib.dot(x, g.reshape(n * n, n * n).T)                          # D_P,uv
+    w = lib.dot(d, x.T)
+    de = np.zeros((auxmol.natm, 3))
+    ext.grad2c(aux_tables, table, np.ascontiguousarray(w), de, omega)
+    w = x = None
+    dpk = np.ascontiguousarray(lib.pack_tril(d.reshape(naux, n, n))[None])
+    d3 = np.zeros((mol.natm, 3))
+    ext.grad_df3c(
+        tables, aux_tables, table, np.zeros(naux), np.zeros(npair), 0.0, -1.0, dpk, c, blk, float(tol), d3,
+        seq_path, seq_prefix, omega,
+    )
+    return de + d3
+
+
+def grad2e_df_casscf(mol, auxmol, mo_core, mo_cas, casdm1, casdm2, max_memory=4000, tol=1e-14):
+    """Two-electron part (natm, 3) of the density-fitted CASSCF gradient in one pass over the integrals.
+
+    The energy is E2(Dc + Da) - E2(Da) + 1/2 sum_uvwx (uv|wx) G_uvwx with
+    E2(D) = 1/2 Tr D (J - K/2)[D], Dc the core and Da the active density
+    (``casdm1``), G the 2-RDM (``casdm2``): the sum of :func:`grad2e_df` for
+    Dc + Da, minus it for Da, and :func:`grad2e_df_rdm2`.  In the basis O of
+    the core and the active natural orbitals (occupations n) every term is
+    of the form O M_P O^T for each auxiliary function P,
+
+        M_P = diag(c1_P n) - 1/2 (n n^T) o X_P
+              + [active block] (-diag(ca_P w) + 1/2 (w w^T) o X_P + U^T D_P U)
+
+    (c = V^-1 rho of Dc + Da and of Da, X = V^-1 (P|ij), D_P the 2-RDM term
+    of :func:`grad2e_df_rdm2` in the active MOs, U the natural orbitals),
+    and the metric terms add up to one W, so the three-centre derivative
+    integrals are generated once.
+    """
+    from pyscf.df.grad.rhf import _gen_metric_solver
+
+    from ._backend import worker_blas
+
+    _check(mol, two_electron=True)
+    _check(auxmol, two_electron=True)
+    ext = get_extension()
+    table = _boys_table()
+    tables = basis_tables(mol)
+    aux_tables = basis_tables(auxmol)
+    seq_path, seq_prefix = worker_blas()
+    nao = mol.nao_nr()
+    naux = auxmol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    mo_core = np.asarray(mo_core, dtype=np.float64).reshape(nao, -1)
+    mo_cas = np.asarray(mo_cas, dtype=np.float64).reshape(nao, -1)
+    ncore, ncas = mo_core.shape[1], mo_cas.shape[1]
+    m = ncore + ncas
+    w, u = np.linalg.eigh(np.asarray(casdm1, dtype=np.float64))
+    w = np.clip(w, 0.0, None)
+    orb = np.ascontiguousarray(np.hstack([mo_core, mo_cas @ u])[None])     # core and natural orbitals
+    n1 = np.concatenate([np.full(ncore, 2.0), w])
+    blk = max(1, min(int(max_memory * 1e6 / 8 / 2 / npair), naux))
+    rhoj = np.empty(naux)
+    xs = np.empty((1, naux, m * (m + 1) // 2))
+    omega = _omega(mol, 0.0)
+    ext.df_grad_rhs(tables, aux_tables, table, np.zeros(npair), orb, blk, rhoj, xs, seq_path, seq_prefix, omega)
+    solve = _gen_metric_solver(int2c2e(auxmol, omega))
+    diag = np.arange(m) * (np.arange(m) + 1) // 2 + np.arange(m)
+    adiag = xs[0][:, diag]                                                # (P|ii)
+    c1 = solve(adiag @ n1)
+    ca = solve(adiag[:, ncore:] @ w)
+    x = lib.unpack_tril(solve(xs[0]))                                     # (naux, m, m)
+    xs = adiag = None
+    xa = x[:, ncore:, ncore:]
+    # the 2-RDM term in the active MOs (u v), with X in that basis
+    xu = np.einsum("ui,pij,vj->puv", u, xa, u).reshape(naux, ncas * ncas)
+    g = np.asarray(casdm2, dtype=np.float64).reshape(ncas, ncas, ncas, ncas)
+    g = g + g.transpose(1, 0, 2, 3)
+    g = (g + g.transpose(0, 1, 3, 2)) * 0.25
+    dg = lib.dot(xu, g.reshape(ncas * ncas, ncas * ncas).T)               # D_P,uv
+    wmat = lib.dot(dg, xu.T) + np.outer(c1, c1) - np.outer(ca, ca)
+    nn = np.outer(n1, n1)
+    ww = np.outer(w, w)
+    wmat -= 0.5 * lib.dot(x.reshape(naux, m * m) * nn.ravel(), x.reshape(naux, m * m).T)
+    wmat += 0.5 * lib.dot(xa.reshape(naux, -1) * ww.ravel(), np.ascontiguousarray(xa).reshape(naux, -1).T)
+    de = np.zeros((auxmol.natm, 3))
+    ext.grad2c(aux_tables, table, np.ascontiguousarray(wmat), de, omega)
+    wmat = xu = None
+    mmat = x * (-0.5 * nn)
+    mmat[:, ncore:, ncore:] += xa * (0.5 * ww) + np.einsum("iu,puv,vj->pij", u.T, dg.reshape(naux, ncas, ncas), u)
+    idx = np.arange(m)
+    mmat[:, idx, idx] += c1[:, None] * n1
+    mmat[:, ncore + np.arange(ncas), ncore + np.arange(ncas)] -= ca[:, None] * w
+    mpk = np.ascontiguousarray(lib.pack_tril(mmat)[None])
+    x = xa = mmat = None
+    d3 = np.zeros((mol.natm, 3))
+    ext.grad_df3c(
+        tables, aux_tables, table, np.zeros(naux), np.zeros(npair), 0.0, -1.0, mpk, orb, blk, float(tol), d3,
+        seq_path, seq_prefix, omega,
+    )
+    return de + d3
