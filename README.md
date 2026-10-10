@@ -74,6 +74,13 @@ iteration then runs without touching Python or pyscf's C code at all.
   setting), with the same energies, the NEVPT2 that follows 4 to 5.5x,
   state-specific CASSCF gradients 8 to 10x and state-averaged gradients 8.6
   to 13x.
+* **MC-PDFT** (`mojoscf.mcpdft`): pyscf's multiconfiguration pair-density
+  functional theory (`pyscf.mcpdft`) takes its on-top energies, effective
+  potentials and nuclear-gradient grid terms from Mojo kernels (the
+  on-top pair density of all states in one pass over the grid, the Becke
+  weight derivatives point by point): on the state-averaged CASSCF of the
+  same complexes the MC-PDFT energies 14 to 20x and the gradients 11 to
+  13.5x faster than pyscf.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -441,6 +448,73 @@ the doubly occupied ones, which here moved part of them into the core (CAS
 reference energies 69 to 185 mEh above ROHF; single-state CASSCF of
 [Fe(H2O)6]2+ then did not converge within 50 macro iterations in either
 code); `openshell_option=3` keeps them active.
+
+### MC-PDFT of metal complexes
+
+Multiconfiguration pair-density functional theory (`pyscf.mcpdft`, e.g.
+`mcpdft.CASSCF(mf, "tPBE", ncas, nelecas)`) runs a CASSCF and then
+evaluates, for every state, the on-top energy E_ot[rho, Pi] on the DFT
+grid, with the on-top pair density
+
+    Pi = rho_a rho_b + 1/2 sum_uvxy psi_u psi_v psi_x psi_y L_uvxy
+
+(psi the active orbitals on the grid, L the cumulant of the active-space
+2-RDM) and a translated Kohn-Sham functional.  Its nuclear gradient adds the
+functional's effective potentials, response equations for the CASSCF
+parameters and the derivative of the grid integral with respect to the
+orbitals, the grid points and the Becke weights.  With mojoscf imported, the
+CASSCF, the response equations and the Lagrange terms run on
+`mojoscf.casscf` (for an accelerated density-fitted reference, as above),
+and `mojoscf.mcpdft` replaces pyscf's grid code:
+
+* **The on-top energies** (`otfnal.energy_ot`, called by
+  `compute_pdft_energy_` once per state).  pyscf loops over blocks of grid
+  points: AO values, two spin densities, the active orbitals on the grid,
+  their pair products contracted with L by NumPy `tensordot`, libxc per
+  block, and it rebuilds the grid for every state.  mojoscf computes the
+  spin densities and Pi of all states in one Mojo pass (per block of 128
+  points one GEMM for the core density and one for the active orbitals
+  psi = C^T phi, shared by the states; per state the active densities and
+  t = L^T q, q_kl = psi_k psi_l) before pyscf's per-state calls, which take
+  the results, and evaluates pyscf's translated functional once per state
+  on the whole grid.
+* **The effective potentials of the gradient** (`pdft_veff.kernel` with
+  `paaa_only`, as the MC-PDFT and MS-PDFT gradients call it): the same
+  density pass, the one-body potentials with the XC potential-matrix kernel
+  and the paaa block sum_p phi_mu v_Pi psi_u psi_v psi_w in one more pass.
+* **The grid part of the Hellmann-Feynman gradient**
+  (`grad.mcpdft.mcpdft_HellmanFeynman_grad`).  Per atom's grid the orbital
+  terms come from the XC gradient kernel with the kernel v_rho + v_Pi rho/2
+  and from one pass for the cumulant term, the grid-point term of an atom
+  is minus the sum of its points' orbital terms, and the Becke weight
+  derivatives, which pyscf forms as (natm, natm, 3) NumPy arrays per point,
+  are contracted with the energy density point by point in a Mojo kernel;
+  the Coulomb term comes from the Mojo DF derivative integrals (pyscf built
+  a DF gradient J/K for it).
+
+`bench_casscf.py --pdft` runs tPBE MC-PDFT (`mcpdft.CASSCF`, default grids)
+on the state-averaged CASSCF of the first table: the MC-PDFT energies of
+all states and the nuclear gradient of the lowest (the CASSCF itself took
+81 to 275 s with pyscf and 5.3 to 20.1 s with mojoscf in this run, 12 to
+15x):
+
+| system                           | nao | CAS   | states | energies pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)     | gradient pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)     | max \|dE\| [Eh] | max \|dg\| [Eh/bohr] |
+|----------------------------------|----:|------:|-------:|-------------------:|----------:|------------:|--------------:|-------------------:|----------:|------------:|--------------:|-----------------:|---------------------:|
+| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |                6.3 |       5.2 |        0.46 | 13.6x (11.3x) |               63.3 |      44.2 |         4.7 | 13.5x (9.4x)  |          4.5e-06 |              3.7e-07 |
+| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |               12.2 |       8.6 |        0.62 | 19.6x (13.9x) |               95.8 |      75.0 |         7.9 | 12.1x (9.5x)  |          1.2e-07 |              3.0e-08 |
+| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |               18.9 |      14.7 |        1.02 | 18.6x (14.4x) |               89.9 |      71.7 |         8.4 | 10.7x (8.5x)  |          1.2e-07 |              4.6e-08 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |               15.0 |      13.7 |        0.78 | 19.3x (17.6x) |              215.8 |     204.6 |        16.9 | 12.8x (12.1x) |          1.4e-07 |              2.1e-07 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |               11.1 |       7.8 |        0.66 | 16.7x (11.8x) |              118.6 |     104.9 |         9.9 | 12.0x (10.6x) |          7.0e-06 |              3.3e-07 |
+
+Of the 7.9 s of the [Fe(H2O)6]2+/def2-SVP gradient the state-averaged CASSCF
+response takes most (profile): 2.3 s the conjugate-gradient solve on the
+orbital-Hessian J/K and 2.6 s the Lagrange terms; the Hellmann-Feynman part
+takes 1.9 s.  As for NEVPT2, the energies and gradients of the two runs
+differ through their separately converged CASSCF orbitals (MC-PDFT is not
+stationary in them; most for the Cu doublets); on the same CASSCF solution
+the on-top energies agree with pyscf's to 1e-9 Eh or better (translated and
+fully translated GGAs, a hybrid and a meta-GGA) and the state-averaged
+MC-PDFT gradients to 1e-8 (tests).
 
 ### Kohn-Sham DFT
 
@@ -1356,6 +1430,7 @@ but slow for more than a few dozen orbitals.
 | DF-NEVPT2 integrals (`mrpt.dfnevpt2._ERIS`) and its Sijrs, Srsi, Srs subspaces | four `with_df.ao2mo` transforms (the full (Q|pq) for `ppaa`), (cv|cv) as an (ncore nvir)^2 matrix in memory or on disk; three-index `einsum` contractions | two partial Mojo transforms ((Q|up), (Q|cv)); (pq|uv) from the AO matrices sum_Q E_Q (Q|uv), one per active pair; Sijrs from the DF factors one core orbital at a time (no (cv|cv) matrix; pairs j <= i only); the Srsi and Srs contractions as GEMMs |
 | DF-CASSCF nuclear gradient (`mc.nuc_grad_method()`, state-specific) | the DF gradient J/K of the core and active densities (libcint three-centre derivative integrals, auxiliary response) and the active 2-RDM terms (`solve_df_rdm2`, `grad_elec_dferi`, auxiliary response) in separate passes | one pass of the Mojo DF gradient kernels: in the basis of the core and active natural orbitals the Coulomb, exchange and 2-RDM terms of E2(Dc + Da) - E2(Da) + E_aa form one matrix per auxiliary function and the metric terms one W; Mojo one-electron derivative integrals; pyscf's generalized Fock matrix |
 | SA-CASSCF nuclear gradient (`mc.nuc_grad_method().kernel(state=i)` after `mc.state_average_`): the Lagrange terms (`df.grad.sacasscf.Lorb_dot_dgorb_dx`, `Lci_dot_dgci_dx`) | per term a DF gradient J/K of four (orbital term) or two (CI term) densities and one or two further passes for the active 2-RDM terms (`solve_df_rdm2`, `grad_elec_dferi`), each with its auxiliary response | one pass of the Mojo DF gradient kernels per term (`integrals.grad2e_df_terms`): Coulomb, exchange and 2-RDM terms with one rotated orbital in the basis [C_core, C_act, C_core L, C_act L] (orbital term) or with the symmetrised transition densities (CI term); pyscf's generalized Fock matrices and response solver |
+| MC-PDFT (`pyscf.mcpdft`): on-top energies, effective potentials, Hellmann-Feynman gradient | Python loops over grid blocks: AO values, spin, core and active densities (`make_rho`), the active orbitals on the grid and the on-top pair density by NumPy products and `tensordot` with the cumulant, libxc per block, the grid rebuilt for every state; for the gradient per atom grid AO second derivatives and NumPy contractions, the Becke weight derivatives as (natm, natm, 3) arrays per point, a DF gradient J/K (K unused) for the Coulomb term | Mojo (`_mojo/pdft.mojo`, `_mojo/grids.mojo`): spin densities and on-top pair densities of all states in one pass, the functional once per state on the whole grid (pyscf's `eval_ot`), the grid reused; the potentials with the XC potential-matrix kernel and one pass for the paaa block; the gradient's orbital terms with the XC gradient kernel (kernel v_rho + v_Pi rho/2) and one pass for the cumulant term, grid-point terms from the same per-atom sums, Becke weight derivatives contracted with the energy density point by point, the Coulomb term from the Mojo DF derivative integrals |
 | PCM/SMD solvation (`pyscf.solvent`): potential at the surface points, surface-charge matrix, S/D matrices, gradient | C (libcint `int3c2e`, `int3c2e_ip1/ip2` with the surface fakemol) + NumPy (einsum, (3, n, n) derivative arrays, two dense solves per cycle) | Mojo (`_mojo/qmmm.mojo`, `_mojo/pcm.mojo`): density-contracted potential pass, charge-lane potential matrix, S/D and their contracted derivatives (Boys-function erf); LU factorisation of K kept per build |
 | QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly (the gradient pass with density-contracted Hermite matrices gives the QM-atom term and all charge forces at once); nucleus-charge terms NumPy as in pyscf |
 
@@ -1452,6 +1527,18 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   `mojoscf.casscf.lorb_dot_dgorb_dx` and `lci_dot_dgci_dx` (without the
   auxiliary-basis response, `auxbasis_response=False`, pyscf's).  Frozen
   orbitals keep pyscf's code.
+* **MC-PDFT**: with mojoscf imported, pyscf's MC-PDFT (`pyscf.mcpdft`:
+  `mcpdft.CASSCF`/`CASCI`, state-averaged and multi-state variants) takes
+  its on-top energies from `mojoscf.mcpdft` (translated and fully
+  translated LDA, GGA and meta-GGA functionals, hybrids) for molecules the
+  Mojo basis code handles, whatever the reference; the effective potentials
+  with `paaa_only`/`aaaa_only` and the Hellmann-Feynman gradient terms run
+  on the Mojo kernels for translated LDA and GGA functionals.  Meta-GGA and
+  fully translated gradients, L-PDFT's full potentials (`get_pdft_veff`
+  without `paaa_only`), the second-order potentials (`get_pdft_feff`:
+  L-PDFT and CMS-PDFT gradients) and the weight derivatives of the LKO grid
+  partition keep pyscf's code.  `Grids.build` everywhere groups the points
+  with `mojoscf.dft.group_grids` (pyscf's order, without `numpy.unique`).
 * The native J/K build covers plain `pyscf.df.DF` objects with the tensor in
   core, the in-core 8-fold ERI path (used when `mol.incore_anyway` or pyscf's
   own memory check allows it) and integral-direct J/K otherwise (pyscf's
