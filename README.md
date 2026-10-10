@@ -72,15 +72,15 @@ iteration then runs without touching Python or pyscf's C code at all.
   state-averaged ligand-field CASSCF of Fe, Ni and Cu complexes 15 to 26x
   faster than pyscf (10 to 23x against pyscf with mojoscf's OpenBLAS
   setting), with the same energies, the NEVPT2 that follows 4 to 5.5x,
-  state-specific CASSCF gradients 8 to 10x and state-averaged gradients 8.6
-  to 13x.
+  state-specific CASSCF gradients 8 to 10x and state-averaged gradients 13
+  to 19x.
 * **MC-PDFT** (`mojoscf.mcpdft`): pyscf's multiconfiguration pair-density
   functional theory (`pyscf.mcpdft`) takes its on-top energies, effective
   potentials and nuclear-gradient grid terms from Mojo kernels (the
   on-top pair density of all states in one pass over the grid, the Becke
   weight derivatives point by point): on the state-averaged CASSCF of the
-  same complexes the MC-PDFT energies 14 to 20x and the gradients 11 to
-  13.5x faster than pyscf.
+  same complexes the MC-PDFT energies 13 to 23x and the gradients 14 to
+  17x faster than pyscf.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -446,11 +446,11 @@ parts, the CI term written in the orbital term's basis
 
 | system                           | nao | CAS   | states | SA grad pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)     | max \|dg\| [Eh/bohr] |
 |----------------------------------|----:|------:|-------:|------------------:|----------:|------------:|--------------:|---------------------:|
-| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |              93.3 |      75.5 |         8.9 | 10.5x (8.5x)  |              1.1e-08 |
-| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |              85.7 |      65.1 |        10.0 | 8.6x (6.5x)   |              2.1e-09 |
-| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |              48.6 |      32.5 |         4.3 | 11.2x (7.6x)  |              6.5e-09 |
-| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |             266.0 |     269.5 |        20.4 | 13.1x (13.2x) |              1.4e-08 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |             122.4 |     129.8 |         9.5 | 12.8x (13.7x) |              1.9e-08 |
+| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |              65.4 |      57.7 |         5.0 | 13.1x (11.5x) |              8.2e-09 |
+| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |              66.1 |      55.4 |         4.8 | 13.7x (11.5x) |              3.8e-09 |
+| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |              42.8 |      27.7 |         2.7 | 15.8x (10.3x) |              1.2e-08 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |             205.7 |     197.4 |        10.8 | 19.1x (18.3x) |              9.8e-09 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |             104.6 |      85.4 |         5.8 | 17.9x (14.7x) |              1.2e-08 |
 
 On the same CASSCF solution the Lagrange terms agree with pyscf's to
 better than 1e-10 for arbitrary multipliers and the state-averaged
@@ -511,21 +511,22 @@ and `mojoscf.mcpdft` replaces pyscf's grid code:
 `bench_casscf.py --pdft` runs tPBE MC-PDFT (`mcpdft.CASSCF`, default grids)
 on the state-averaged CASSCF of the first table: the MC-PDFT energies of
 all states and the nuclear gradient of the lowest (the CASSCF itself took
-81 to 275 s with pyscf and 5.3 to 20.1 s with mojoscf in this run, 12 to
-15x):
+70 to 285 s with pyscf and 3.9 to 11.9 s with mojoscf in this run, 17 to
+25x):
 
 | system                           | nao | CAS   | states | energies pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)     | gradient pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)     | max \|dE\| [Eh] | max \|dg\| [Eh/bohr] |
 |----------------------------------|----:|------:|-------:|-------------------:|----------:|------------:|--------------:|-------------------:|----------:|------------:|--------------:|-----------------:|---------------------:|
-| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |                6.3 |       5.2 |        0.46 | 13.6x (11.3x) |               63.3 |      44.2 |         4.7 | 13.5x (9.4x)  |          4.5e-06 |              3.7e-07 |
-| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |               12.2 |       8.6 |        0.62 | 19.6x (13.9x) |               95.8 |      75.0 |         7.9 | 12.1x (9.5x)  |          1.2e-07 |              3.0e-08 |
-| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |               18.9 |      14.7 |        1.02 | 18.6x (14.4x) |               89.9 |      71.7 |         8.4 | 10.7x (8.5x)  |          1.2e-07 |              4.6e-08 |
-| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |               15.0 |      13.7 |        0.78 | 19.3x (17.6x) |              215.8 |     204.6 |        16.9 | 12.8x (12.1x) |          1.4e-07 |              2.1e-07 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |               11.1 |       7.8 |        0.66 | 16.7x (11.8x) |              118.6 |     104.9 |         9.9 | 12.0x (10.6x) |          7.0e-06 |              3.3e-07 |
+| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |                6.7 |       5.5 |        0.51 | 13.2x (10.8x) |               61.7 |      43.2 |         3.9 | 15.7x (11.1x) |          3.1e-06 |              2.2e-07 |
+| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |               10.0 |       7.3 |        0.57 | 17.4x (12.7x) |               88.0 |      73.5 |         6.1 | 14.4x (12.0x) |          1.0e-07 |              2.7e-08 |
+| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |               20.4 |      14.6 |        0.88 | 23.1x (16.5x) |               89.4 |      75.9 |         6.3 | 14.2x (12.0x) |          1.1e-07 |              3.8e-08 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |               14.7 |      13.0 |        0.81 | 18.2x (16.1x) |              234.2 |     207.1 |        13.6 | 17.2x (15.2x) |          8.2e-08 |              7.0e-08 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |               10.5 |       9.3 |        0.60 | 17.4x (15.4x) |              121.3 |     107.3 |         7.1 | 17.0x (15.1x) |          7.7e-06 |              2.1e-07 |
 
-Of the 7.9 s of the [Fe(H2O)6]2+/def2-SVP gradient the state-averaged CASSCF
-response takes most (profile): 2.3 s the conjugate-gradient solve on the
-orbital-Hessian J/K and 2.6 s the Lagrange terms; the Hellmann-Feynman part
-takes 1.9 s.  As for NEVPT2, the energies and gradients of the two runs
+Of the [Fe(H2O)6]2+/def2-SVP gradient (6.8 s in a profiled run) the
+state-averaged CASSCF response takes most: 1.5 s the conjugate-gradient
+solve on the orbital-Hessian J/K and 2.3 s the two Lagrange terms (one DF
+gradient pass for both); the Hellmann-Feynman part takes 2.0 s and the
+effective potentials 0.7 s.  As for NEVPT2, the energies and gradients of the two runs
 differ through their separately converged CASSCF orbitals (MC-PDFT is not
 stationary in them; most for the Cu doublets); on the same CASSCF solution
 the on-top energies agree with pyscf's to 1e-9 Eh or better (translated and
