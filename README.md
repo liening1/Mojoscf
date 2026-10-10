@@ -69,8 +69,8 @@ iteration then runs without touching Python or pyscf's C code at all.
 * **DF-CASSCF** (`mojoscf.casscf`): pyscf's `mcscf.CASSCF` of an
   accelerated density-fitted reference builds its integrals and the J/K of
   its orbital-Hessian steps with Mojo kernels in the MO basis:
-  state-averaged ligand-field CASSCF of Fe, Ni and Cu complexes 12 to 18x
-  faster than pyscf (10 to 17x against pyscf with mojoscf's OpenBLAS
+  state-averaged ligand-field CASSCF of Fe, Ni and Cu complexes 15 to 26x
+  faster than pyscf (10 to 23x against pyscf with mojoscf's OpenBLAS
   setting), with the same energies, the NEVPT2 that follows 4 to 5.5x,
   state-specific CASSCF gradients 8 to 10x and state-averaged gradients 8.6
   to 13x.
@@ -331,11 +331,11 @@ steps are given as pyscf/mojoscf.
 
 | system                           | nao | CAS   | states | macro | AH steps | CASSCF pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)     | SCF pyscf [s] | mojoscf [s] | \|dE\| [Eh] |
 |----------------------------------|----:|------:|-------:|------:|---------:|-----------------:|----------:|------------:|--------------:|--------------:|------------:|------------:|
-| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |   3/3 |    50/49 |             87.4 |      65.3 |         6.8 | 12.9x (9.6x)  |          25.8 |         4.7 |     5.9e-12 |
-| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |   4/4 |    68/64 |            101.5 |      80.6 |         8.3 | 12.3x (9.7x)  |          18.0 |         3.4 |     1.1e-12 |
-| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |   4/4 |    77/84 |             88.0 |      65.4 |         6.0 | 14.6x (10.9x) |          10.1 |         2.0 |     2.3e-11 |
-| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |   3/3 |    62/61 |            343.6 |     323.2 |        19.6 | 17.5x (16.5x) |          43.0 |         8.2 |     1.5e-11 |
-| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |   4/4 |    87/89 |            232.9 |     220.5 |        16.1 | 14.5x (13.7x) |          19.5 |         3.6 |     7.3e-12 |
+| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |   3/3 |    48/49 |             72.3 |      49.5 |         4.7 | 15.3x (10.5x) |          21.5 |         3.7 |     5.2e-12 |
+| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |   4/4 |    72/64 |            100.8 |      70.2 |         5.0 | 20.1x (14.0x) |          15.6 |         2.8 |     2.7e-12 |
+| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |   4/4 |    82/84 |             77.3 |      43.3 |         4.2 | 18.5x (10.3x) |           9.4 |         1.5 |     3.4e-11 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |   3/3 |    65/61 |            307.0 |     274.7 |        11.9 | 25.7x (23.1x) |          34.9 |         8.8 |     3.8e-11 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |   4/4 |    91/89 |            211.1 |     168.8 |         8.2 | 25.7x (20.6x) |          16.8 |         3.5 |     3.0e-11 |
 
 `--nevpt2` adds pyscf's strongly contracted NEVPT2 (`mrpt.NEVPT`) of the
 three lowest states, a CASCI on each run's state-averaged orbitals:
@@ -351,7 +351,7 @@ three lowest states, a CASCI on each run's state-averaged orbitals:
 The NEVPT2 energies inherit the difference of the two runs' CASSCF orbitals
 (each converged to conv_tol 1e-8; NEVPT2 is not stationary in them): on the
 same orbitals pyscf's and mojoscf's integrals give the same energies to
-1e-10.  The CASSCF energies agree to 3e-11 Eh, in the same number of macro
+1e-10.  The CASSCF energies agree to 4e-11 Eh, in the same number of macro
 iterations.
 
 pyscf's driver, FCI solver and orbital optimiser run unchanged; with an
