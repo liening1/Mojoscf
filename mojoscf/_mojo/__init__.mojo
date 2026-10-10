@@ -33,6 +33,7 @@ from _mojo.gradients import grad2e_core, grad2e_pairs_core, hess2e_core, grad2c_
 from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
 from _mojo.pcm import pcm_ds_core, pcm_pair_core
 from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core, xc_hess_core, xc_h1_core
+from _mojo.pdft import ontop_pi_core, ontop_grad_core, ontop_paaa_core
 
 comptime VERSION = "0.12.0"
 
@@ -90,6 +91,9 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_xc_h1]("xc_h1", docstring="xc_h1(basis, coords, weights, kind, dms, fxc, aoatm, cmo, nocc, h1, seq_path, seq_prefix): kernel part C^T (F + F^T) C_o of the XC first-derivative Fock matrices of the Hessian, h1 (nspin, natm, 3, nmo, nocc).")
         m.def_function[py_xc_grad]("xc_grad", docstring="xc_grad(basis, coords, kind, wv, vmat, seq_path, seq_prefix): XC gradient matrices (nset, 3, nao, nao) of pyscf's grad.rks.get_vxc (LDA 0, GGA 1, meta-GGA 2), before its sign flip.")
         m.def_function[py_xc_grad_dm]("xc_grad_dm", docstring="xc_grad_dm(basis, coords, kind, wv, dms, orbs, occs, de, seq_path, seq_prefix): XC term of the nuclear gradient (natm, 3), the XC gradient matrices contracted with the densities (optionally also given as orbitals, norb may be 0).")
+        m.def_function[py_ontop_pi]("ontop_pi", docstring="ontop_pi(basis, coords, deriv, mo_cas, lt, pi, seq_path, seq_prefix): cumulant part of the MC-PDFT on-top pair density (deriv 0) and its gradient (deriv 1) into pi (1 or 4, ngrid), active orbitals mo_cas (nao, ncas), lt (ncas^2, ncas^2) the transposed 2-RDM cumulant.")
+        m.def_function[py_ontop_grad]("ontop_grad", docstring="ontop_grad(basis, coords, wpi, mo_cas, lmat, de, seq_path, seq_prefix): on-top pair-density term of the MC-PDFT nuclear gradient at fixed grids (natm, 3) for weighted v_Pi wpi (ngrid), active orbitals mo_cas (nao, ncas), lmat (ncas^2, ncas^2) the 2-RDM cumulant.")
+        m.def_function[py_ontop_paaa]("ontop_paaa", docstring="ontop_paaa(basis, coords, wpi, mo_cas, paaa, seq_path, seq_prefix): paaa (nao, ncas^3) = sum_p phi_mu wpi psi_u psi_v psi_w, the AO-active-active-active block of the MC-PDFT on-top potential.")
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
         m.def_function[py_pcm_ds]("pcm_ds", docstring="pcm_ds(table, coords, zeta, switch, norm, rvdw, with_d, s, d): pyscf's PCM S (and D) matrices (n, n).")
         m.def_function[py_pcm_pair]("pcm_pair", docstring="pcm_pair(table, coords, zeta, norm, kind, a, b, g): G_p = a_p sum_j dX_pj b_j - b_p sum_i a_i dX_ip for X = S (kind 0) or D (1), g (n, 3).")
@@ -809,6 +813,45 @@ def py_xc_h1(
         _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(weights), Int(py=kind),
         Int(py=dms.shape[0]), f64ptr(dms), f64ptr(fxc), pat, Int(py=h1.shape[1]), f64ptr(cmo), Int(py=cmo.shape[2]),
         Int(py=nocc), f64ptr(h1),
+    )
+    _ = bs^
+    return PythonObject(None)
+
+
+def py_ontop_pi(
+    basis: PythonObject, coords: PythonObject, deriv: PythonObject, mo_cas: PythonObject, lt: PythonObject,
+    pi: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    ontop_pi_core(
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), Int(py=deriv),
+        Int(py=mo_cas.shape[1]), f64ptr(mo_cas), f64ptr(lt), f64ptr(pi),
+    )
+    _ = bs^
+    return PythonObject(None)
+
+
+def py_ontop_grad(
+    basis: PythonObject, coords: PythonObject, wpi: PythonObject, mo_cas: PythonObject, lmat: PythonObject,
+    de: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    ontop_grad_core(
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(wpi),
+        Int(py=mo_cas.shape[1]), f64ptr(mo_cas), f64ptr(lmat), f64ptr(de),
+    )
+    _ = bs^
+    return PythonObject(None)
+
+
+def py_ontop_paaa(
+    basis: PythonObject, coords: PythonObject, wpi: PythonObject, mo_cas: PythonObject, paaa: PythonObject,
+    seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    ontop_paaa_core(
+        _blas(seq_path, seq_prefix), bs, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(wpi),
+        Int(py=mo_cas.shape[1]), f64ptr(mo_cas), f64ptr(paaa),
     )
     _ = bs^
     return PythonObject(None)
