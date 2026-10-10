@@ -361,3 +361,35 @@ def casscf_ah_core(
             for i in range(ncore):
                 v3[unsafe_offset=t * nmo + i] += acc3c[unsafe_offset=i * ncas + t]
     _ = buf^
+
+
+comptime I64Ptr = Pointer[Int64, MutAnyOrigin]
+
+
+def packed_gather_core(nq: Int, npk: Int, src: F64Ptr, nidx: Int, idx: I64Ptr, dst: F64Ptr):
+    """dst[P, k] = src[P, idx[k]] for P < nq (src rows npk apart, dst rows nidx apart): blocks of the
+    packed per-auxiliary-function matrices of the DF gradient terms, rows in parallel."""
+    if nq == 0 or nidx == 0:
+        return
+
+    def row(q: Int) {imm src, imm dst, imm idx, imm npk, imm nidx}:
+        var s = src.unsafe_offset(q * npk)
+        var d = dst.unsafe_offset(q * nidx)
+        for k in range(nidx):
+            d[unsafe_offset=k] = s[unsafe_offset=Int(idx[unsafe_offset=k])]
+
+    parallelize(row, nq)
+
+
+def packed_scatter_core(nq: Int, npk: Int, dst: F64Ptr, nidx: Int, idx: I64Ptr, wts: F64Ptr, src: F64Ptr):
+    """dst[P, idx[k]] += wts[k] src[P, k] for P < nq (repeated indices accumulate), rows in parallel."""
+    if nq == 0 or nidx == 0:
+        return
+
+    def row(q: Int) {imm src, imm dst, imm idx, imm wts, imm npk, imm nidx}:
+        var s = src.unsafe_offset(q * nidx)
+        var d = dst.unsafe_offset(q * npk)
+        for k in range(nidx):
+            d[unsafe_offset=Int(idx[unsafe_offset=k])] += wts[unsafe_offset=k] * s[unsafe_offset=k]
+
+    parallelize(row, nq)

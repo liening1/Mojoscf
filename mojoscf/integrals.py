@@ -766,8 +766,6 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
     exchange of range-separated functionals with pyscf's
     ``with_df.range_coulomb(omega)``.
     """
-    from pyscf.df.grad.rhf import _gen_metric_solver
-
     from ._backend import worker_blas
 
     _check(mol, two_electron=True)
@@ -807,7 +805,7 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
 
     # X = V^-1 (P|ij) in place, and W on the packed columns:
     # sum_ij n_i n_j X_Pij X_Qij = sum_{i>=j} w_ij X_Pij X_Qij, w_ij = n_i n_j (2 for i > j)
-    solve = _gen_metric_solver(int2c2e(auxmol, omega))
+    solve = _metric_solver(int2c2e(auxmol, omega))
     coef = solve(rhoj)
     w = j_factor * np.outer(coef, coef)
     tri = np.tril_indices(m)
@@ -846,8 +844,6 @@ def grad2e_df_rdm2(mol, auxmol, orbs, dm2, max_memory=4000, tol=1e-14):
     the exchange-type terms of :func:`grad2e_df` with D_P in place of the
     fitted orbital products, so the same Mojo kernels evaluate it.
     """
-    from pyscf.df.grad.rhf import _gen_metric_solver
-
     from ._backend import worker_blas
 
     _check(mol, two_electron=True)
@@ -867,7 +863,7 @@ def grad2e_df_rdm2(mol, auxmol, orbs, dm2, max_memory=4000, tol=1e-14):
     xs = np.empty((1, naux, n * (n + 1) // 2))
     omega = _omega(mol, 0.0)
     ext.df_grad_rhs(tables, aux_tables, table, np.zeros(npair), c, blk, rhoj, xs, seq_path, seq_prefix, omega)
-    x = lib.unpack_tril(_gen_metric_solver(int2c2e(auxmol, omega))(xs[0])).reshape(naux, n * n)
+    x = lib.unpack_tril(_metric_solver(int2c2e(auxmol, omega))(xs[0])).reshape(naux, n * n)
     g = np.asarray(dm2, dtype=np.float64).reshape(n, n, n, n)
     g = g + g.transpose(1, 0, 2, 3)
     g = (g + g.transpose(0, 1, 3, 2)) * 0.25
@@ -903,8 +899,6 @@ def grad2e_df_casscf(mol, auxmol, mo_core, mo_cas, casdm1, casdm2, max_memory=40
     and the metric terms add up to one W, so the three-centre derivative
     integrals are generated once.
     """
-    from pyscf.df.grad.rhf import _gen_metric_solver
-
     from ._backend import worker_blas
 
     _check(mol, two_electron=True)
@@ -930,7 +924,7 @@ def grad2e_df_casscf(mol, auxmol, mo_core, mo_cas, casdm1, casdm2, max_memory=40
     xs = np.empty((1, naux, m * (m + 1) // 2))
     omega = _omega(mol, 0.0)
     ext.df_grad_rhs(tables, aux_tables, table, np.zeros(npair), orb, blk, rhoj, xs, seq_path, seq_prefix, omega)
-    solve = _gen_metric_solver(int2c2e(auxmol, omega))
+    solve = _metric_solver(int2c2e(auxmol, omega))
     diag = np.arange(m) * (np.arange(m) + 1) // 2 + np.arange(m)
     adiag = xs[0][:, diag]                                                # (P|ii)
     c1 = solve(adiag @ n1)
@@ -967,6 +961,30 @@ def grad2e_df_casscf(mol, auxmol, mo_core, mo_cas, casdm1, casdm2, max_memory=40
     return de + d3
 
 
+def _metric_solver(j2c):
+    """``solve(v)`` = V^-1 v for the DF metric V, as pyscf's ``_gen_metric_solver`` (Cholesky, or its
+    eigenvalue solver when V is not positive definite).  A C-ordered (naux, k) right-hand side is solved
+    from the right on its transpose (two triangular solves, X^T = A^T L^-T L^-1): no layout copies, and the
+    result is C-ordered too (pyscf's ``cho_solve`` copies it to column-major and returns that layout)."""
+    import scipy.linalg
+    from pyscf.df.grad.rhf import _gen_metric_solver
+    from scipy.linalg import blas as sblas
+
+    try:
+        low = scipy.linalg.cholesky(j2c, lower=True)
+    except (np.linalg.LinAlgError, scipy.linalg.LinAlgError):
+        return _gen_metric_solver(j2c)
+
+    def solve(v):
+        v = np.asarray(v, dtype=np.float64)
+        if v.ndim != 2 or not v.flags.c_contiguous:
+            return scipy.linalg.cho_solve((low, True), v)
+        y = sblas.dtrsm(1.0, low, v.T, side=1, lower=1, trans_a=1)           # A^T L^-T
+        return sblas.dtrsm(1.0, low, y, side=1, lower=1, trans_a=0, overwrite_b=1).T
+
+    return solve
+
+
 def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=4000, tol=1e-14):
     """Nuclear gradient (natm, 3) of a sum of density-fitted two-electron energies, at fixed coefficients,
     in one pass over the three-centre derivative integrals (auxiliary-basis response included).
@@ -990,8 +1008,6 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
     Y (core, active and the rotated blocks), so this is a fraction of the
     (naux m)^2 work on the full matrices.
     """
-    from pyscf.df.grad.rhf import _gen_metric_solver
-
     from ._backend import worker_blas
 
     _check(mol, two_electron=True)
@@ -1011,15 +1027,18 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
     xs = np.empty((1, naux, m * (m + 1) // 2))
     omega = _omega(mol, 0.0)
     ext.df_grad_rhs(tables, aux_tables, table, np.zeros(npair), orb, blk, rhoj, xs, seq_path, seq_prefix, omega)
-    solve = _gen_metric_solver(int2c2e(auxmol, omega))
+    solve = _metric_solver(int2c2e(auxmol, omega))
     ap = xs[0]                                                           # A, packed lower triangles
-    xp = solve(ap)                                                       # X = V^-1 A, packed
+    xp = np.ascontiguousarray(solve(ap))                                 # X = V^-1 A, packed
     xs = None
     ii, jj = np.indices((m, m))
     tri = np.maximum(ii, jj) * (np.maximum(ii, jj) + 1) // 2 + np.minimum(ii, jj)
 
     def xblock(rows, cols):                                              # X_P[rows, cols] for all P
-        return xp[:, tri[np.ix_(rows, cols)]]
+        idx = np.ascontiguousarray(tri[np.ix_(rows, cols)].ravel(), dtype=np.int64)
+        out = np.empty((naux, len(rows), len(cols)))
+        ext.packed_gather(xp, idx, out.reshape(naux, -1))
+        return out
 
     def pack_sym(y):                                                     # lower triangle of symmetric y
         return lib.pack_tril(np.ascontiguousarray(y))
@@ -1035,20 +1054,11 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
     mpk = np.zeros((naux, m * (m + 1) // 2))                             # (M + M^T) / 2, packed
 
     def add_block(vals, rows, cols, diag_weight):
-        """mpk[P, tri(r, c)] += w vals[P, r, c] over the block, w = 1 off the diagonal, diag_weight on it.
-        Within the entries with r >= c (and within those with r < c) every packed index occurs once, so
-        two fancy-index additions do it."""
-        r, c = rows[:, None], cols[None, :]
-        idx = tri[np.ix_(rows, cols)].ravel()
-        vals = vals.reshape(naux, -1)
-        lower = (r >= c).ravel()
-        diag = (r == c).ravel()
-        if diag.any():
-            vals = vals.copy()
-            vals[:, diag] *= diag_weight
-        for sel in (lower, ~lower):
-            if sel.any():
-                mpk[:, idx[sel]] += vals[:, sel]
+        """mpk[P, tri(r, c)] += w vals[P, r, c] over the block, w = 1 off the diagonal, diag_weight on it
+        (entries (r, c) and (c, r) of the block both add to the same packed element)."""
+        idx = np.ascontiguousarray(tri[np.ix_(rows, cols)].ravel(), dtype=np.int64)
+        w = np.where((rows[:, None] == cols[None, :]).ravel(), float(diag_weight), 1.0)
+        ext.packed_scatter(mpk, idx, w, np.ascontiguousarray(vals, dtype=np.float64).reshape(naux, -1))
 
     wmat = np.zeros((naux, naux))
     for f, y1, y2 in jk_terms:
@@ -1067,11 +1077,10 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
         y1s = np.ascontiguousarray(y1[np.ix_(s1, s1)])
         y2s = np.ascontiguousarray(y2[np.ix_(s2, s2)])
         a = lib.dot(xb.reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)              # X_P Y2
-        c = lib.dot(y1s, np.ascontiguousarray(xb.transpose(1, 0, 2)).reshape(n1, naux * n2))
-        c = c.reshape(n1, naux, n2).transpose(1, 0, 2)                                  # Y1 X_P
-        b = lib.dot(np.ascontiguousarray(c).reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)  # Y1 X_P Y2
+        c = np.matmul(y1s, xb)                                                          # Y1 X_P
+        b = lib.dot(c.reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)                # Y1 X_P Y2
         add_block(-0.5 * f * b, s1, s2, 2.0)
-        t = lib.dot(a.reshape(naux, n1 * n2), np.ascontiguousarray(c).reshape(naux, n1 * n2).T)
+        t = lib.dot(a.reshape(naux, n1 * n2), c.reshape(naux, n1 * n2).T)
         wmat -= 0.5 * f * (t + t.T)
         xb = a = b = c = t = None
     for f, left, right, g in rdm2_terms:

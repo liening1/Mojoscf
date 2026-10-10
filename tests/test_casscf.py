@@ -263,8 +263,11 @@ def test_sa_lagrange_terms_match_pyscf(o2):
     ref = df_sacasscf_grad.Lorb_dot_dgorb_dx._mojoscf_orig(lorb, mc, eris=eris)
     assert abs(mcas.lorb_dot_dgorb_dx(lorb, mc, eris=eris) - ref).max() < 1e-10
     lci = [rng.standard_normal(c.shape) * 0.1 for c in mc.ci]
-    ref = df_sacasscf_grad.Lci_dot_dgci_dx._mojoscf_orig(lci, mc.weights, mc, eris=eris)
-    assert abs(mcas.lci_dot_dgci_dx(lci, mc.weights, mc, eris=eris) - ref).max() < 1e-10
+    ref_ci = df_sacasscf_grad.Lci_dot_dgci_dx._mojoscf_orig(lci, mc.weights, mc, eris=eris)
+    assert abs(mcas.lci_dot_dgci_dx(lci, mc.weights, mc, eris=eris) - ref_ci).max() < 1e-10
+    # both terms in one pass, as get_LdotJnuc runs them
+    both = mcas.lagrange_terms(lorb, lci, mc.weights, mc, eris=eris)
+    assert abs(both - ref - ref_ci).max() < 1e-10
 
 
 def test_casscf_gradient_fallbacks(o2):

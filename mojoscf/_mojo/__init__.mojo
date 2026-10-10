@@ -24,7 +24,10 @@ from _mojo.kernels import (
 )
 from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
-from _mojo.dfmo import df_mo_core, df_sandwich_core, cphf_k_core, casscf_ah_core, casscf_mo_core
+from _mojo.dfmo import (
+    df_mo_core, df_sandwich_core, cphf_k_core, casscf_ah_core, casscf_mo_core, packed_gather_core,
+    packed_scatter_core,
+)
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
@@ -65,6 +68,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_df_mo]("df_mo", docstring="df_mo(cderi, cl, cr, out, seq_path, seq_prefix): out[Q] = cl^T E_Q cr for the packed DF tensor (naux, npair), out (naux, nl, nr).")
         m.def_function[py_df_sandwich]("df_sandwich", docstring="df_sandwich(a, x, b, nvec, alpha, r, seq_path, seq_prefix, a_qstride, b_qstride): r (m*nvec, p) += alpha sum_Q reshape(a[Q] x, (m*nvec, k2)) b[Q] for a (nq, m, k1), x (k1, nvec*k2), b (nq, k2, p); a[Q], b[Q] start a_qstride, b_qstride elements apart.")
         m.def_function[py_casscf_mo]("casscf_mo", docstring="casscf_mo(cderi, mo, ncore, dst, diag, vj, vk, kpc, seq_path, seq_prefix): dst[Q] = mo^T E_Q mo and the core terms of DF-CASSCF from the same pass: diag (naux, nmo), vj = sum_Q rho_Q L_Q, vk = sum_Q L_Q[c]^T L_Q[c], kpc = sum_Q L_Q[c]**2.")
+        m.def_function[py_packed_gather]("packed_gather", docstring="packed_gather(src, idx, dst): dst[P, k] = src[P, idx[k]] for src (nq, npk), idx int64 (nidx,), dst (nq, nidx).")
+        m.def_function[py_packed_scatter]("packed_scatter", docstring="packed_scatter(dst, idx, wts, src): dst[P, idx[k]] += wts[k] src[P, k] for dst (nq, npk), idx int64 (nidx,), wts (nidx,), src (nq, nidx).")
         m.def_function[py_casscf_ah]("casscf_ah", docstring="casscf_ah(b, ncore, ncas, rmat, sa, v3, v34, seq_path, seq_prefix): v3 (ncas, nmo), v34 (ncore, nmo - ncore) += the MO-basis (2J - K) rows of a CASSCF orbital-Hessian step for the DF tensor b (nq, nmo, nmo), the core-noncore rotation rmat and sa = casdm1 r[active].")
         m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r (nmo, nset, nocc) += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)) with xs (nmo, nset, nocc), the MO-basis exchange of the orbital-Hessian response.")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k, nanti): J/K from 8-fold packed ERIs (the last nanti densities antisymmetric: K only).")
@@ -416,6 +421,21 @@ def py_df_sandwich(
         blas_seq, Int(py=a.shape[0]), f64ptr(a), Int(py=a.shape[1]), Int(py=a.shape[2]), f64ptr(x), nv,
         Int(py=b.shape[1]), f64ptr(b), Int(py=b.shape[2]), Float64(py=alpha), f64ptr(r),
         Int(py=a_qstride), Int(py=b_qstride),
+    )
+    return PythonObject(None)
+
+
+def py_packed_gather(src: PythonObject, idx: PythonObject, dst: PythonObject) raises -> PythonObject:
+    packed_gather_core(
+        Int(py=src.shape[0]), Int(py=src.shape[1]), f64ptr(src), Int(py=idx.shape[0]), i64ptr(idx), f64ptr(dst),
+    )
+    return PythonObject(None)
+
+
+def py_packed_scatter(dst: PythonObject, idx: PythonObject, wts: PythonObject, src: PythonObject) raises -> PythonObject:
+    packed_scatter_core(
+        Int(py=dst.shape[0]), Int(py=dst.shape[1]), f64ptr(dst), Int(py=idx.shape[0]), i64ptr(idx), f64ptr(wts),
+        f64ptr(src),
     )
     return PythonObject(None)
 
