@@ -324,7 +324,8 @@ def test_overridden_glue_is_detected(oh):
     smeared.verbose = 0
     ref = scf.addons.smearing_(scf.UHF(oh), sigma=0.01, method="fermi")
     ref.verbose = 0
-    assert abs(smeared.kernel() - ref.kernel()) < 1e-9
+    # both converge to conv_tol 1e-9; the Fermi occupations amplify last-bit differences of the two loops
+    assert abs(smeared.kernel() - ref.kernel()) < 1e-8
     # ... and one installed *after* accelerate() makes kernel() fall back to pyscf's loop
     mf = mojoscf.accelerate(scf.UHF(oh))
     mf.verbose = 0

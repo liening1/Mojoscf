@@ -66,6 +66,12 @@ iteration then runs without touching Python or pyscf's C code at all.
   coupled-perturbed equations with Mojo kernels in the MO basis:
   4.3 to 8.3x faster than pyscf for benzene, ferrocene and Cu(II) complexes,
   with the same Hessians to about 1e-8.
+* **DF-CASSCF** (`mojoscf.casscf`): pyscf's `mcscf.CASSCF` of an
+  accelerated density-fitted reference builds its integrals and the J/K of
+  its orbital-Hessian steps with Mojo kernels in the MO basis:
+  state-averaged ligand-field CASSCF of Fe, Ni and Cu complexes 12 to 18x
+  faster than pyscf (10 to 17x against pyscf with mojoscf's OpenBLAS
+  setting), with the same energies, and the NEVPT2 that follows 4 to 5.5x.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -289,9 +295,10 @@ gradients.
 * **The DF object.**  The `with_df` of accelerated objects (and of
   `mojoscf.RHF(mol).density_fit()`) is a `mojoscf.dft.MojoDF`, pyscf's
   `df.DF` whose `get_jk` runs the Mojo kernel (in memory, mapped or
-  streamed), so pyscf code that calls the DF object directly, such as the
-  orbital-Hessian steps of DF-CASSCF (`mcscf.CASSCF` of a density-fitted
-  reference), gets it too.
+  streamed), so pyscf code that calls the DF object directly, such as
+  DF-CASSCF (`mcscf.CASSCF` of a density-fitted reference) for its core
+  potentials, gets it too (its integrals and orbital-Hessian steps: see
+  *DF-CASSCF* below).
 * **Segmented basis sets** (def2) consist largely of single-primitive shells,
   where vectorising over the primitive quartets of one shell quartet leaves
   most SIMD lanes empty.  The drivers therefore batch kets as SIMD lanes
@@ -300,6 +307,85 @@ gradients.
   16.4 s (pyscf 36.6 s), and for [Fe(H2O)6]2+ / def2-SVP from 0.78 s to
   0.57 s.  The f shells of def2-TZVP give pairs beyond the lane kernels'
   Hermite degree, which keep the single-quartet path.
+
+### DF-CASSCF of metal complexes
+
+`benchmarks/bench_casscf.py` runs pyscf's CASSCF (`mcscf.CASSCF`, conv_tol
+1e-8) on a density-fitted ROHF reference, averaged with equal weights over
+all states of the metal 3d active space from AVAS (singly occupied orbitals
+kept active): the ligand-field states of the high-spin ion.  pyscf versus
+the same objects with the reference accelerated by `mojoscf.accelerate`,
+each in its own process, 4 cores of a 2.1 GHz Xeon.  "tuned" is pyscf with
+`OPENBLAS_THREAD_TIMEOUT=16`, the OpenBLAS spin-wait mojoscf sets when it is
+imported (see *BLAS/LAPACK backend*); macro iterations and orbital-Hessian
+steps are given as pyscf/mojoscf.
+
+| system                           | nao | CAS   | states | macro | AH steps | CASSCF pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)     | SCF pyscf [s] | mojoscf [s] | \|dE\| [Eh] |
+|----------------------------------|----:|------:|-------:|------:|---------:|-----------------:|----------:|------------:|--------------:|--------------:|------------:|------------:|
+| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |   3/3 |    50/49 |             87.4 |      65.3 |         6.8 | 12.9x (9.6x)  |          25.8 |         4.7 |     5.9e-12 |
+| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |   4/4 |    68/64 |            101.5 |      80.6 |         8.3 | 12.3x (9.7x)  |          18.0 |         3.4 |     1.1e-12 |
+| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |   4/4 |    77/84 |             88.0 |      65.4 |         6.0 | 14.6x (10.9x) |          10.1 |         2.0 |     2.3e-11 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |   3/3 |    62/61 |            343.6 |     323.2 |        19.6 | 17.5x (16.5x) |          43.0 |         8.2 |     1.5e-11 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |   4/4 |    87/89 |            232.9 |     220.5 |        16.1 | 14.5x (13.7x) |          19.5 |         3.6 |     7.3e-12 |
+
+`--nevpt2` adds pyscf's strongly contracted NEVPT2 (`mrpt.NEVPT`) of the
+three lowest states, a CASCI on each run's state-averaged orbitals:
+
+| system                           | NEVPT2 pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)   | max \|dE\| [Eh] |
+|----------------------------------|-----------------:|----------:|------------:|------------:|----------------:|
+| [Fe(H2O)6]2+ quintet / def2-SVP  |             15.7 |      14.9 |         3.7 | 4.3x (4.0x) |         6.1e-08 |
+| [Ni(H2O)6]2+ triplet / def2-SVP  |             15.3 |      15.8 |         3.8 | 4.0x (4.2x) |         4.9e-08 |
+| [Cu(NH3)4]2+ doublet / def2-SVP  |             10.9 |       6.4 |         2.0 | 5.5x (3.2x) |         5.2e-07 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP |             61.8 |      56.4 |        12.9 | 4.8x (4.4x) |         7.0e-08 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP |             26.9 |      26.3 |         5.0 | 5.3x (5.3x) |         9.1e-06 |
+
+The NEVPT2 energies inherit the difference of the two runs' CASSCF orbitals
+(each converged to conv_tol 1e-8; NEVPT2 is not stationary in them): on the
+same orbitals pyscf's and mojoscf's integrals give the same energies to
+1e-10.  The CASSCF energies agree to 3e-11 Eh, in the same number of macro
+iterations.
+
+pyscf's driver, FCI solver and orbital optimiser run unchanged; with an
+accelerated reference two of its parts come from `mojoscf.casscf`:
+
+* **The integrals of each macro iteration** (`pyscf.mcscf.df._ERIS`).  pyscf
+  transforms the DF tensor to (Q|pq) for all orbital pairs, writes it to a
+  temporary HDF5 file and reads it back to form ppaa = (pq|uv) and
+  papa = (pu|qv) with the active orbitals u, v: 3.6 s per macro iteration
+  for [Fe(H2O)6]2+/def2-SVP, a sixth of its time.  mojoscf transforms once
+  with the Mojo kernel and keeps (Q|pq) in memory for the macro iteration
+  (naux nmo^2 doubles, 0.23 GB here) when it fits in `max_memory`; `j_pc`,
+  `k_pc`, `ppaa`, `papa` and the core potential (2J - K of the core
+  density, in the MO basis) come from it: 0.5 s.
+* **The J/K of the orbital-Hessian steps** (`update_jk_in_ah`), two thirds
+  of pyscf's time.  pyscf builds Coulomb and exchange matrices in the AO
+  basis for two densities of rank 2 ncore and 2 ncore + 2 ncas (1.1 s per
+  step with `df_jk.get_jk`, 0.2 s with the Mojo DF kernel) and keeps only
+  the active rows of the first and the core-noncore block of the second.
+  mojoscf computes just these rows in the MO basis from the kept tensor: J
+  from rho_Q = sum_rs B_Q,rs X_rs, K as sum_Q (B_Q[rows] X) B_Q with per-Q
+  GEMMs in worker threads on views of the tensor (`kernels.df_sandwich`):
+  62 ms per step.
+
+**NEVPT2** builds its integrals with `mojoscf.casscf.nevpt2_eris`.  pyscf transforms the DF
+tensor four times (once over all orbital pairs, for `ppaa`) and stores
+(cv|cv), (ncore nvir)^2 doubles: 0.8 GB for [Fe(H2O)6]2+/def2-TZVP, growing
+with the fourth power of the system and moved to disk when it does not fit.
+mojoscf transforms to (Q|up) and (Q|cv) only, forms (pq|uv) from the ncas^2
+AO matrices sum_Q E_Q (Q|uv), and evaluates the one subspace that needs
+(cv|cv) (Sijrs) from the DF factors, one core orbital at a time and for
+j <= i only; the three-index `einsum` contractions of the Srsi and Srs
+subspaces run as GEMMs.  The reduced density matrices and the other
+subspaces are pyscf's.
+
+When the MO-basis tensor does not fit, the integrals are built block by
+block and the orbital-Hessian J/K runs on the Mojo DF kernel in the AO
+basis.  For open-shell references the AVAS option matters: pyscf's default
+(`openshell_option=2`) rotates the singly occupied orbitals together with
+the doubly occupied ones, which here moved part of them into the core (CAS
+reference energies 69 to 185 mEh above ROHF; single-state CASSCF of
+[Fe(H2O)6]2+ then did not converge within 50 macro iterations in either
+code); `openshell_option=3` keeps them active.
 
 ### Kohn-Sham DFT
 
@@ -1212,6 +1298,7 @@ but slow for more than a few dozen orbitals.
 | excited-state gradients (`pyscf.grad.tdrks`/`tduks`/`tdrhf`), exact integrals | derivative J/K of four densities (libcint `int2e_ip1`, `libcvhf`), `_contract_xc_kernel` (Python loops, AO second/third derivatives), Z-vector through `gen_response` | Mojo: the two-electron term as one 8-fold pass over the derivative integrals contracted with density pairs (`grad2e_pairs_core`, also long-range), the XC-kernel contractions in grid passes, Z-vector through the Mojo J/K and XC kernels; pyscf's driver |
 | SCF stability analysis (`mf.stability()`) | orbital Hessian one vector per Davidson call, AO densities through `gen_response` | the TDDFT operators above for all vectors of an iteration (`lib.davidson1`); pyscf's Fock blocks, preconditioner and rotation |
 | DF-CASSCF integrals and orbital Hessian (`mcscf.df._ERIS`, `update_jk_in_ah`) | per macro iteration (Q|pq) for all MO pairs written to a temporary HDF5 file and read back for `ppaa`/`papa`; two AO J/K builds per orbital-Hessian step (rank 2 ncore densities, `df_jk.get_jk`) | Mojo transform (`df_mo`), (Q|pq) kept in memory for the macro iteration: `j_pc`, `k_pc`, `ppaa`, `papa` and the core potential from it, the orbital-Hessian J/K only for the rows pyscf uses, in the MO basis (`df_sandwich` on views of the tensor); pyscf's driver, FCI solver and orbital optimiser |
+| DF-NEVPT2 integrals (`mrpt.dfnevpt2._ERIS`) and its Sijrs, Srsi, Srs subspaces | four `with_df.ao2mo` transforms (the full (Q|pq) for `ppaa`), (cv|cv) as an (ncore nvir)^2 matrix in memory or on disk; three-index `einsum` contractions | two partial Mojo transforms ((Q|up), (Q|cv)); (pq|uv) from the AO matrices sum_Q E_Q (Q|uv), one per active pair; Sijrs from the DF factors one core orbital at a time (no (cv|cv) matrix; pairs j <= i only); the Srsi and Srs contractions as GEMMs |
 | PCM/SMD solvation (`pyscf.solvent`): potential at the surface points, surface-charge matrix, S/D matrices, gradient | C (libcint `int3c2e`, `int3c2e_ip1/ip2` with the surface fakemol) + NumPy (einsum, (3, n, n) derivative arrays, two dense solves per cycle) | Mojo (`_mojo/qmmm.mojo`, `_mojo/pcm.mojo`): density-contracted potential pass, charge-lane potential matrix, S/D and their contracted derivatives (Boys-function erf); LU factorisation of K kept per build |
 | QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly (the gradient pass with density-contracted Hermite matrices gives the QM-atom term and all charge forces at once); nucleus-charge terms NumPy as in pyscf |
 
@@ -1296,7 +1383,12 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   in `mc.max_memory`; otherwise the integrals are built block by block and
   the orbital-Hessian J/K runs on the DF object.  UCASSCF, `approx_hessian`,
   other DF classes and tensors that cannot be mapped keep pyscf's code; the
-  CASCI active-space integrals (`with_df.ao2mo`) stay pyscf's.
+  CASCI active-space integrals (`with_df.ao2mo`) stay pyscf's.  pyscf's
+  NEVPT2 (`mrpt.NEVPT`) of a CASCI on such a reference gets its integrals
+  from `mojoscf.casscf.nevpt2_eris` when they fit in `max_memory`, without
+  the (cv|cv) matrix (its Sijrs subspace from the DF factors; Srsi and Srs
+  with GEMMs); its other subspaces and the reduced density matrices run
+  pyscf's code.
 * The native J/K build covers plain `pyscf.df.DF` objects with the tensor in
   core, the in-core 8-fold ERI path (used when `mol.incore_anyway` or pyscf's
   own memory check allows it) and integral-direct J/K otherwise (pyscf's

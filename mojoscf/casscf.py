@@ -147,23 +147,33 @@ def _memory_mb(nmo, ncore, ncas, naux, keep):
     return words * 8e-6
 
 
-def make_eris(casscf, mo, with_df):
-    """:class:`ERIS` for a :class:`~mojoscf.dft.MojoDF` whose tensor is in memory or memory-mapped and
-    when the integrals fit in ``max_memory`` (the MO-basis tensor kept when it fits too); None otherwise
-    (pyscf's ``_ERIS`` then runs)."""
+def _incore_tensor(mc, mo, with_df):
+    """The DF tensor (naux, nao*(nao+1)//2) of a :class:`~mojoscf.dft.MojoDF` in memory or memory-mapped,
+    for real orbitals ``mo`` (nao, nmo) and integer ``ncore``/``ncas`` of ``mc``; None otherwise."""
     from . import dft
 
     if not isinstance(with_df, dft.MojoDF) or not np.isrealobj(mo) or np.ndim(mo) != 2:
         return None
-    if not isinstance(casscf.ncore, (int, np.integer)) or not isinstance(casscf.ncas, (int, np.integer)):
+    if not isinstance(mc.ncore, (int, np.integer)) or not isinstance(mc.ncas, (int, np.integer)):
         return None
     cderi = with_df._cderi
     if not isinstance(cderi, np.ndarray):
         cderi = dft.ondisk_tensor(with_df) if cderi is not None else None
-    nao, nmo = np.shape(mo)
+    nao = np.shape(mo)[0]
     if (not isinstance(cderi, np.ndarray) or cderi.ndim != 2 or cderi.dtype != np.float64
             or cderi.shape[1] != nao * (nao + 1) // 2):
         return None
+    return cderi
+
+
+def make_eris(casscf, mo, with_df):
+    """:class:`ERIS` for a :class:`~mojoscf.dft.MojoDF` whose tensor is in memory or memory-mapped and
+    when the integrals fit in ``max_memory`` (the MO-basis tensor kept when it fits too); None otherwise
+    (pyscf's ``_ERIS`` then runs)."""
+    cderi = _incore_tensor(casscf, mo, with_df)
+    if cderi is None:
+        return None
+    nmo = np.shape(mo)[1]
     naux = cderi.shape[0]
     free = casscf.max_memory - lib.current_memory()[0]
     keep = _memory_mb(nmo, casscf.ncore, casscf.ncas, naux, True)
@@ -175,14 +185,152 @@ def make_eris(casscf, mo, with_df):
     return ERIS(casscf, mo, cderi, free - blocked)
 
 
+class NEVPT2ERIS(dict):
+    """pyscf's DF-NEVPT2 integrals (the dict of ``pyscf.mrpt.dfnevpt2._ERIS``) without ``cvcv``.
+
+    (cv|cv), (ncore nvir)^2 doubles, is used only by the Sijrs subspace;
+    the DF factors ``cv`` = (Q|cv) (naux, ncore, nvir) are kept instead and
+    :func:`sijrs` evaluates that subspace from them.  The Srsi and Srs
+    subspaces of such integrals run :func:`srsi` and :func:`srs`.
+    """
+
+
+def nevpt2_eris(mc, mo, with_df):
+    """pyscf's DF-NEVPT2 integrals (``vhf_c``, ``ppaa``, ``papa``, ``pacv``, ``h1eff``) for a
+    :class:`~mojoscf.dft.MojoDF` whose tensor is in memory or memory-mapped, as :class:`NEVPT2ERIS`; None
+    when that does not apply or they do not fit in ``max_memory`` (pyscf's ``_ERIS`` then runs).
+
+    Two partial transforms replace pyscf's four: (Q|up) with the active
+    orbitals u (``papa``, ``pacv`` and the (Q|uv) block) and (Q|cv).
+    ``ppaa`` = (pq|uv) for all orbital pairs comes from the AO matrices
+    sum_Q E_Q (Q|uv), one per active pair, transformed to the MO basis: no
+    full (Q|pq) transform.
+    """
+    cderi = _incore_tensor(mc, mo, with_df)
+    if cderi is None:
+        return None
+    log = logger.new_logger(mc)
+    t0 = (logger.process_clock(), logger.perf_counter())
+    mo = np.ascontiguousarray(mo, dtype=np.float64)
+    nao, nmo = mo.shape
+    ncore, ncas = mc.ncore, mc.ncas
+    nocc = ncore + ncas
+    nvir = nmo - nocc
+    naux = cderi.shape[0]
+    words = (2 * nmo * nmo * ncas * ncas + nmo * ncas * ncore * nvir + naux * ncore * nvir
+             + naux * ncas * nmo + 3 * ncas * ncas * nao * nao)
+    if words * 8e-6 > 0.8 * (mc.max_memory - lib.current_memory()[0]):
+        return None
+    ap = kernels.df_mo(cderi, mo[:, ncore:nocc], mo)                      # (Q|up)
+    cv = kernels.df_mo(cderi, mo[:, :ncore], mo[:, nocc:])                # (Q|cv)
+    pa = np.ascontiguousarray(ap.transpose(0, 2, 1)).reshape(naux, nmo * ncas)
+    papa = lib.dot(pa.T, pa).reshape(nmo, ncas, nmo, ncas)
+    pacv = lib.dot(pa.T, cv.reshape(naux, ncore * nvir)).reshape(nmo, ncas, ncore, nvir)
+    aa = np.ascontiguousarray(ap[:, :, ncore:nocc]).reshape(naux, ncas * ncas)
+    ap = pa = None
+    w = lib.unpack_tril(lib.dot(aa.T, cderi))                             # sum_Q (Q|uv) E_Q
+    ppaa = np.matmul(mo.T, np.matmul(w, mo))                              # (uv, p, q)
+    w = None
+    ppaa = np.ascontiguousarray(ppaa.reshape(ncas * ncas, nmo * nmo).T).reshape(nmo, nmo, ncas, ncas)
+    dmcore = mo[:, :ncore] @ mo[:, :ncore].T
+    vj, vk = mc._scf.get_jk(mc.mol, dmcore)
+    vhf_c = mo.T @ (vj * 2 - vk) @ mo
+    eris = NEVPT2ERIS(vhf_c=vhf_c, ppaa=ppaa, papa=papa, pacv=pacv, cvcv=None,
+                      h1eff=mo.T @ mc.get_hcore() @ mo + vhf_c)
+    eris.cv = cv
+    log.timer("mojoscf DF-NEVPT2 integrals", *t0)
+    return eris
+
+
+def sijrs(nevpt, eris, verbose=None):
+    """pyscf's Sijrs subspace (``pyscf.mrpt.nevpt2.Sijrs``: norm and energy of the doubly external
+    core -> virtual excitations) from the DF factors of :class:`NEVPT2ERIS`.
+
+    For each core orbital i, (ia|jb) = sum_Q (Q|ia)(Q|jb) for j <= i is one
+    GEMM and is contracted with 2(ia|jb) - (ib|ja) as pyscf does with the
+    stored (cv|cv); the terms are symmetric under (ia) <-> (jb), so the pairs
+    j < i count twice and half of (cv|cv) is ever formed.
+    """
+    cv = eris.cv
+    naux, ncore, nvir = cv.shape
+    nocc = nevpt.ncore + nevpt.ncas
+    mo_energy = np.asarray(nevpt.mo_energy)
+    eia = mo_energy[:ncore, None] - mo_energy[None, nocc:]
+    cv2 = cv.reshape(naux, ncore * nvir)
+    norm = e = 0.0
+    for i in range(ncore):
+        k = i + 1
+        g = (cv[:, i].T @ cv2[:, :k * nvir]).reshape(nvir, k, nvir)          # (ia|jb), j <= i
+        theta = g * 2 - g.transpose(2, 1, 0)
+        wgt = np.full(k, 2.0)
+        wgt[i] = 1.0
+        norm += np.einsum("ajb,ajb->j", g, theta) @ wgt
+        g /= eia[i][:, None, None] + eia[None, :k, :]
+        e += np.einsum("ajb,ajb->j", g, theta) @ wgt
+    return norm, e
+
+
+def srsi(nevpt, dms, eris, verbose=None):
+    """pyscf's Srsi subspace (``pyscf.mrpt.nevpt2.Srsi``, the r <= s sums of its current version) with
+    the three-index contractions sum_pa (rs|ip) m_pa (rs|ia) as a GEMM over p and a two-index reduction."""
+    from pyscf.mrpt import nevpt2 as pnev
+
+    ncore, ncas = nevpt.ncore, nevpt.ncas
+    nocc = ncore + ncas
+    dm1, dm2 = dms["1"], dms["2"]
+    h1e = eris["h1eff"][ncore:nocc, ncore:nocc]
+    h2e = eris["ppaa"][ncore:nocc, ncore:nocc].transpose(0, 2, 1, 3)
+    h2e_v = np.ascontiguousarray(eris["pacv"][nocc:].transpose(3, 0, 2, 1))     # (r, s, i, p)
+    nvir = h2e_v.shape[0]
+    k27 = pnev.make_k27(h1e, h2e, dm1, dm2)
+    vi_diag = np.diag_indices(nvir)
+    vi_triu = np.triu_indices(nvir)
+
+    def contract(m):
+        x = (h2e_v.reshape(-1, ncas) @ m).reshape(h2e_v.shape)
+        out = 2.0 * np.einsum("rsia,rsia->rsi", x, h2e_v) - np.einsum("rsia,sria->rsi", x, h2e_v)
+        out += out.transpose(1, 0, 2)
+        out[vi_diag] *= 0.5
+        return out
+
+    norm = contract(dm1)
+    h = contract(k27)
+    mo_energy = np.asarray(nevpt.mo_energy)
+    diff = mo_energy[nocc:, None, None] + mo_energy[None, nocc:, None] - mo_energy[None, None, :ncore]
+    return pnev._norm_to_energy(norm[vi_triu], h[vi_triu], diff[vi_triu])
+
+
+def srs(nevpt, dms, eris, verbose=None):
+    """pyscf's Srs subspace (``pyscf.mrpt.nevpt2.Srs``) with sum_{pq,ab} (rs|qp)(rs|ba) m_pqab as one GEMM
+    (nvir^2 x ncas^2 x ncas^2) and a row-wise dot product."""
+    from pyscf.mrpt import nevpt2 as pnev
+
+    ncore, ncas = nevpt.ncore, nevpt.ncas
+    nocc = ncore + ncas
+    nvir = eris["papa"].shape[0] - nocc
+    if nvir == 0:
+        return 0, 0
+    h1e = eris["h1eff"][ncore:nocc, ncore:nocc]
+    h2e = eris["ppaa"][ncore:nocc, ncore:nocc].transpose(0, 2, 1, 3)
+    hv = np.ascontiguousarray(eris["papa"][nocc:, :, nocc:].transpose(0, 2, 1, 3)).reshape(nvir * nvir, ncas * ncas)
+    rm2, a7 = pnev.make_a7(h1e, h2e, dms["1"], dms["2"], dms["3"])
+    n2 = ncas * ncas
+    norm = 0.5 * np.einsum("xy,xy->x", hv @ rm2.transpose(1, 0, 2, 3).reshape(n2, n2), hv).reshape(nvir, nvir)
+    h = 0.5 * np.einsum("xy,xy->x", hv @ a7.transpose(1, 0, 3, 2).reshape(n2, n2), hv).reshape(nvir, nvir)
+    mo_energy = np.asarray(nevpt.mo_energy)
+    return pnev._norm_to_energy(norm, h, mo_energy[nocc:, None] + mo_energy[None, nocc:])
+
+
 _installed = False
 
 
 def install():
     """Make pyscf's DF-CASSCF build its integrals with :func:`make_eris` for :class:`~mojoscf.dft.MojoDF`
-    objects (``pyscf.mcscf.df._ERIS``), and run the J/K of its orbital Hessian steps with
-    :meth:`ERIS.update_jk_in_ah` when they have the MO-basis tensor (``_DFCASSCF.update_jk_in_ah``).
-    Idempotent; other DF objects keep pyscf's code."""
+    objects (``pyscf.mcscf.df._ERIS``) and run the J/K of its orbital Hessian steps with
+    :meth:`ERIS.update_jk_in_ah` when they have the MO-basis tensor (``_DFCASSCF.update_jk_in_ah``), and
+    DF-NEVPT2 build its integrals with :func:`nevpt2_eris` (``pyscf.mrpt.dfnevpt2._ERIS``; the Sijrs,
+    Srsi and Srs subspaces of those integrals from :func:`sijrs`, :func:`srsi`, :func:`srs`).  Idempotent;
+    other DF objects keep pyscf's code."""
     global _installed
     if _installed:
         return
@@ -209,4 +357,33 @@ def install():
 
         update_jk_in_ah._mojoscf_orig = own
         cls.update_jk_in_ah = update_jk_in_ah
+    from pyscf.mrpt import dfnevpt2, nevpt2
+
+    orig_nevpt2 = dfnevpt2._ERIS
+
+    def _NEVPT2_ERIS(mc, mo, with_df, method="incore"):
+        eris = nevpt2_eris(mc, mo, with_df)
+        return eris if eris is not None else orig_nevpt2(mc, mo, with_df, method)
+
+    _NEVPT2_ERIS._mojoscf_orig = orig_nevpt2
+    dfnevpt2._ERIS = _NEVPT2_ERIS
+    orig_sijrs, orig_srsi, orig_srs = nevpt2.Sijrs, nevpt2.Srsi, nevpt2.Srs
+
+    def Sijrs(mc, eris, verbose=None):
+        if isinstance(eris, NEVPT2ERIS):
+            return sijrs(mc, eris, verbose)
+        return orig_sijrs(mc, eris, verbose)
+
+    def Srsi(mc, dms, eris, verbose=None):
+        if isinstance(eris, NEVPT2ERIS):
+            return srsi(mc, dms, eris, verbose)
+        return orig_srsi(mc, dms, eris, verbose)
+
+    def Srs(mc, dms, eris=None, verbose=None):
+        if isinstance(eris, NEVPT2ERIS):
+            return srs(mc, dms, eris, verbose)
+        return orig_srs(mc, dms, eris, verbose)
+
+    Sijrs._mojoscf_orig, Srsi._mojoscf_orig, Srs._mojoscf_orig = orig_sijrs, orig_srsi, orig_srs
+    nevpt2.Sijrs, nevpt2.Srsi, nevpt2.Srs = Sijrs, Srsi, Srs
     _installed = True

@@ -13,9 +13,12 @@ with the Mojo DF kernel (:class:`mojoscf.dft.MojoDF`).  Reported: the CASSCF
 and SCF times, the CASSCF macro iterations and orbital Hessian steps (J/K
 builds) of each driver and the energy difference.  ``--tuned-pyscf`` also
 runs pyscf with ``OPENBLAS_THREAD_TIMEOUT=16``, the OpenBLAS spin-wait that
-mojoscf sets when it is imported.  Usage:
+mojoscf sets when it is imported.  ``--nevpt2`` adds pyscf's
+strongly-contracted NEVPT2 (``mrpt.NEVPT``) of the three lowest states, a
+CASCI on the state-averaged orbitals (DF integrals from
+:func:`mojoscf.casscf.nevpt2_eris` for mojoscf).  Usage:
 
-    python benchmarks/bench_casscf.py [--cases a,b,...] [--heavy] [--tuned-pyscf] [--list]
+    python benchmarks/bench_casscf.py [--cases a,b,...] [--heavy] [--tuned-pyscf] [--nevpt2] [--list]
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ CASES = {
     "ni6-svp": ("[Ni(H2O)6]2+ triplet / def2-SVP", NI6, "def2-svp", 2, 2, ["Ni 3d"], 10),
     "cu4-svp": ("[Cu(NH3)4]2+ doublet / def2-SVP", CU4, "def2-svp", 2, 1, ["Cu 3d"], 5),
     "fe6-tzvp": ("[Fe(H2O)6]2+ quintet / def2-TZVP", FE6, "def2-tzvp", 2, 4, ["Fe 3d"], 5),
-    "ni6-tzvp": ("[Ni(H2O)6]2+ triplet / def2-TZVP", NI6, "def2-tzvp", 2, 2, ["Ni 3d"], 10),
+    "cu4-tzvp": ("[Cu(NH3)4]2+ doublet / def2-TZVP", CU4, "def2-tzvp", 2, 1, ["Cu 3d"], 5),
     "fe6-12w": ("[Fe(H2O)6]2+ 12H2O quintet / def2-SVP", "solvated_ion_atoms()", "def2-svp", 2, 4, ["Fe 3d"], 5),
 }
 HEAVY = {"fe6-12w"}
@@ -66,15 +69,24 @@ mc.conv_tol = 1e-8
 stats = {}
 mc.callback = lambda envs: stats.update(macro=envs["imacro"], jk=envs["totinner"])
 t0 = time.perf_counter(); mc.kernel(mo); tcas = time.perf_counter() - t0
+enev, tnev = [], None
+if %(nevpt2)r:
+    from pyscf import mrpt
+    mc2 = mcscf.CASCI(mf, ncas, nelecas)
+    mc2.fcisolver.nroots = 3
+    mc2.kernel(mc.mo_coeff)
+    t0 = time.perf_counter()
+    enev = [float(mrpt.NEVPT(mc2, root=i).kernel()) for i in range(3)]
+    tnev = time.perf_counter() - t0
 print(json.dumps(dict(tscf=tscf, tcas=tcas, ecas=mc.e_tot, ncas=int(ncas), nelecas=int(nelecas), nao=mol.nao_nr(),
-                      conv=bool(mc.converged), scf_conv=bool(mf.converged), **stats)))
+                      conv=bool(mc.converged), scf_conv=bool(mf.converged), tnev=tnev, enev=enev, **stats)))
 '''
 
 
-def run(case, driver, bench_dir, env=None):
+def run(case, driver, bench_dir, env=None, nevpt2=False):
     _, atoms, basis, charge, spin, ao_labels, nstates = CASES[case]
     code = WORKER % dict(bench_dir=bench_dir, atoms=atoms, basis=basis, charge=charge, spin=spin,
-                         ao_labels=ao_labels, nstates=nstates, driver=driver)
+                         ao_labels=ao_labels, nstates=nstates, driver=driver, nevpt2=nevpt2)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env=None if env is None else {**os.environ, **env})
     if out.returncode != 0:
@@ -88,6 +100,7 @@ def main():
     ap.add_argument("--heavy", action="store_true", help="also run the cases marked heavy")
     ap.add_argument("--tuned-pyscf", action="store_true",
                     help="also time pyscf with OPENBLAS_THREAD_TIMEOUT=16 (mojoscf's OpenBLAS spin-wait)")
+    ap.add_argument("--nevpt2", action="store_true", help="also time NEVPT2 of the three lowest states")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list:
@@ -96,21 +109,28 @@ def main():
         return
     bench_dir = os.path.dirname(os.path.abspath(__file__))
     tuned = f" {'tuned':>7s}" if args.tuned_pyscf else ""
+    nev = f" | {'NEVPT2 pyscf':>12s}{tuned} {'mojoscf':>8s} {'x':>5s} {'|dE2|':>7s}" if args.nevpt2 else ""
     print(f"{'system':38s} {'nao':>4s} {'CAS':>7s} {'SA':>3s} {'macro':>5s} {'AH J/K':>7s} | {'CASSCF pyscf':>12s}{tuned} "
-          f"{'mojoscf':>8s} {'x':>5s} | {'SCF pyscf':>9s} {'mojoscf':>8s} | {'|dE|':>7s}")
+          f"{'mojoscf':>8s} {'x':>5s} | {'SCF pyscf':>9s} {'mojoscf':>8s} | {'|dE|':>7s}{nev}")
     keys = args.cases.split(",") if args.cases else [k for k in CASES if args.heavy or k not in HEAVY]
     for key in keys:
         name, nstates = CASES[key][0], CASES[key][6]
-        ref = run(key, "pyscf", bench_dir)
-        tun = run(key, "pyscf", bench_dir, {"OPENBLAS_THREAD_TIMEOUT": "16"}) if args.tuned_pyscf else None
-        moj = run(key, "mojoscf", bench_dir)
+        ref = run(key, "pyscf", bench_dir, nevpt2=args.nevpt2)
+        tun = (run(key, "pyscf", bench_dir, {"OPENBLAS_THREAD_TIMEOUT": "16"}, nevpt2=args.nevpt2)
+               if args.tuned_pyscf else None)
+        moj = run(key, "mojoscf", bench_dir, nevpt2=args.nevpt2)
         cas = f"({ref['nelecas']},{ref['ncas']})"
         flag = "" if ref["conv"] and moj["conv"] else "  NOT CONVERGED"
         tcol = f" {tun['tcas']:7.1f}" if tun else ""
+        nev = ""
+        if args.nevpt2:
+            de2 = max(abs(a - b) for a, b in zip(ref["enev"], moj["enev"]))
+            tnev = f" {tun['tnev']:7.1f}" if tun else ""
+            nev = f" | {ref['tnev']:12.1f}{tnev} {moj['tnev']:8.1f} {ref['tnev'] / moj['tnev']:4.1f}x {de2:7.1e}"
         print(f"{name:38s} {ref['nao']:4d} {cas:>7s} {nstates:3d} {ref['macro']:2d}/{moj['macro']:<2d} "
               f"{ref['jk']:3d}/{moj['jk']:<3d} | {ref['tcas']:12.1f}{tcol} {moj['tcas']:8.1f} "
               f"{ref['tcas'] / moj['tcas']:4.1f}x | {ref['tscf']:9.1f} {moj['tscf']:8.1f} | "
-              f"{abs(ref['ecas'] - moj['ecas']):7.1e}{flag}", flush=True)
+              f"{abs(ref['ecas'] - moj['ecas']):7.1e}{flag}{nev}", flush=True)
 
 
 if __name__ == "__main__":

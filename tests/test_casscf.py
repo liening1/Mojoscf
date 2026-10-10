@@ -107,3 +107,44 @@ def test_pyscf_eris_kept_without_mojo_df():
     mcas.install()
     assert mcas.make_eris(mc, mf.mo_coeff, mf.with_df) is None
     assert not isinstance(mc.ao2mo(mf.mo_coeff), mcas.ERIS)
+
+
+def _orig_nevpt2_eris():
+    from pyscf.mrpt import dfnevpt2
+
+    return getattr(dfnevpt2._ERIS, "_mojoscf_orig", dfnevpt2._ERIS)
+
+
+def test_nevpt2_eris_match_pyscf(o2):
+    """vhf_c, ppaa, papa, pacv and h1eff of DF-NEVPT2 equal pyscf's dfnevpt2._ERIS, and the DF factors
+    kept instead of cvcv reproduce it."""
+    mf, _ = o2
+    mc = mcscf.CASCI(mf, 6, 8)
+    mc.kernel()
+    ref = _orig_nevpt2_eris()(mc, mc.mo_coeff, mf.with_df)
+    eris = mcas.nevpt2_eris(mc, mc.mo_coeff, mf.with_df)
+    assert isinstance(eris, mcas.NEVPT2ERIS) and eris["cvcv"] is None
+    for name in ("vhf_c", "ppaa", "papa", "pacv", "h1eff"):
+        a, b = np.asarray(eris[name]), np.asarray(ref[name])
+        assert a.shape == b.shape and abs(a - b).max() < 1e-10, name
+    cv = eris.cv.reshape(eris.cv.shape[0], -1)
+    assert abs(cv.T @ cv - ref["cvcv"]).max() < 1e-10
+
+
+def test_nevpt2_energy(o2, monkeypatch):
+    """pyscf's NEVPT2 of a DF-CASCI on an accelerated reference uses mojoscf's integrals (and the Sijrs
+    subspace from the DF factors) and gives the energy of pyscf's integral code."""
+    from pyscf import mrpt
+    from pyscf.mrpt import dfnevpt2, nevpt2
+
+    mf, _ = o2
+    mc = mcscf.CASCI(mf, 6, 8).run()
+    built = []
+    orig = mcas.nevpt2_eris
+    monkeypatch.setattr(mcas, "nevpt2_eris", lambda *a: built.append(orig(*a)) or built[-1])
+    e1 = mrpt.NEVPT(mc).kernel()
+    assert built and isinstance(built[0], mcas.NEVPT2ERIS)
+    monkeypatch.setattr(dfnevpt2, "_ERIS", getattr(dfnevpt2._ERIS, "_mojoscf_orig", dfnevpt2._ERIS))
+    monkeypatch.setattr(nevpt2, "Sijrs", getattr(nevpt2.Sijrs, "_mojoscf_orig", nevpt2.Sijrs))
+    e0 = mrpt.NEVPT(mc).kernel()
+    assert abs(e1 - e0) < 1e-10
