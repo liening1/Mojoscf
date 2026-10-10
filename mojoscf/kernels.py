@@ -44,6 +44,30 @@ def _square(a, name: str) -> np.ndarray:
     return a
 
 
+def dot(a, b, alpha=1.0, c=None, beta=0.0):
+    """pyscf's ``lib.dot`` (``alpha a @ b + beta c``, into ``c`` when given) on NumPy's BLAS.
+
+    pyscf's ``lib.dot`` multiplies with the OpenBLAS of the pyscf wheel, a
+    sequential 0.3.3 build without AVX-512 kernels split over OpenMP threads:
+    36 to 62 GFlop/s for the products of the DF integral and gradient code on
+    4 cores here, against 120 to 216 GFlop/s with NumPy's (multithreaded,
+    current) OpenBLAS.  Transposed (Fortran-ordered) operands are used
+    without a copy.
+    """
+    ab = np.matmul(a, b)
+    if alpha != 1.0:
+        ab *= alpha
+    if c is None:
+        return ab
+    if beta == 0.0:
+        c[...] = ab
+    else:
+        if beta != 1.0:
+            c *= beta
+        c += ab
+    return c
+
+
 def gemm(a, b, transa: bool = False, transb: bool = False, alpha: float = 1.0, beta: float = 0.0, out=None):
     """Row-major ``C = alpha * op(A) @ op(B) + beta * C``."""
     a = _c(a)

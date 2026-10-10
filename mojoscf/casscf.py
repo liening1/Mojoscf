@@ -70,9 +70,9 @@ class ERIS:
         self.k_pc = np.ascontiguousarray(kpc.T)
         b2 = b.reshape(naux, nmo * nmo)
         baa = np.ascontiguousarray(self.bact[:, :, ncore:nocc]).reshape(naux, ncas * ncas)
-        self.ppaa = lib.dot(b2.T, baa).reshape(nmo, nmo, ncas, ncas)
+        self.ppaa = kernels.dot(b2.T, baa).reshape(nmo, nmo, ncas, ncas)
         pa = np.ascontiguousarray(self.bact.transpose(0, 2, 1)).reshape(naux, nmo * ncas)
-        self.papa = lib.dot(pa.T, pa).reshape(nmo, ncas, nmo, ncas)
+        self.papa = kernels.dot(pa.T, pa).reshape(nmo, ncas, nmo, ncas)
         self.vhf_c = vj * 2 - vk
 
     def _build_blocked(self, mo, cderi, ncore, ncas, max_memory):
@@ -93,12 +93,12 @@ class ERIS:
             k_cp += np.einsum("kij,kij->ij", bc, bc)
             bufpa[q0:q1] = b[:, :, ncore:nocc]
             baa = np.ascontiguousarray(b[:, ncore:nocc, ncore:nocc]).reshape(q1 - q0, ncas * ncas)
-            lib.dot(b.reshape(q1 - q0, -1).T, baa, 1.0, ppaa, 1.0)
+            kernels.dot(b.reshape(q1 - q0, -1).T, baa, 1.0, ppaa, 1.0)
             b = d = bc = baa = None
         self.k_pc = np.ascontiguousarray(k_cp.T)
         self.ppaa = ppaa.reshape(nmo, nmo, ncas, ncas)
         pa = bufpa.reshape(naux, nmo * ncas)
-        self.papa = lib.dot(pa.T, pa).reshape(nmo, ncas, nmo, ncas)
+        self.papa = kernels.dot(pa.T, pa).reshape(nmo, ncas, nmo, ncas)
 
     def same_mo(self, mo) -> bool:
         """True when ``mo`` are the orbitals of these integrals."""
@@ -247,11 +247,11 @@ def nevpt2_eris(mc, mo, with_df):
     ap = kernels.df_mo(cderi, mo[:, ncore:nocc], mo)                      # (Q|up)
     cv = kernels.df_mo(cderi, mo[:, :ncore], mo[:, nocc:])                # (Q|cv)
     pa = np.ascontiguousarray(ap.transpose(0, 2, 1)).reshape(naux, nmo * ncas)
-    papa = lib.dot(pa.T, pa).reshape(nmo, ncas, nmo, ncas)
-    pacv = lib.dot(pa.T, cv.reshape(naux, ncore * nvir)).reshape(nmo, ncas, ncore, nvir)
+    papa = kernels.dot(pa.T, pa).reshape(nmo, ncas, nmo, ncas)
+    pacv = kernels.dot(pa.T, cv.reshape(naux, ncore * nvir)).reshape(nmo, ncas, ncore, nvir)
     aa = np.ascontiguousarray(ap[:, :, ncore:nocc]).reshape(naux, ncas * ncas)
     ap = pa = None
-    w = lib.unpack_tril(lib.dot(aa.T, cderi))                             # sum_Q (Q|uv) E_Q
+    w = lib.unpack_tril(kernels.dot(aa.T, cderi))                             # sum_Q (Q|uv) E_Q
     ppaa = np.matmul(mo.T, np.matmul(w, mo))                              # (uv, p, q)
     w = None
     ppaa = np.ascontiguousarray(ppaa.reshape(ncas * ncas, nmo * nmo).T).reshape(nmo, nmo, ncas, ncas)
@@ -342,6 +342,24 @@ def srs(nevpt, dms, eris, verbose=None):
     h = 0.5 * np.einsum("xy,xy->x", hv @ a7.transpose(1, 0, 3, 2).reshape(n2, n2), hv).reshape(nvir, nvir)
     mo_energy = np.asarray(nevpt.mo_energy)
     return pnev._norm_to_energy(norm, h, mo_energy[nocc:, None] + mo_energy[None, nocc:])
+
+class _EinsumNumpy:
+    """``numpy`` for ``pyscf.mrpt.nevpt2``, whose subspace energies contract the active-space 2- and
+    3-RDMs with integrals in some 230 ``numpy.einsum`` calls (``make_a16``, ``make_a22``, ``Sir``, ...):
+    there ``einsum`` with two or more operands takes BLAS contraction paths (``optimize=True``, 5 to 10x
+    for ncas = 10; the same contractions, summed in another order).  Everything else is numpy's."""
+
+    _mojoscf_orig = np
+
+    def __getattr__(self, name):
+        return getattr(np, name)
+
+    @staticmethod
+    def einsum(*operands, **kwargs):
+        if len(operands) > 2:
+            kwargs.setdefault("optimize", True)
+        return np.einsum(*operands, **kwargs)
+
 
 def _sa_terms_ok(mc, auxbasis_response):
     from . import dft
@@ -896,4 +914,6 @@ def install():
 
     Sijrs._mojoscf_orig, Srsi._mojoscf_orig, Srs._mojoscf_orig = orig_sijrs, orig_srsi, orig_srs
     nevpt2.Sijrs, nevpt2.Srsi, nevpt2.Srs = Sijrs, Srsi, Srs
+    if nevpt2.__dict__.get("numpy") is np:
+        nevpt2.numpy = _EinsumNumpy()
     _installed = True

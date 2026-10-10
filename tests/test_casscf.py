@@ -191,6 +191,22 @@ def test_nevpt2_energy(o2, monkeypatch):
     assert abs(e1 - e0) < 1e-10
 
 
+def test_nevpt2_einsum_paths(o2, monkeypatch):
+    """pyscf's NEVPT2 module contracts its RDMs on BLAS paths (mojoscf.casscf._EinsumNumpy) with the
+    energy of plain numpy.einsum."""
+    from pyscf import mrpt
+    from pyscf.mrpt import nevpt2
+
+    assert isinstance(nevpt2.numpy, mcas._EinsumNumpy)
+    assert nevpt2.numpy.ndarray is np.ndarray
+    mf, _ = o2
+    mc = mcscf.CASCI(mf, 6, 8).run()
+    e1 = mrpt.NEVPT(mc).kernel()
+    monkeypatch.setattr(nevpt2, "numpy", np)
+    e0 = mrpt.NEVPT(mc).kernel()
+    assert abs(e1 - e0) < 1e-11
+
+
 @pytest.mark.parametrize("case", ["o2", "n2", "agh"])
 def test_casscf_gradient_matches_pyscf(case):
     """mc.nuc_grad_method() of a DF-CASSCF on an accelerated reference is mojoscf's and gives pyscf's DF-CASSCF

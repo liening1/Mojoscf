@@ -30,6 +30,7 @@ import numpy as np
 from pyscf import gto, lib
 from pyscf.df import addons as df_addons
 
+from . import kernels
 from ._backend import get_extension
 
 __all__ = [
@@ -316,7 +317,7 @@ def cholesky_eri(mol, auxbasis="weigend+etb", auxmol=None, lindep=None, omega=No
         w, v = scipy.linalg.eigh(j2c)
         keep = w > lindep
         v = v[:, keep] / np.sqrt(w[keep])
-        return lib.dot(v.T, j3c)
+        return kernels.dot(v.T, j3c)
 
 
 def cholesky_eri_h5(mol, erifile, auxmol=None, auxbasis="weigend+etb", dataname="j3c", max_memory=2000,
@@ -366,7 +367,7 @@ def cholesky_eri_h5(mol, erifile, auxmol=None, auxbasis="weigend+etb", dataname=
             if low is not None:
                 dat = sblas.dtrsm(1.0, low, j3c.T, side=1, lower=1, trans_a=1, overwrite_b=1).T
             else:
-                dat = lib.dot(eig.T, j3c)
+                dat = kernels.dot(eig.T, j3c)
             dset[:, first[a0]:first[a1]] = dat
             j3c = dat = None
             a0 = a1
@@ -815,7 +816,7 @@ def grad2e_df(mol, auxmol, dm_j, orbs, occs, j_factor=1.0, k_factor=1.0, max_mem
         if np.all(wij >= 0):
             w -= k_factor * _syrk_full((xs[st] * np.sqrt(wij)).T)
         else:
-            w -= k_factor * lib.dot(xs[st] * wij, xs[st].T)
+            w -= k_factor * kernels.dot(xs[st] * wij, xs[st].T)
 
     de = np.zeros((auxmol.natm, 3))
     ext.grad2c(aux_tables, table, np.ascontiguousarray(w), de, omega)
@@ -867,8 +868,8 @@ def grad2e_df_rdm2(mol, auxmol, orbs, dm2, max_memory=4000, tol=1e-14):
     g = np.asarray(dm2, dtype=np.float64).reshape(n, n, n, n)
     g = g + g.transpose(1, 0, 2, 3)
     g = (g + g.transpose(0, 1, 3, 2)) * 0.25
-    d = lib.dot(x, g.reshape(n * n, n * n).T)                          # D_P,uv
-    w = lib.dot(d, x.T)
+    d = kernels.dot(x, g.reshape(n * n, n * n).T)                          # D_P,uv
+    w = kernels.dot(d, x.T)
     de = np.zeros((auxmol.natm, 3))
     ext.grad2c(aux_tables, table, np.ascontiguousarray(w), de, omega)
     w = x = None
@@ -937,12 +938,12 @@ def grad2e_df_casscf(mol, auxmol, mo_core, mo_cas, casdm1, casdm2, max_memory=40
     g = np.asarray(casdm2, dtype=np.float64).reshape(ncas, ncas, ncas, ncas)
     g = g + g.transpose(1, 0, 2, 3)
     g = (g + g.transpose(0, 1, 3, 2)) * 0.25
-    dg = lib.dot(xu, g.reshape(ncas * ncas, ncas * ncas).T)               # D_P,uv
-    wmat = lib.dot(dg, xu.T) + np.outer(c1, c1) - np.outer(ca, ca)
+    dg = kernels.dot(xu, g.reshape(ncas * ncas, ncas * ncas).T)               # D_P,uv
+    wmat = kernels.dot(dg, xu.T) + np.outer(c1, c1) - np.outer(ca, ca)
     nn = np.outer(n1, n1)
     ww = np.outer(w, w)
-    wmat -= 0.5 * lib.dot(x.reshape(naux, m * m) * nn.ravel(), x.reshape(naux, m * m).T)
-    wmat += 0.5 * lib.dot(xa.reshape(naux, -1) * ww.ravel(), np.ascontiguousarray(xa).reshape(naux, -1).T)
+    wmat -= 0.5 * kernels.dot(x.reshape(naux, m * m) * nn.ravel(), x.reshape(naux, m * m).T)
+    wmat += 0.5 * kernels.dot(xa.reshape(naux, -1) * ww.ravel(), np.ascontiguousarray(xa).reshape(naux, -1).T)
     de = np.zeros((auxmol.natm, 3))
     ext.grad2c(aux_tables, table, np.ascontiguousarray(wmat), de, omega)
     wmat = xu = None
@@ -1067,8 +1068,8 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
         c1 = solve(ap @ pack_dot(y1))
         c2 = solve(ap @ pack_dot(y2))
         cc = np.stack((c2, c1), axis=1)                                   # rank-2 updates as GEMMs
-        lib.dot(cc, np.stack((pack_sym(y1), pack_sym(y2))), f, mpk, 1.0)
-        lib.dot(cc, cc[:, ::-1].T.copy(), f, wmat, 1.0)
+        kernels.dot(cc, np.stack((pack_sym(y1), pack_sym(y2))), f, mpk, 1.0)
+        kernels.dot(cc, cc[:, ::-1].T.copy(), f, wmat, 1.0)
         s1, s2 = support(y1), support(y2)
         if len(s1) == 0 or len(s2) == 0:
             continue
@@ -1076,11 +1077,11 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
         n1, n2 = len(s1), len(s2)
         y1s = np.ascontiguousarray(y1[np.ix_(s1, s1)])
         y2s = np.ascontiguousarray(y2[np.ix_(s2, s2)])
-        a = lib.dot(xb.reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)              # X_P Y2
+        a = kernels.dot(xb.reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)              # X_P Y2
         c = np.matmul(y1s, xb)                                                          # Y1 X_P
-        b = lib.dot(c.reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)                # Y1 X_P Y2
+        b = kernels.dot(c.reshape(naux * n1, n2), y2s).reshape(naux, n1, n2)                # Y1 X_P Y2
         add_block(-0.5 * f * b, s1, s2, 2.0)
-        t = lib.dot(a.reshape(naux, n1 * n2), c.reshape(naux, n1 * n2).T)
+        t = kernels.dot(a.reshape(naux, n1 * n2), c.reshape(naux, n1 * n2).T)
         wmat -= 0.5 * f * (t + t.T)
         xb = a = b = c = t = None
     for f, left, right, g in rdm2_terms:
@@ -1089,13 +1090,13 @@ def grad2e_df_terms(mol, auxmol, orbs, jk_terms=(), rdm2_terms=(), max_memory=40
         g2 = g.reshape(n * n, n * n)
         xl = sum(xblock(np.asarray(i), np.asarray(j)) for i, j in left).reshape(naux, n * n)
         xr = sum(xblock(np.asarray(i), np.asarray(j)) for i, j in right).reshape(naux, n * n)
-        dl = (f * lib.dot(xr, g2.T)).reshape(naux, n, n)
-        dr = (f * lib.dot(xl, g2)).reshape(naux, n, n)
+        dl = (f * kernels.dot(xr, g2.T)).reshape(naux, n, n)
+        dr = (f * kernels.dot(xl, g2)).reshape(naux, n, n)
         for i, j in left:
             add_block(0.5 * dl, np.asarray(i), np.asarray(j), 2.0)
         for i, j in right:
             add_block(0.5 * dr, np.asarray(i), np.asarray(j), 2.0)
-        wl = lib.dot(lib.dot(xl, g2), xr.T)
+        wl = kernels.dot(kernels.dot(xl, g2), xr.T)
         wmat += f * (wl + wl.T)
     xp = ap = None
     de = np.zeros((auxmol.natm, 3))
