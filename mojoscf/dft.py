@@ -600,9 +600,17 @@ MojoDF = type("MojoDF", (_MojoDFObject, pyscf_df.DF), {"__module__": __name__})
 
 
 def mojo_df(with_df):
-    """Put :class:`_MojoDFObject` in front of a plain pyscf ``df.DF`` object (in place); returns it."""
+    """Put :class:`_MojoDFObject` in front of a plain pyscf ``df.DF`` object (in place); returns it.
+
+    Also lets pyscf's DF-CASSCF build its integrals for such objects with
+    :mod:`mojoscf.casscf`.
+    """
     if type(with_df) is pyscf_df.DF:
         with_df.__class__ = MojoDF
+    if isinstance(with_df, MojoDF):
+        from . import casscf
+
+        casscf.install()
     return with_df
 
 

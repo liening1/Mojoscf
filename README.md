@@ -281,7 +281,11 @@ gradients.
   block read while the previous one is processed).  Ferrocene/def2-TZVP with
   `max_memory=1000`: building the file 5.1 s (pyscf) against 2.9 s, one J/K
   2.05 s against 0.50 s, the SCF 33.0 s against 7.4 s (4.5x, as with the
-  tensor in memory; streaming instead of mapping: 21.8 s).
+  tensor in memory; streaming instead of mapping: 21.8 s).  Fe(II)
+  porphine/def2-TZVP UHF (861 basis functions, a 6.8 GB tensor;
+  `bench_metals.py --heavy`): 100 SCF cycles 3241 s against 653 s (5.0x;
+  neither run converges from the default guess within 100 cycles), the
+  gradient 319 s against 46 s (7.0x).
 * **The DF object.**  The `with_df` of accelerated objects (and of
   `mojoscf.RHF(mol).density_fit()`) is a `mojoscf.dft.MojoDF`, pyscf's
   `df.DF` whose `get_jk` runs the Mojo kernel (in memory, mapped or
@@ -1122,7 +1126,9 @@ diis = mojoscf.CDIIS()                          # pyscf.scf.diis.CDIIS replaceme
 used.  Environment variables: `MOJOSCF_BLAS=/path/lib.so[:symbol_prefix]`,
 `MOJOSCF_NATIVE=1` (pure-Mojo fallbacks), `MOJOSCF_INTEGRALS=libcint` (use
 pyscf's integrals instead of the Mojo engine), `MOJOSCF_SKIP_BUILD=1`,
-`MOJOSCF_MOJO=/path/to/mojo`.
+`MOJOSCF_MOJO=/path/to/mojo`, `MOJOSCF_OPENBLAS_TIMEOUT=n` (spin-wait of
+NumPy's and SciPy's OpenBLAS threads, 2^n cycles, default 16; `0` keeps
+OpenBLAS's own, see below).
 
 ### BLAS/LAPACK backend
 
@@ -1151,6 +1157,27 @@ GEMM and the symmetric eigensolvers (`dsygvd`/`dsyevd`) are called through
   closes every block with one `dsyrk` rank-k update.  The other Mojo kernels
   that run GEMMs in worker threads (DF gradients, XC integration) do the same
   (`MOJOSCF_SEQ_BLAS=1`: the sequential library instead).
+* the spin-wait itself: everything that runs in parallel right after a
+  threaded BLAS call shares the cores with the spinning threads: pyscf's
+  OpenMP code (`lib.dot` splits small products over threads, libcint, the
+  FCI solver) and the worker threads of the Mojo kernels.  In pyscf's
+  DF-CASSCF a 5 x 175 x 25 `lib.dot` took 0.4 ms instead of 25 us.  When
+  mojoscf is imported it restarts the thread pools of NumPy's and SciPy's
+  bundled OpenBLAS with a spin of 2^16 cycles (`OPENBLAS_THREAD_TIMEOUT`,
+  which OpenBLAS reads when a pool starts; `MOJOSCF_OPENBLAS_TIMEOUT=n` for
+  2^n, `0` to keep OpenBLAS's setting; a timeout set in the environment is
+  left alone).  That is long enough for the back-to-back calls inside LAPACK
+  (`numpy.linalg.eigh` of 400 x 400 kept its 15 ms; with the shortest
+  spin, 2^4 cycles, it took 27 ms) and returns the cores to the code that
+  follows.  Measured on 4 cores: ferrocene/def2-SVP SCF (DF) 3.7 s -> 2.6 s,
+  direct 8.7 s -> 7.2 s, [Fe(H2O)6]2+ UKS/B3LYP 15.4 s -> 13.8 s, a
+  state-averaged DF-CASSCF of [Fe(H2O)6]2+ 29 s -> 20 s (before its
+  MO-basis orbital Hessian).  pyscf without mojoscf gains from the same
+  setting: its ROHF SCF of [Fe(H2O)6]2+ went from 24.1 s to 12.0 s and the
+  DF-CASSCF from 110 s to 88 s with `OPENBLAS_THREAD_TIMEOUT=4`.  The
+  benchmark tables compare with pyscf as installed (the DF-CASSCF table also
+  with that setting); the tables measured before mojoscf set it (all but
+  DF-CASSCF) are conservative for mojoscf.
 
 Both the LP64 (`dgemm_`) and the ILP64 interface with suffixed symbols
 (`dgemm_64_`) are recognised when a library is opened.
@@ -1184,6 +1211,7 @@ but slow for more than a few dozen orbitals.
 | TDA/TDDFT/TDHF response, exact integrals | AO transition densities through `get_jk` with `hermi=0` (`_vhf.incore` or libcint + `libcvhf` direct) and the XC kernel | in-core ERIs transformed once to (ov) x (ov) matrices (GEMMs per iteration), or J/K of all transition densities in one integral-direct pass (antisymmetric parts K only); long-range exchange from erf-attenuated Mojo integrals |
 | excited-state gradients (`pyscf.grad.tdrks`/`tduks`/`tdrhf`), exact integrals | derivative J/K of four densities (libcint `int2e_ip1`, `libcvhf`), `_contract_xc_kernel` (Python loops, AO second/third derivatives), Z-vector through `gen_response` | Mojo: the two-electron term as one 8-fold pass over the derivative integrals contracted with density pairs (`grad2e_pairs_core`, also long-range), the XC-kernel contractions in grid passes, Z-vector through the Mojo J/K and XC kernels; pyscf's driver |
 | SCF stability analysis (`mf.stability()`) | orbital Hessian one vector per Davidson call, AO densities through `gen_response` | the TDDFT operators above for all vectors of an iteration (`lib.davidson1`); pyscf's Fock blocks, preconditioner and rotation |
+| DF-CASSCF integrals and orbital Hessian (`mcscf.df._ERIS`, `update_jk_in_ah`) | per macro iteration (Q|pq) for all MO pairs written to a temporary HDF5 file and read back for `ppaa`/`papa`; two AO J/K builds per orbital-Hessian step (rank 2 ncore densities, `df_jk.get_jk`) | Mojo transform (`df_mo`), (Q|pq) kept in memory for the macro iteration: `j_pc`, `k_pc`, `ppaa`, `papa` and the core potential from it, the orbital-Hessian J/K only for the rows pyscf uses, in the MO basis (`df_sandwich` on views of the tensor); pyscf's driver, FCI solver and orbital optimiser |
 | PCM/SMD solvation (`pyscf.solvent`): potential at the surface points, surface-charge matrix, S/D matrices, gradient | C (libcint `int3c2e`, `int3c2e_ip1/ip2` with the surface fakemol) + NumPy (einsum, (3, n, n) derivative arrays, two dense solves per cycle) | Mojo (`_mojo/qmmm.mojo`, `_mojo/pcm.mojo`): density-contracted potential pass, charge-lane potential matrix, S/D and their contracted derivatives (Boys-function erf); LU factorisation of K kept per build |
 | QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly (the gradient pass with density-contracted Hermite matrices gives the QM-atom term and all charge forces at once); nucleus-charge terms NumPy as in pyscf |
 
@@ -1260,6 +1288,15 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   internal (RHF/RKS, UHF/UKS) and external RHF/RKS analyses with the
   occupied-virtual operators; ROHF, GHF, the UHF -> GHF analysis,
   point-group symmetry labels and solvent models use pyscf's.
+* **DF-CASSCF**: pyscf's `mcscf.CASSCF` (and `mc.state_average_`,
+  `mc2step`) of a reference whose `with_df` is a `mojoscf.dft.MojoDF` with
+  the tensor in memory or memory-mapped gets its integrals from
+  `mojoscf.casscf` (installed into `pyscf.mcscf.df` when such a DF object is
+  created).  The MO-basis tensor (naux nmo^2 doubles) is kept when it fits
+  in `mc.max_memory`; otherwise the integrals are built block by block and
+  the orbital-Hessian J/K runs on the DF object.  UCASSCF, `approx_hessian`,
+  other DF classes and tensors that cannot be mapped keep pyscf's code; the
+  CASCI active-space integrals (`with_df.ao2mo`) stay pyscf's.
 * The native J/K build covers plain `pyscf.df.DF` objects with the tensor in
   core, the in-core 8-fold ERI path (used when `mol.incore_anyway` or pyscf's
   own memory check allows it) and integral-direct J/K otherwise (pyscf's

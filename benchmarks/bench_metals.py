@@ -12,7 +12,7 @@ each (system, driver) pair the script converges the SCF (conv_tol 1e-9; the
 same pyscf object, accelerated with ``mojoscf.accelerate`` for mojoscf) and
 then computes the gradient with ``nuc_grad_method()``.  Usage:
 
-    python benchmarks/bench_metals.py [--cases a,b,...] [--list]
+    python benchmarks/bench_metals.py [--cases a,b,...] [--heavy] [--list]
 """
 from __future__ import annotations
 
@@ -42,10 +42,13 @@ CASES = {
     "ni-svp-ic": ("Ni(CO)4 / def2-SVP (in-core)", NI4, "def2-svp", None, 0, 0, "rhf", "incore"),
     "fep-svp-df": ("Fe(II) porphine triplet / def2-SVP (DF, UHF)", 'porphyrin_atoms("Fe")', "def2-svp", None, 0, 2,
                    "uhf", "df"),
-    # the DF tensor (about 5 GB) does not fit in pyscf's default max_memory of 4000 MB: kept on disk
+    # the DF tensor (6.8 GB) does not fit in pyscf's default max_memory of 4000 MB: kept on disk.  Opt-in
+    # (--heavy): over an hour for pyscf, and from the default guess this UHF triplet does not converge within
+    # max_cycle = 100, so it compares the time per cycle
     "fep-tz-disk": ("Fe(II) porphine triplet / def2-TZVP (DF on disk, UHF)", 'porphyrin_atoms("Fe")', "def2-tzvp",
                     None, 0, 2, "uhf", "df-disk"),
 }
+HEAVY = {"fep-tz-disk"}
 
 WORKER = r'''
 import json, sys, time
@@ -93,7 +96,8 @@ def main():
     import numpy as np
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cases", default=",".join(CASES))
+    ap.add_argument("--cases", default=None)
+    ap.add_argument("--heavy", action="store_true", help="also run the cases marked heavy (over an hour)")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     if args.list:
@@ -102,7 +106,8 @@ def main():
     bench_dir = os.path.dirname(os.path.abspath(__file__))
     print(f"{'system':48s} {'nao':>4s} {'cyc':>6s} | {'SCF pyscf':>9s} {'mojoscf':>8s} {'x':>5s} | "
           f"{'grad pyscf':>10s} {'mojoscf':>8s} {'x':>5s} | {'|dE|':>7s} {'max|dg|':>8s}")
-    for key in args.cases.split(","):
+    keys = args.cases.split(",") if args.cases else [k for k in CASES if args.heavy or k not in HEAVY]
+    for key in keys:
         name = CASES[key][0]
         ref = run(key, "pyscf", bench_dir)
         moj = run(key, "mojoscf", bench_dir)

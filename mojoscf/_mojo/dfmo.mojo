@@ -68,10 +68,13 @@ def df_sandwich_core(
     p: Int,
     alpha: Float64,
     r: F64Ptr,
+    a_qs: Int,
+    b_qs: Int,
 ) raises:
     """r (m*nvec x p) += alpha * sum_Q reshape(A_Q X, (m*nvec, k2)) B_Q.
 
-    a : nq x m x k1,  x : k1 x (nvec*k2),  b : nq x k2 x p  (row-major).
+    a : nq x m x k1,  x : k1 x (nvec*k2),  b : nq x k2 x p  (row-major, A_Q at a + Q a_qs and
+    B_Q at b + Q b_qs: blocks of rows of larger per-Q matrices need no copy).
     """
     if nq == 0 or m == 0 or nvec == 0 or p == 0 or k1 == 0 or k2 == 0:
         return
@@ -83,14 +86,14 @@ def df_sandwich_core(
     var pt = list_ptr(tbuf)
     var pr = list_ptr(rbuf)
 
-    def work(c: Int) {imm blas_seq, imm a, imm x, imm b, imm pt, imm pr, imm nq, imm m, imm k1, imm nvec, imm k2, imm p, imm tsize, imm rsize, imm nwork}:
+    def work(c: Int) {imm blas_seq, imm a, imm x, imm b, imm pt, imm pr, imm nq, imm m, imm k1, imm nvec, imm k2, imm p, imm tsize, imm rsize, imm nwork, imm a_qs, imm b_qs}:
         var t = pt.unsafe_offset(c * tsize)
         var acc = pr.unsafe_offset(c * rsize)
         var q = c
         while q < nq:
             try:
-                blas_seq.gemm(False, False, m, nvec * k2, k1, 1.0, a.unsafe_offset(q * m * k1), x, 0.0, t)
-                blas_seq.gemm(False, False, m * nvec, p, k2, 1.0, t, b.unsafe_offset(q * k2 * p), 1.0, acc)
+                blas_seq.gemm(False, False, m, nvec * k2, k1, 1.0, a.unsafe_offset(q * a_qs), x, 0.0, t)
+                blas_seq.gemm(False, False, m * nvec, p, k2, 1.0, t, b.unsafe_offset(q * b_qs), 1.0, acc)
             except:
                 pass
             q += nwork

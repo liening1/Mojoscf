@@ -13,6 +13,9 @@ MOJOSCF_DF_BLOCK_MB work-buffer budget of the density-fitting J/K build (default
 MOJOSCF_NATIVE      ``1`` to use the pure-Mojo fallbacks instead of BLAS/LAPACK.
 MOJOSCF_SKIP_BUILD  ``1`` to never invoke the Mojo compiler.
 MOJOSCF_MOJO        Path of the ``mojo`` executable (default: ``mojo`` on PATH).
+MOJOSCF_OPENBLAS_TIMEOUT  busy-wait of NumPy's and SciPy's OpenBLAS worker threads after a
+                    call, as log2 of CPU cycles (default 16; ``0`` keeps OpenBLAS's own
+                    setting), see :func:`tune_openblas_spin`.
 """
 from __future__ import annotations
 
@@ -331,6 +334,64 @@ class serial_scipy_blas:
         if self._n is not None and self._n > 1:
             self._ctl[1](self._n)
         return False
+
+
+OPENBLAS_TIMEOUT_DEFAULT = 16
+_spin_tuned = False
+
+
+def tune_openblas_spin() -> int:
+    """Shorten the busy-wait of the OpenBLAS thread pools of NumPy and SciPy; returns how many were changed.
+
+    After each multi-threaded call, OpenBLAS keeps its worker threads
+    spinning for 2**28 CPU cycles (about 0.1 s) in case another call follows.
+    Everything else that runs in parallel in between then shares the cores
+    with them: pyscf's OpenMP code (``lib.dot`` splits small products over
+    threads, libcint, the FCI solver) and the worker threads of the Mojo
+    kernels.  In pyscf's DF-CASSCF a 5 x 175 x 25 ``lib.dot`` took 0.4 ms
+    instead of 25 us; whole SCF runs were 10-30% slower.  This restarts the
+    pools of the bundled libraries already loaded with a spin of
+    2**``MOJOSCF_OPENBLAS_TIMEOUT`` cycles (``OPENBLAS_THREAD_TIMEOUT``, read
+    when a pool starts): long enough for the back-to-back calls inside
+    LAPACK (``eigh`` keeps its speed), short enough to release the cores for
+    the code that follows.  Nothing is changed when ``OPENBLAS_THREAD_TIMEOUT``
+    is set in the environment (OpenBLAS then already uses it) or
+    ``MOJOSCF_OPENBLAS_TIMEOUT`` is 0.  Runs once, when mojoscf is imported.
+    """
+    global _spin_tuned
+    if _spin_tuned or "OPENBLAS_THREAD_TIMEOUT" in os.environ:
+        return 0
+    _spin_tuned = True
+    try:
+        n = int(os.environ.get("MOJOSCF_OPENBLAS_TIMEOUT", OPENBLAS_TIMEOUT_DEFAULT))
+    except ValueError:
+        n = OPENBLAS_TIMEOUT_DEFAULT
+    if n <= 0:
+        return 0
+    paths = []
+    for pkg, pattern in (("numpy", "libscipy_openblas64_*.so*"), ("scipy", "libscipy_openblas-*.so*")):
+        try:
+            mod = importlib.import_module(pkg)
+        except ImportError:  # pragma: no cover
+            continue
+        libdir = os.path.join(os.path.dirname(os.path.dirname(mod.__file__)), pkg + ".libs")
+        paths += sorted(glob.glob(os.path.join(libdir, pattern)))
+    changed = 0
+    os.environ["OPENBLAS_THREAD_TIMEOUT"] = str(min(n, 30))
+    try:
+        for path in paths:
+            try:
+                # only libraries the process has loaded; the pool restarts at the next threaded call
+                lib = ctypes.CDLL(path, mode=getattr(os, "RTLD_NOLOAD", 4))
+                read_env, shutdown = lib.openblas_read_env, lib.blas_thread_shutdown_
+            except (OSError, AttributeError):
+                continue
+            read_env()
+            shutdown()
+            changed += 1
+    finally:
+        del os.environ["OPENBLAS_THREAD_TIMEOUT"]
+    return changed
 
 
 def worker_blas() -> tuple[str, str]:

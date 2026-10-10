@@ -61,7 +61,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_jk_dense]("jk_dense", docstring="jk_dense(eri, dm, vj_out, vk_out) from a full (n,n,n,n) ERI tensor.")
         m.def_function[py_df_jk]("df_jk", docstring="df_jk(cderi, dms, orbs_or_None, ms_or_None, signs_or_None, vj, vk, with_j, with_k, block_mb, fact_tol, path, prefix, seq_path, seq_prefix).")
         m.def_function[py_df_mo]("df_mo", docstring="df_mo(cderi, cl, cr, out, seq_path, seq_prefix): out[Q] = cl^T E_Q cr for the packed DF tensor (naux, npair), out (naux, nl, nr).")
-        m.def_function[py_df_sandwich]("df_sandwich", docstring="df_sandwich(a, x, b, nvec, alpha, r, seq_path, seq_prefix): r (m*nvec, p) += alpha sum_Q reshape(a[Q] x, (m*nvec, k2)) b[Q] for a (nq, m, k1), x (k1, nvec*k2), b (nq, k2, p).")
+        m.def_function[py_df_sandwich]("df_sandwich", docstring="df_sandwich(a, x, b, nvec, alpha, r, seq_path, seq_prefix, a_qstride, b_qstride): r (m*nvec, p) += alpha sum_Q reshape(a[Q] x, (m*nvec, k2)) b[Q] for a (nq, m, k1), x (k1, nvec*k2), b (nq, k2, p); a[Q], b[Q] start a_qstride, b_qstride elements apart.")
         m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r (nmo, nset, nocc) += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)) with xs (nmo, nset, nocc), the MO-basis exchange of the orbital-Hessian response.")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k, nanti): J/K from 8-fold packed ERIs (the last nanti densities antisymmetric: K only).")
         m.def_function[py_factorize_density]("factorize_density", docstring="factorize_density(dm, orb_out, sign_out, rel_tol, path, prefix) -> m.")
@@ -399,13 +399,14 @@ def py_df_mo(
 
 def py_df_sandwich(
     a: PythonObject, x: PythonObject, b: PythonObject, nvec: PythonObject, alpha: PythonObject, r: PythonObject,
-    seq_path: PythonObject, seq_prefix: PythonObject,
+    seq_path: PythonObject, seq_prefix: PythonObject, a_qstride: PythonObject, b_qstride: PythonObject,
 ) raises -> PythonObject:
     var blas_seq = _blas(seq_path, seq_prefix)
     var nv = Int(py=nvec)
     df_sandwich_core(
         blas_seq, Int(py=a.shape[0]), f64ptr(a), Int(py=a.shape[1]), Int(py=a.shape[2]), f64ptr(x), nv,
         Int(py=b.shape[1]), f64ptr(b), Int(py=b.shape[2]), Float64(py=alpha), f64ptr(r),
+        Int(py=a_qstride), Int(py=b_qstride),
     )
     return PythonObject(None)
 

@@ -353,12 +353,13 @@ def df_jk_blocks(blocks, dm, mo_coeff=None, mo_occ=None, with_j=True, with_k=Tru
     return vj, vk
 
 
-def df_mo(cderi, cl, cr):
+def df_mo(cderi, cl, cr, out=None):
     """The DF tensor in an orbital basis: ``out[Q] = cl^T E_Q cr``, shape ``(naux, nl, nr)``.
 
     ``cderi`` is pyscf's in-core ``(naux, nao*(nao+1)//2)`` tensor (packed
     symmetric ``E_Q``), ``cl`` and ``cr`` are ``(nao, nl)`` and ``(nao, nr)``
     coefficient matrices (``(ia|Q)`` with the occupied and virtual orbitals).
+    ``out``, if given, is a C-contiguous float64 array of that shape to fill.
     """
     cderi = _c(cderi)
     cl = _c(cl)
@@ -366,10 +367,27 @@ def df_mo(cderi, cl, cr):
     nao = cl.shape[0]
     if cderi.ndim != 2 or cderi.shape[1] != nao * (nao + 1) // 2 or cr.shape[0] != nao:
         raise ValueError("cderi must have shape (naux, nao*(nao+1)//2) and cl, cr nao rows")
-    out = np.empty((cderi.shape[0], cl.shape[1], cr.shape[1]))
+    shape = (cderi.shape[0], cl.shape[1], cr.shape[1])
+    if out is None:
+        out = np.empty(shape)
+    elif out.shape != shape or out.dtype != np.float64 or not out.flags.c_contiguous:
+        raise ValueError(f"out must be a C-contiguous float64 array of shape {shape}")
     seq_path, seq_prefix = worker_blas()
     get_extension().df_mo(cderi, cl, cr, out, seq_path, seq_prefix)
     return out
+
+
+def _q_slabs(a):
+    """``(a, qstride)``: a float64 ``(nq, m, k)`` array whose ``a[Q]`` are C-contiguous, as given when only the
+    stride between them differs (blocks of rows of a larger per-Q tensor), else a contiguous copy."""
+    a = np.asarray(a)
+    if a.dtype == np.float64 and a.ndim == 3:
+        m, k = a.shape[1:]
+        st = a.strides
+        if st[2] == 8 and (st[1] == 8 * k or m == 1) and st[0] % 8 == 0 and (st[0] >= 8 * m * k or a.shape[0] == 1):
+            return a, (st[0] // 8 if a.shape[0] > 1 else m * k)
+    a = _c(a)
+    return a, a.shape[1] * a.shape[2]
 
 
 def df_sandwich(a, x, b, nvec, alpha=1.0, out=None):
@@ -377,12 +395,14 @@ def df_sandwich(a, x, b, nvec, alpha=1.0, out=None):
 
     ``a`` is ``(nq, m, k1)``, ``x`` is ``(k1, nvec*k2)`` and ``b`` is
     ``(nq, k2, p)``: the exchange contractions of the linear-response
-    operators (:mod:`mojoscf.tdscf`).  A new zero ``out`` is used when none is
+    operators (:mod:`mojoscf.tdscf`).  ``a`` and ``b`` may be views whose
+    ``[Q]`` matrices are contiguous (``L[:, i0:i1]`` of an ``(nq, n, p)``
+    tensor), used without a copy.  A new zero ``out`` is used when none is
     given; returns ``out``.
     """
-    a = _c(a)
+    a, a_qs = _q_slabs(a)
     x = _c(x)
-    b = _c(b)
+    b, b_qs = _q_slabs(b)
     nq, m, k1 = a.shape
     k2, p = b.shape[1], b.shape[2]
     if b.shape[0] != nq or x.shape != (k1, nvec * k2):
@@ -392,7 +412,7 @@ def df_sandwich(a, x, b, nvec, alpha=1.0, out=None):
     elif out.shape != (m * nvec, p) or out.dtype != np.float64 or not out.flags.c_contiguous:
         raise ValueError(f"out must be a C-contiguous float64 array of shape {(m * nvec, p)}")
     seq_path, seq_prefix = worker_blas()
-    get_extension().df_sandwich(a, x, b, int(nvec), float(alpha), out, seq_path, seq_prefix)
+    get_extension().df_sandwich(a, x, b, int(nvec), float(alpha), out, seq_path, seq_prefix, int(a_qs), int(b_qs))
     return out
 
 

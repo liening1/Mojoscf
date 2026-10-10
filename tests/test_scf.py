@@ -202,6 +202,31 @@ def test_backend_info():
     assert info["simd_width_f64"] >= 1
 
 
+def test_tune_openblas_spin(monkeypatch):
+    """The spin-wait of NumPy's OpenBLAS pool is shortened once at import (the pool restarts and BLAS keeps
+    working); a timeout set by the user or MOJOSCF_OPENBLAS_TIMEOUT=0 leaves OpenBLAS alone."""
+    import os
+
+    from mojoscf import _backend
+
+    assert _backend._spin_tuned or "OPENBLAS_THREAD_TIMEOUT" in os.environ
+    assert _backend.tune_openblas_spin() == 0                 # once per process
+    monkeypatch.setattr(_backend, "_spin_tuned", False)
+    monkeypatch.setenv("OPENBLAS_THREAD_TIMEOUT", "20")
+    assert _backend.tune_openblas_spin() == 0
+    monkeypatch.delenv("OPENBLAS_THREAD_TIMEOUT")
+    monkeypatch.setenv("MOJOSCF_OPENBLAS_TIMEOUT", "0")
+    assert _backend.tune_openblas_spin() == 0
+    monkeypatch.setattr(_backend, "_spin_tuned", False)
+    monkeypatch.delenv("MOJOSCF_OPENBLAS_TIMEOUT")
+    numpy_openblas = "scipy_openblas64" in str(getattr(np.__config__, "CONFIG", ""))
+    changed = _backend.tune_openblas_spin()
+    assert changed >= int(numpy_openblas)
+    assert "OPENBLAS_THREAD_TIMEOUT" not in os.environ
+    a = np.random.default_rng(0).standard_normal((300, 300))
+    assert np.allclose(a @ a.T, np.einsum("ik,jk->ij", a, a))
+
+
 WATER = "O 0 0 0.1173; H 0 0.7572 -0.4692; H 0 -0.7572 -0.4692"
 
 
