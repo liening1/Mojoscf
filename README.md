@@ -71,8 +71,9 @@ iteration then runs without touching Python or pyscf's C code at all.
   its orbital-Hessian steps with Mojo kernels in the MO basis:
   state-averaged ligand-field CASSCF of Fe, Ni and Cu complexes 12 to 18x
   faster than pyscf (10 to 17x against pyscf with mojoscf's OpenBLAS
-  setting), with the same energies, the NEVPT2 that follows 4 to 5.5x and
-  state-specific CASSCF gradients 8 to 10x.
+  setting), with the same energies, the NEVPT2 that follows 4 to 5.5x,
+  state-specific CASSCF gradients 8 to 10x and state-averaged gradients 8.6
+  to 13x.
 * **Individual kernels** are also exposed (`mojoscf.kernels`) and a
   Mojo-backed `CDIIS` class can be dropped into any pyscf SCF object.
 * **BLAS/LAPACK** (OpenBLAS bundled with pyscf and SciPy) is called from Mojo
@@ -420,11 +421,13 @@ Tr(DT (J - K/2)[Dc]) + 1/2 sum (uv|wx) T_uvwx with the symmetrised
 transition densities DT and T: one pass of the Mojo DF gradient kernels each
 (`integrals.grad2e_df_terms`, auxiliary response included).
 
-| system                           | nao | CAS   | states | SA grad pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)    | max \|dg\| [Eh/bohr] |
-|----------------------------------|----:|------:|-------:|------------------:|----------:|------------:|-------------:|---------------------:|
-| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |              93.3 |      75.5 |         8.9 | 10.5x (8.5x) |              1.1e-08 |
-| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |              85.7 |      65.1 |        10.0 | 8.6x (6.5x)  |              2.1e-09 |
-| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |              48.6 |      32.5 |         4.3 | 11.2x (7.6x) |              6.5e-09 |
+| system                           | nao | CAS   | states | SA grad pyscf [s] | tuned [s] | mojoscf [s] | x (tuned)     | max \|dg\| [Eh/bohr] |
+|----------------------------------|----:|------:|-------:|------------------:|----------:|------------:|--------------:|---------------------:|
+| [Fe(H2O)6]2+ quintet / def2-SVP  | 175 | (6,5) |      5 |              93.3 |      75.5 |         8.9 | 10.5x (8.5x)  |              1.1e-08 |
+| [Ni(H2O)6]2+ triplet / def2-SVP  | 175 | (8,5) |     10 |              85.7 |      65.1 |        10.0 | 8.6x (6.5x)   |              2.1e-09 |
+| [Cu(NH3)4]2+ doublet / def2-SVP  | 147 | (9,5) |      5 |              48.6 |      32.5 |         4.3 | 11.2x (7.6x)  |              6.5e-09 |
+| [Fe(H2O)6]2+ quintet / def2-TZVP | 303 | (6,5) |      5 |             266.0 |     269.5 |        20.4 | 13.1x (13.2x) |              1.4e-08 |
+| [Cu(NH3)4]2+ doublet / def2-TZVP | 241 | (9,5) |      5 |             122.4 |     129.8 |         9.5 | 12.8x (13.7x) |              1.9e-08 |
 
 On the same CASSCF solution the Lagrange terms agree with pyscf's to
 better than 1e-10 for arbitrary multipliers and the state-averaged
