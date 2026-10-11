@@ -13,12 +13,13 @@ integral engine (``mojoscf.integrals.attach(mf)`` makes an SCF object use it);
 """
 from ._backend import BackendError, backend_info, blas_args, blas_config, build_extension, set_blas, use_native
 from ._backend import tune_openblas_spin as _tune_openblas_spin
-from . import dft, grad, guess, integrals, kernels, mcpdft, qmmm, solvent
+from . import dft, fcirdm, grad, guess, integrals, kernels, mcpdft, qmmm, solvent
 from .diis import CDIIS
 from .scf import RHF, UHF, accelerate, is_supported, kernel, native_veff
 
 _tune_openblas_spin()
 mcpdft.install_on_import()
+fcirdm.install()
 
 __version__ = "0.12.0"
 
@@ -34,6 +35,7 @@ __all__ = [
     "integrals",
     "dft",
     "mcpdft",
+    "fcirdm",
     "grad",
     "guess",
     "qmmm",

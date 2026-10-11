@@ -24,6 +24,7 @@ from _mojo.kernels import (
 )
 from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
+from _mojo.fcirdm import fci_dm123_core, fci_f3_core
 from _mojo.dfmo import (
     df_mo_core, df_sandwich_core, cphf_k_core, casscf_ah_core, casscf_mo_core, packed_gather_core,
     packed_scatter_core,
@@ -70,6 +71,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_casscf_mo]("casscf_mo", docstring="casscf_mo(cderi, mo, ncore, dst, diag, vj, vk, kpc, seq_path, seq_prefix): dst[Q] = mo^T E_Q mo and the core terms of DF-CASSCF from the same pass: diag (naux, nmo), vj = sum_Q rho_Q L_Q, vk = sum_Q L_Q[c]^T L_Q[c], kpc = sum_Q L_Q[c]**2.")
         m.def_function[py_packed_gather]("packed_gather", docstring="packed_gather(src, idx, dst): dst[P, k] = src[P, idx[k]] for src (nq, npk), idx int64 (nidx,), dst (nq, nidx).")
         m.def_function[py_packed_scatter]("packed_scatter", docstring="packed_scatter(dst, idx, wts, src): dst[P, idx[k]] += wts[k] src[P, k] for dst (nq, npk), idx int64 (nidx,), wts (nidx,), src (nq, nidx).")
+        m.def_function[py_fci_dm123]("fci_dm123", docstring="fci_dm123(linka, linkb, bra, ket, ak, ab, dm1, dm2, dm3, seq_path, seq_prefix): spin-traced <bra|E_pq|ket>, <bra|E_pq E_rs|ket> and <bra|E_pq E_rs E_tu|ket> (p >= r >= t) of FCI vectors from pyscf's link tables (int64).")
+        m.def_function[py_fci_f3]("fci_f3", docstring="fci_f3(linka, linkb, ci, eri, mode, buf1, buf2, fdm2, fdm3, seq_path, seq_prefix): pyscf's NEVPT 4-particle contractions (mode 0 NEVPTkern_cedf_aedf, 1 NEVPTkern_aedf_ecdf) before their completion: fdm3 for a >= c and fdm2.")
         m.def_function[py_casscf_ah]("casscf_ah", docstring="casscf_ah(b, ncore, ncas, rmat, sa, v3, v34, seq_path, seq_prefix): v3 (ncas, nmo), v34 (ncore, nmo - ncore) += the MO-basis (2J - K) rows of a CASSCF orbital-Hessian step for the DF tensor b (nq, nmo, nmo), the core-noncore rotation rmat and sa = casdm1 r[active].")
         m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r (nmo, nset, nocc) += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)) with xs (nmo, nset, nocc), the MO-basis exchange of the orbital-Hessian response.")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k, nanti): J/K from 8-fold packed ERIs (the last nanti densities antisymmetric: K only).")
@@ -436,6 +439,34 @@ def py_packed_scatter(dst: PythonObject, idx: PythonObject, wts: PythonObject, s
     packed_scatter_core(
         Int(py=dst.shape[0]), Int(py=dst.shape[1]), f64ptr(dst), Int(py=idx.shape[0]), i64ptr(idx), f64ptr(wts),
         f64ptr(src),
+    )
+    return PythonObject(None)
+
+
+def py_fci_dm123(
+    linka: PythonObject, linkb: PythonObject, bra: PythonObject, ket: PythonObject, ak: PythonObject,
+    ab: PythonObject, dm1: PythonObject, dm2: PythonObject, dm3: PythonObject, seq_path: PythonObject,
+    seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    fci_dm123_core(
+        blas_seq, Int(py=dm1.shape[0]), Int(py=linka.shape[0]), Int(py=linkb.shape[0]), Int(py=linka.shape[1]),
+        Int(py=linkb.shape[1]), i64ptr(linka), i64ptr(linkb), f64ptr(bra), f64ptr(ket),
+        f64ptr(ak), f64ptr(ab), f64ptr(dm1), f64ptr(dm2), f64ptr(dm3),
+    )
+    return PythonObject(None)
+
+
+def py_fci_f3(
+    linka: PythonObject, linkb: PythonObject, ci: PythonObject, eri: PythonObject, mode: PythonObject,
+    buf1: PythonObject, buf2: PythonObject, fdm2: PythonObject, fdm3: PythonObject, seq_path: PythonObject,
+    seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    fci_f3_core(
+        blas_seq, Int(py=fdm2.shape[0]), Int(py=linka.shape[0]), Int(py=linkb.shape[0]), Int(py=linka.shape[1]),
+        Int(py=linkb.shape[1]), i64ptr(linka), i64ptr(linkb), f64ptr(ci), f64ptr(eri), Int(py=mode), f64ptr(buf1),
+        f64ptr(buf2), f64ptr(fdm2), f64ptr(fdm3),
     )
     return PythonObject(None)
 
