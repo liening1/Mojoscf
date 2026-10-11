@@ -31,9 +31,25 @@ def _links(norb, nelec):
     return np.ascontiguousarray(cistring.gen_linkstr_index(range(norb), nelec), dtype=np.int64)
 
 
+def _available_mb() -> float:
+    """Memory the system reports available (Linux ``MemAvailable``), MB; 0 when unknown."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return 0.0
+
+
 def _fits(ndet, norb) -> bool:
-    need = 2 * ndet * norb * norb * 8e-6 + norb ** 6 * 8e-6 * 2
-    return need < 0.7 * (lib.param.MAX_MEMORY - lib.current_memory()[0])
+    """The two work vectors (ndet, norb^2) and the 6-index results fit: within pyscf's ``MAX_MEMORY`` or
+    half of the memory the system has available, whichever is larger (pyscf's own C kernels allocate
+    their buffers without consulting ``MAX_MEMORY`` either)."""
+    need = 2 * ndet * norb * norb * 8e-6 + norb ** 6 * 8e-6 * 3
+    room = max(lib.param.MAX_MEMORY - lib.current_memory()[0], 0.5 * _available_mb())
+    return need < 0.8 * room
 
 
 def make_dm123(fname, cibra, ciket, norb, nelec):

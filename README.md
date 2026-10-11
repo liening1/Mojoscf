@@ -71,7 +71,8 @@ iteration then runs without touching Python or pyscf's C code at all.
   its orbital-Hessian steps with Mojo kernels in the MO basis:
   state-averaged ligand-field CASSCF of Fe, Ni and Cu complexes 15 to 26x
   faster than pyscf (10 to 23x against pyscf with mojoscf's OpenBLAS
-  setting), with the same energies, the NEVPT2 that follows 4 to 5.5x,
+  setting), with the same energies, the NEVPT2 that follows 4 to 5.5x
+  (5 to 7.4x with ten and twelve active orbitals),
   state-specific CASSCF gradients 8 to 10x and state-averaged gradients 13
   to 19x.
 * **MC-PDFT** (`mojoscf.mcpdft`): pyscf's multiconfiguration pair-density
@@ -396,8 +397,39 @@ mojoscf transforms to (Q|up) and (Q|cv) only, forms (pq|uv) from the ncas^2
 AO matrices sum_Q E_Q (Q|uv), and evaluates the one subspace that needs
 (cv|cv) (Sijrs) from the DF factors, one core orbital at a time and for
 j <= i only; the three-index `einsum` contractions of the Srsi and Srs
-subspaces run as GEMMs.  The reduced density matrices and the other
-subspaces are pyscf's.
+subspaces run as GEMMs.  The other subspaces are pyscf's, with BLAS
+contraction paths for their some 230 `einsum` calls over the active-space
+2- and 3-particle density matrices (5 to 10x on those for ten active
+orbitals).
+
+With ten or more active orbitals the reduced density matrices dominate:
+pyscf evaluates the 3-particle matrix <p+q r+s t+u> and the two 4-particle
+contractions of strongly contracted NEVPT2, sum_xyz (fx|yz) <E_ab E_cd E_ex E_yz>
+and sum_xyz (ex|yz) <E_ab E_cd E_xf E_yz>, with C kernels over the FCI
+strings (68 s and 2 x 89 s for a CAS(12,12) vector here, against 0.3 s for
+the 2-particle matrix).  `mojoscf.fcirdm` (installed when mojoscf is
+imported, for any NEVPT2) forms the vectors E_tu|ket> and E_qp|bra> over all
+determinants; every single excitation of an alpha string then adds one GEMM
+over the beta strings (of a beta string, over the alpha strings) to the
+p >= r >= t part of the 3-particle matrix, which pyscf's `_complete_dm3_`
+completes.  The 4-particle contractions are 3-particle matrices with the
+third vector O_ef|ci> = sum_x E_ex W_fx|ci>, W_fx = sum_yz (fx|yz) E_yz, (or
+sum_x E_xf W_ex|ci>), one more GEMM: 9 s and 2 x 16 s.
+`benchmarks/bench_nevpt2.py` runs a CASCI with the orbitals around the Fermi
+level and pyscf's NEVPT2 of its ground state on a density-fitted reference,
+pyscf versus mojoscf in separate processes:
+
+| system                                       | nao | CASCI pyscf [s] | mojoscf [s] | NEVPT2 pyscf [s] | mojoscf [s] | x    | \|dE2\| [Eh] |
+|----------------------------------------------|----:|----------------:|------------:|-----------------:|------------:|-----:|-------------:|
+| ferrocene singlet / def2-SVP, CAS(10,10)     | 221 |             3.3 |         0.6 |             21.3 |         4.2 | 5.0x |      5.0e-11 |
+| [Fe(H2O)6]2+ quintet / def2-SVP, CAS(12,12)  | 175 |             2.8 |         0.7 |             87.0 |        11.8 | 7.4x |      2.2e-13 |
+| ferrocene singlet / def2-SVP, CAS(12,12)     | 221 |             5.6 |         3.0 |            272.7 |        39.1 | 7.0x |      4.0e-09 |
+
+The two work vectors take 2 ndet ncas^2 doubles (2 GB for CAS(12,12)); when
+they do not fit (within pyscf's `MAX_MEMORY` or half the available memory)
+pyscf's kernels run.  On the same CASCI vector the matrices agree with
+pyscf's to 1e-15 relative (tests); the energy differences above come from
+the two runs' separately converged references.
 
 **Nuclear gradients** of the state-specific CASSCF (`mc.nuc_grad_method()`,
 `bench_casscf.py --grad`: the lowest state, conv_tol 1e-10) come from
@@ -1445,6 +1477,7 @@ but slow for more than a few dozen orbitals.
 | SCF stability analysis (`mf.stability()`) | orbital Hessian one vector per Davidson call, AO densities through `gen_response` | the TDDFT operators above for all vectors of an iteration (`lib.davidson1`); pyscf's Fock blocks, preconditioner and rotation |
 | DF-CASSCF integrals and orbital Hessian (`mcscf.df._ERIS`, `update_jk_in_ah`) | per macro iteration (Q|pq) for all MO pairs written to a temporary HDF5 file and read back for `ppaa`/`papa`; two AO J/K builds per orbital-Hessian step (rank 2 ncore densities, `df_jk.get_jk`) | Mojo transform with the core terms in the same pass (`casscf_mo`: `j_pc`, `k_pc`, the core potential with a rank-ncore SYRK per auxiliary function), (Q|pq) kept in memory for the macro iteration (its memory reused by the next one within a `kernel`) for `ppaa`, `papa`; the orbital-Hessian J/K only for the rows pyscf uses, in the MO basis in one pass (`casscf_ah`: the core-noncore structure of the rotation, the exchange rows from one GEMM per four auxiliary functions); pyscf's driver, FCI solver and orbital optimiser |
 | DF-NEVPT2 integrals (`mrpt.dfnevpt2._ERIS`) and its Sijrs, Srsi, Srs subspaces | four `with_df.ao2mo` transforms (the full (Q|pq) for `ppaa`), (cv|cv) as an (ncore nvir)^2 matrix in memory or on disk; three-index `einsum` contractions | two partial Mojo transforms ((Q|up), (Q|cv)); (pq|uv) from the AO matrices sum_Q E_Q (Q|uv), one per active pair; Sijrs from the DF factors one core orbital at a time (no (cv|cv) matrix; pairs j <= i only); the Srsi and Srs contractions as GEMMs |
+| FCI 3-particle density matrix (`fci.rdm.make_dm123`) and NEVPT2's 4-particle contractions (`mrpt.nevpt2._contract4pdm`) | C kernels over the FCI strings for p >= r >= t (4-particle: one free index of (pq|rs) contracted with a 4-particle matrix) | Mojo: the vectors E_tu|ket>, E_qp|bra> over all determinants, one GEMM per single excitation of each string for the p >= r >= t part (pyscf's `_complete_dm3_` completes it); the 4-particle contractions as the same matrices with the third vector sum_x E_ex W_fx|ci> (W_fx = sum_yz (fx|yz) E_yz) |
 | DF-CASSCF nuclear gradient (`mc.nuc_grad_method()`, state-specific) | the DF gradient J/K of the core and active densities (libcint three-centre derivative integrals, auxiliary response) and the active 2-RDM terms (`solve_df_rdm2`, `grad_elec_dferi`, auxiliary response) in separate passes | one pass of the Mojo DF gradient kernels: in the basis of the core and active natural orbitals the Coulomb, exchange and 2-RDM terms of E2(Dc + Da) - E2(Da) + E_aa form one matrix per auxiliary function and the metric terms one W; Mojo one-electron derivative integrals; pyscf's generalized Fock matrix |
 | SA-CASSCF nuclear gradient (`mc.nuc_grad_method().kernel(state=i)` after `mc.state_average_`): the Lagrange terms (`df.grad.sacasscf.Lorb_dot_dgorb_dx`, `Lci_dot_dgci_dx`) | per term a DF gradient J/K of four (orbital term) or two (CI term) densities and one or two further passes for the active 2-RDM terms (`solve_df_rdm2`, `grad_elec_dferi`), each with its auxiliary response | both terms in one pass of the Mojo DF gradient kernels (`integrals.grad2e_df_terms`): Coulomb, exchange and 2-RDM terms with one rotated orbital in the basis [C_core, C_act, C_core L, C_act L] (orbital term) and with the symmetrised transition densities in the same basis (CI term), one J/K build for their densities; pyscf's generalized Fock matrices and response solver |
 | MC-PDFT (`pyscf.mcpdft`): on-top energies, effective potentials, Hellmann-Feynman gradient | Python loops over grid blocks: AO values, spin, core and active densities (`make_rho`), the active orbitals on the grid and the on-top pair density by NumPy products and `tensordot` with the cumulant, libxc per block, the grid rebuilt for every state; for the gradient per atom grid AO second derivatives and NumPy contractions, the Becke weight derivatives as (natm, natm, 3) arrays per point, a DF gradient J/K (K unused) for the Coulomb term | Mojo (`_mojo/pdft.mojo`, `_mojo/grids.mojo`): spin densities and on-top pair densities of all states in one pass, the functional once per state on the whole grid (pyscf's `eval_ot`), the grid reused; the potentials with the XC potential-matrix kernel and one pass for the paaa block; the gradient's orbital terms with the XC gradient kernel (kernel v_rho + v_Pi rho/2) and one pass for the cumulant term, grid-point terms from the same per-atom sums, Becke weight derivatives contracted with the energy density point by point, the Coulomb term from the Mojo DF derivative integrals |
@@ -1536,13 +1569,19 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   NEVPT2 (`mrpt.NEVPT`) of a CASCI on such a reference gets its integrals
   from `mojoscf.casscf.nevpt2_eris` when they fit in `max_memory`, without
   the (cv|cv) matrix (its Sijrs subspace from the DF factors; Srsi and Srs
-  with GEMMs); its other subspaces and the reduced density matrices run
-  pyscf's code.  `mc.nuc_grad_method()` of a state-specific DF-CASSCF on
+  with GEMMs); its other subspaces run pyscf's code (their `einsum` calls on
+  BLAS contraction paths).  With mojoscf imported, pyscf's spin-traced
+  3-particle density matrix (`fci.rdm.make_dm123`, also behind
+  `direct_spin1.make_rdm123`) and NEVPT2's 4-particle contractions
+  (`mrpt.nevpt2._contract4pdm`) come from `mojoscf.fcirdm` for real CI
+  vectors whose work arrays fit in memory, whatever the integrals.  `mc.nuc_grad_method()` of a state-specific DF-CASSCF on
   such a reference is `mojoscf.casscf.Gradients`; that of a state-averaged
   one stays pyscf's `df.grad.sacasscf.Gradients`, with the state's own term
-  from `mojoscf.casscf.Gradients` and the Lagrange terms from
-  `mojoscf.casscf.lorb_dot_dgorb_dx` and `lci_dot_dgci_dx` (without the
-  auxiliary-basis response, `auxbasis_response=False`, pyscf's).  Frozen
+  from `mojoscf.casscf.Gradients` and both Lagrange terms in one pass from
+  `mojoscf.casscf.lagrange_terms` (its `get_LdotJnuc`; the separate
+  `Lorb_dot_dgorb_dx`/`Lci_dot_dgci_dx` from `lorb_dot_dgorb_dx` and
+  `lci_dot_dgci_dx`; without the auxiliary-basis response,
+  `auxbasis_response=False`, pyscf's).  Frozen
   orbitals keep pyscf's code.
 * **MC-PDFT**: with mojoscf imported, pyscf's MC-PDFT (`pyscf.mcpdft`:
   `mcpdft.CASSCF`/`CASCI`, state-averaged and multi-state variants) takes
