@@ -38,6 +38,8 @@ mol = gto.M(atom=atoms_to_str(%(atoms)s), basis=%(basis)r, charge=%(charge)d, sp
             verbose=0, max_memory=12000)
 if %(driver)r == "mojoscf":
     import mojoscf
+else:   # the reference must be plain pyscf: mojoscf patches some pyscf functions when imported
+    assert "mojoscf" not in sys.modules
 mf = (scf.ROHF(mol) if mol.spin else scf.RHF(mol)).density_fit()
 mf.conv_tol = 1e-9; mf.max_cycle = 100
 if %(driver)r == "mojoscf":

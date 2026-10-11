@@ -13,7 +13,8 @@ import time
 
 from pyscf import gto, lib, scf
 
-import mojoscf
+# mojoscf is imported in main() only: other benchmarks import the molecules from here into their pyscf
+# reference processes, which must not carry mojoscf's import-time patches (VV10, FCI 3-RDM, ...)
 
 WATER = "O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587"
 BENZENE = """
@@ -51,6 +52,8 @@ def run(factory, mol, repeat):
 
 
 def main():
+    import mojoscf
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--repeat", type=int, default=3)
     ap.add_argument("--threads", type=int, default=None)

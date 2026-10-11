@@ -39,6 +39,8 @@ driver = %(driver)r
 if driver == "mojoscf":
     import mojoscf
     mojoscf.UHF(gto.M(atom="H 0 0 0; H 0 0 1", basis="sto-3g", verbose=0)).run()  # start the runtime
+else:   # the reference must be plain pyscf: mojoscf patches some pyscf functions when imported
+    assert "mojoscf" not in sys.modules
 method = %(method)r
 if method == "hf":
     mf = (scf.UHF if %(spin)d else scf.RHF)(mol)

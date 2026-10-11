@@ -58,7 +58,8 @@ if driver == "mojoscf":
         g = (mojoscf.grad.DFUGradients if %(kind)r == "uhf" else mojoscf.grad.DFGradients)(mf)
     else:
         g = (mojoscf.grad.UGradients if %(kind)r == "uhf" else mojoscf.grad.Gradients)(mf)
-else:
+else:   # the reference must be plain pyscf: mojoscf patches some pyscf functions when imported
+    assert "mojoscf" not in sys.modules
     g = mf.nuc_grad_method()
 dm = mf.make_rdm1()
 t0 = time.perf_counter(); de = g.kernel(); total = time.perf_counter() - t0
