@@ -338,3 +338,53 @@ def test_becke_response_matches_pyscf(variant):
         assert abs(w - w0).max() < 1e-12 * max(1.0, abs(w0).max())
         ref = np.tensordot(e, w1, axes=(0, 2))
         assert abs(de - ref).max() < 1e-10 * max(1.0, abs(ref).max()), (variant, ia)
+
+
+def _water_nlc():
+    mol = gto.M(atom="O 0 0 0; H 0 0.76 0.59; H 0 -0.76 0.59", basis="def2-svp", verbose=0)
+    mf = dft.RKS(mol, xc="wb97m-v")
+    mf.nlcgrids.level = 1
+    mf.nlcgrids.build()
+    return mol, mf
+
+
+def test_vv10_matches_pyscf():
+    """The VV10 pair sums (one grid as both point sets, and two distinct grids) equal pyscf's ``_vv10nlc``."""
+    mol, mf = _water_nlc()
+    g = mf.nlcgrids
+    dm = dft.RKS(mol, xc="pbe").run().make_rdm1()
+    rho = numint.eval_rho(mol, numint.eval_ao(mol, g.coords, deriv=1), dm, xctype="GGA")
+    assert numint._vv10nlc is mdft.vv10nlc
+    orig = mdft.vv10nlc._mojoscf_orig
+    pars = (6.0, 0.01)
+    e0, v0 = orig(rho, g.coords, rho, g.weights, g.coords, pars)
+    for args in ((rho, g.coords, rho, g.weights, g.coords), (rho, g.coords, rho.copy(), g.weights, g.coords.copy())):
+        e1, v1 = mdft.vv10nlc(*args, pars)
+        assert abs(e1 - e0).max() < 1e-12 * abs(e0).max()
+        assert abs(v1 - v0).max() < 1e-12 * abs(v0).max()
+    # a coarser inner grid: the general kernel
+    sub = slice(0, None, 3)
+    e0, v0 = orig(rho, g.coords, rho[:, sub], g.weights[sub], g.coords[sub], pars)
+    e1, v1 = mdft.vv10nlc(rho, g.coords, rho[:, sub], g.weights[sub], g.coords[sub], pars)
+    assert abs(e1 - e0).max() < 1e-12 * abs(e0).max() and abs(v1 - v0).max() < 1e-12 * abs(v0).max()
+
+
+def test_nlc_vxc_and_scf_match_pyscf():
+    """nr_nlc_vxc from the Mojo kernels equals pyscf's, and an accelerated UKS wB97M-V SCF reaches pyscf's energy."""
+    mol, mf = _water_nlc()
+    dm = dft.RKS(mol, xc="pbe").run().make_rdm1()
+    ni = mdft.NumInt()
+    ref = numint.NumInt.nr_nlc_vxc(ni, mol, mf.nlcgrids, "wb97m-v", dm)
+    got = ni.nr_nlc_vxc(mol, mf.nlcgrids, "wb97m-v", dm)
+    assert abs(ref[0] - got[0]) < 1e-10 and abs(ref[1] - got[1]) < 1e-10
+    assert abs(ref[2] - got[2]).max() < 1e-10
+    mol = gto.M(atom="O 0 0 0; H 0 0.76 0.59; H 0 -0.76 0.59", basis="def2-svp", charge=1, spin=1, verbose=0)
+    energies = []
+    for accel in (False, True):
+        ks = dft.UKS(mol, xc="wb97m-v").density_fit()
+        ks.nlcgrids.level = 1
+        ks.conv_tol = 1e-10
+        if accel:
+            ks = mojoscf.accelerate(ks)
+        energies.append(ks.kernel())
+    assert abs(energies[0] - energies[1]) < 1e-8

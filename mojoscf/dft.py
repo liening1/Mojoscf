@@ -37,6 +37,7 @@ from __future__ import annotations
 import numpy as np
 from pyscf.df import df as pyscf_df
 from pyscf.dft import numint as pyscf_numint
+from pyscf.dft import xc_deriv as pyscf_xc_deriv
 
 from . import integrals
 from ._backend import get_extension, worker_blas
@@ -227,8 +228,92 @@ def _grid(grids):
     return np.ascontiguousarray(grids.coords, dtype=np.float64), np.asarray(grids.weights, dtype=np.float64)
 
 
+def vv10nlc(rho, coords, vvrho, vvweight, vvcoords, nlc_pars):
+    """pyscf's ``numint._vv10nlc`` (VV10 non-local correlation: energy density and the (vrho, vsigma)
+    potential on the outer grid ``coords`` from the density on the inner grid ``vvcoords``) with the pair
+    sums over the two grids, O(n_out n_in), from the Mojo kernels (``nlc.mojo``: SIMD over cached tiles of
+    inner points, one division per pair, and when one grid serves as both, as in pyscf's ``nr_nlc_vxc``,
+    one division per unordered pair: the denominators are symmetric; pyscf's C loop took 62 s per call
+    for 223k points here).  The thresholds and the per-point terms are pyscf's."""
+    thresh = 1e-8
+    same = rho is vvrho and coords is vvcoords        # pyscf's nr_nlc_vxc and NLC gradient pass one grid twice
+    rho = np.asarray(rho)
+    vvrho = np.asarray(vvrho)
+    exc = np.zeros(rho[0, :].size)
+    vxc = np.zeros([2, rho[0, :].size])
+    threshind = rho[0, :] >= thresh
+    coords = np.asarray(coords)[threshind]
+    R = rho[0, :][threshind]
+    G = rho[1, :][threshind] ** 2.0 + rho[2, :][threshind] ** 2.0 + rho[3, :][threshind] ** 2.0
+    innerthreshind = vvrho[0, :] >= thresh
+    vvcoords = np.asarray(vvcoords)[innerthreshind]
+    Rp = vvrho[0, :][innerthreshind]
+    RpW = Rp * np.asarray(vvweight)[innerthreshind]
+    Gp = vvrho[1, :][innerthreshind] ** 2.0 + vvrho[2, :][innerthreshind] ** 2.0 + vvrho[3, :][innerthreshind] ** 2.0
+    Pi = np.pi
+    Pi43 = 4.0 * Pi / 3.0
+    Bvv, Cvv = nlc_pars
+    Kvv = Bvv * 1.5 * Pi * ((9.0 * Pi) ** (-1.0 / 6.0))
+    Beta = ((3.0 / (Bvv * Bvv)) ** 0.75) / 32.0
+    W0p = Gp / (Rp * Rp)
+    W0p = Cvv * W0p * W0p
+    W0p = (W0p + Pi43 * Rp) ** 0.5
+    Kp = Kvv * (Rp ** (1.0 / 6.0))
+    W0tmp = G / (R ** 2)
+    W0tmp = Cvv * W0tmp * W0tmp
+    W0 = (W0tmp + Pi43 * R) ** 0.5
+    dW0dR = (0.5 * Pi43 * R - 2.0 * W0tmp) / W0
+    dW0dG = W0tmp * R / (G * W0)
+    K = Kvv * (R ** (1.0 / 6.0))
+    dKdR = (1.0 / 6.0) * K
+    F = np.empty_like(R)
+    U = np.empty_like(R)
+    W = np.empty_like(R)
+    c = np.ascontiguousarray
+    if same:          # one grid for both: symmetric pair denominators, half the work
+        get_extension().vv10_sym(c(coords, dtype=np.float64), c(W0), c(K), c(RpW), F, U, W)
+    else:
+        get_extension().vv10(c(coords, dtype=np.float64), c(W0), c(K), c(vvcoords, dtype=np.float64), c(W0p),
+                             c(Kp), c(RpW), F, U, W)
+    exc[threshind] = Beta + 0.5 * F
+    vxc[0, threshind] = Beta + F + 1.5 * (U * dKdR + W * dW0dR)
+    vxc[1, threshind] = 1.5 * W * dW0dG
+    return exc, vxc
+
+
+def install_nlc():
+    """Make pyscf's ``numint._vv10nlc`` (behind ``nr_nlc_vxc`` and the NLC gradient) use :func:`vv10nlc`
+    (idempotent; the original stays as ``_mojoscf_orig``)."""
+    if getattr(pyscf_numint._vv10nlc, "_mojoscf_orig", None) is not None:
+        return
+    vv10nlc._mojoscf_orig = pyscf_numint._vv10nlc
+    pyscf_numint._vv10nlc = vv10nlc
+
+
 class NumInt(pyscf_numint.NumInt):
     """pyscf's ``NumInt`` with ``nr_rks``/``nr_uks`` for LDA, GGA and meta-GGA functionals from the Mojo kernels."""
+
+    def nr_nlc_vxc(self, mol, grids, xc_code, dm, relativity=0, hermi=1, max_memory=2000, verbose=None):
+        """pyscf's ``nr_nlc_vxc`` (VV10) with the density and the potential matrix on the NLC grid from the
+        Mojo kernels and the pair sums from :func:`vv10nlc`."""
+        d = np.asarray(dm)
+        nao = mol.nao_nr()
+        if (hermi != 1 or d.shape != (nao, nao) or not np.isrealobj(d) or not integrals.available(mol)
+                or type(self).nlc_coeff is not pyscf_numint.NumInt.nlc_coeff):
+            return super().nr_nlc_vxc(mol, grids, xc_code, dm, relativity, hermi, max_memory, verbose)
+        coords, weights = _grid(grids)
+        rho = _rho(mol, coords, 1, np.ascontiguousarray(d, dtype=np.float64)[None], _orbitals(dm, 1, nao))[0]
+        exc = 0
+        vxc = 0
+        for nlc_pars, fac in self.nlc_coeff(xc_code):
+            e, v = vv10nlc(rho, coords, rho, weights, coords, nlc_pars)
+            exc += e * fac
+            vxc += v * fac
+        den = rho[0] * weights
+        wv = pyscf_xc_deriv.transform_vxc(rho, vxc, "GGA", spin=0)[:4] * weights
+        wv[0] *= 0.5
+        vmat = _vmat(mol, coords, 1, np.ascontiguousarray(wv[None]))[0]
+        return den.sum(), _wsum(den, exc), vmat
 
     def nr_rks(self, mol, grids, xc_code, dms, relativity=0, hermi=1, max_memory=2000, verbose=None):
         if not _passes_ok(self, mol, xc_code, dms, hermi):

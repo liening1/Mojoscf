@@ -21,6 +21,7 @@ from .scf import RHF, UHF, accelerate, is_supported, kernel, native_veff
 _tune_openblas_spin()
 mcpdft.install_on_import()
 fcirdm.install()
+dft.install_nlc()
 
 __version__ = "0.12.0"
 

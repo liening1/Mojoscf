@@ -25,6 +25,7 @@ from _mojo.kernels import (
 from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
 from _mojo.fcirdm import fci_dm123_core, fci_f3_core
+from _mojo.nlc import vv10_core, vv10_sym_core
 from _mojo.dfmo import (
     df_mo_core, df_sandwich_core, cphf_k_core, casscf_ah_core, casscf_mo_core, packed_gather_core,
     packed_scatter_core,
@@ -73,6 +74,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_packed_scatter]("packed_scatter", docstring="packed_scatter(dst, idx, wts, src): dst[P, idx[k]] += wts[k] src[P, k] for dst (nq, npk), idx int64 (nidx,), wts (nidx,), src (nq, nidx).")
         m.def_function[py_fci_dm123]("fci_dm123", docstring="fci_dm123(linka, linkb, bra, ket, ak, ab, dm1, dm2, dm3, seq_path, seq_prefix): spin-traced <bra|E_pq|ket>, <bra|E_pq E_rs|ket> and <bra|E_pq E_rs E_tu|ket> (p >= r >= t) of FCI vectors from pyscf's link tables (int64).")
         m.def_function[py_fci_f3]("fci_f3", docstring="fci_f3(linka, linkb, ci, eri, mode, buf1, buf2, fdm2, fdm3, seq_path, seq_prefix): pyscf's NEVPT 4-particle contractions (mode 0 NEVPTkern_cedf_aedf, 1 NEVPTkern_aedf_ecdf) before their completion: fdm3 for a >= c and fdm2.")
+        m.def_function[py_vv10]("vv10", docstring="vv10(xyz, w0, k, vxyz, w0p, kp, rpw, f, u, w): the VV10 pair sums of pyscf's numint._vv10nlc (F already scaled by -3/2).")
+        m.def_function[py_vv10_sym]("vv10_sym", docstring="vv10_sym(xyz, w0, k, rpw, f, u, w): vv10 with one grid as outer and inner points (symmetric pair denominators).")
         m.def_function[py_casscf_ah]("casscf_ah", docstring="casscf_ah(b, ncore, ncas, rmat, sa, v3, v34, seq_path, seq_prefix): v3 (ncas, nmo), v34 (ncore, nmo - ncore) += the MO-basis (2J - K) rows of a CASSCF orbital-Hessian step for the DF tensor b (nq, nmo, nmo), the core-noncore rotation rmat and sa = casdm1 r[active].")
         m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r (nmo, nset, nocc) += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)) with xs (nmo, nset, nocc), the MO-basis exchange of the orbital-Hessian response.")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k, nanti): J/K from 8-fold packed ERIs (the last nanti densities antisymmetric: K only).")
@@ -468,6 +471,25 @@ def py_fci_f3(
         Int(py=linkb.shape[1]), i64ptr(linka), i64ptr(linkb), f64ptr(ci), f64ptr(eri), Int(py=mode), f64ptr(buf1),
         f64ptr(buf2), f64ptr(fdm2), f64ptr(fdm3),
     )
+    return PythonObject(None)
+
+
+def py_vv10(
+    xyz: PythonObject, w0: PythonObject, k: PythonObject, vxyz: PythonObject, w0p: PythonObject, kp: PythonObject,
+    rpw: PythonObject, f: PythonObject, u: PythonObject, w: PythonObject,
+) raises -> PythonObject:
+    vv10_core(
+        Int(py=xyz.shape[0]), f64ptr(xyz), f64ptr(w0), f64ptr(k), Int(py=vxyz.shape[0]), f64ptr(vxyz), f64ptr(w0p),
+        f64ptr(kp), f64ptr(rpw), f64ptr(f), f64ptr(u), f64ptr(w),
+    )
+    return PythonObject(None)
+
+
+def py_vv10_sym(
+    xyz: PythonObject, w0: PythonObject, k: PythonObject, rpw: PythonObject, f: PythonObject, u: PythonObject,
+    w: PythonObject,
+) raises -> PythonObject:
+    vv10_sym_core(Int(py=xyz.shape[0]), f64ptr(xyz), f64ptr(w0), f64ptr(k), f64ptr(rpw), f64ptr(f), f64ptr(u), f64ptr(w))
     return PythonObject(None)
 
 
