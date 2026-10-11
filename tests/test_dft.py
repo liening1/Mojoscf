@@ -388,3 +388,49 @@ def test_nlc_vxc_and_scf_match_pyscf():
             ks = mojoscf.accelerate(ks)
         energies.append(ks.kernel())
     assert abs(energies[0] - energies[1]) < 1e-8
+
+
+@pytest.mark.parametrize("df", [True, False])
+@pytest.mark.parametrize("xc, nlc, spin", [("wb97m-v", None, 0), ("wb97m-v", None, 1), ("b3lyp", "vv10", 1)])
+def test_nlc_gradients(xc, nlc, spin, df):
+    """Gradients of VV10 functionals (the functional's own VV10 or ``mf.nlc``) stay on the native path,
+    with the VV10 term from grad_nlc, and equal pyscf's for the same SCF solution."""
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+
+    def make():
+        mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc)
+        if nlc:
+            mf.nlc = nlc
+        mf.nlcgrids.level = 1
+        return mf.density_fit() if df else mf
+
+    ref = make()
+    mf = mdft.accelerate(make()).run(conv_tol=1e-10)
+    for k in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(ref, k, getattr(mf, k))
+    g = mf.nuc_grad_method()
+    assert mf.do_nlc() and g._direct_2e()
+    # the range-separated long-range metric is ill-conditioned with density fitting: ~1e-9
+    assert abs(g.kernel() - ref.nuc_grad_method().kernel()).max() < (1e-8 if df else 1e-10)
+
+
+def test_grad_nlc_matches_pyscf():
+    """The VV10 gradient term equals pyscf's get_nlc_vxc contracted with the total density, with and
+    without orbital tags, for restricted and unrestricted densities, and for pyscf's NumInt."""
+    from pyscf.grad import rks as rks_grad
+
+    grids = None
+    for spin in (0, 1):
+        mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+        if grids is None:
+            grids = dft.gen_grid.Grids(mol)
+            grids.level = 1
+            grids.build(with_non0tab=True)
+        dms = (dft.UKS if spin else dft.RKS)(mol, xc="pbe").run().make_rdm1()
+        dm = np.asarray(dms).sum(axis=0) if spin else np.asarray(dms)
+        vmat = rks_grad.get_nlc_vxc(numint.NumInt(), mol, grids, "wb97m-v", dm)[1]
+        ref = np.array([2 * np.einsum("xij,ij->x", vmat[:, p0:p1], dm[p0:p1])
+                        for p0, p1 in mol.aoslice_by_atom()[:, 2:]])
+        for ni, d in ((mdft.NumInt(), dms), (mdft.NumInt(), np.asarray(dms)), (numint.NumInt(), dms)):
+            got = mdft.grad_nlc(ni, mol, grids, "wb97m-v", d, spin=spin)
+            assert abs(got - ref).max() < 1e-12

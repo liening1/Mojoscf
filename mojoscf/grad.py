@@ -407,11 +407,12 @@ class _MojoKSGradMixin:
 
     The XC term (at fixed grids) is :func:`mojoscf.dft.grad_xc`: the Mojo
     kernels for ``mojoscf.dft.NumInt`` with LDA, GGA and meta-GGA
-    functionals, pyscf's ``get_vxc`` otherwise.  Range-separated functionals
-    add the long-range exchange term from the attenuated integrals
-    (``grad2e(omega=...)``, with density fitting ``grad2e_df(omega=...)``);
-    short-range-only exchange (omega < 0), non-local correlation (``nlc``)
-    and ``grid_response`` keep pyscf's ``get_veff``.
+    functionals, pyscf's ``get_vxc`` otherwise; VV10 functionals (``nlc``)
+    add :func:`mojoscf.dft.grad_nlc` on the NLC grid.  Range-separated
+    functionals add the long-range exchange term from the attenuated
+    integrals (``grad2e(omega=...)``, with density fitting
+    ``grad2e_df(omega=...)``); short-range-only exchange (omega < 0) and
+    ``grid_response`` keep pyscf's ``get_veff``.
     """
 
     def _hybrid(self):
@@ -421,7 +422,7 @@ class _MojoKSGradMixin:
         hyb) K_LR(omega).
         """
         mf = self.base
-        if self.grid_response or mf.do_nlc():
+        if self.grid_response:
             return False, 0.0, 0.0, 0.0
         omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=self.mol.spin)
         if omega == 0:
@@ -439,8 +440,14 @@ class _MojoKSGradMixin:
         mf = self.base
         _, hyb, lr, omega = self._hybrid()
         de = self._grad_jk(dm0, mol, hyb, lr, omega) if lr else self._grad_jk(dm0, mol, hyb)
-        grids = rks_grad._initialize_grids(self)[0]
-        return de + dft.grad_xc(mf._numint, mol, grids, mf.xc, dm0, spin=int(self._unrestricted))
+        grids, nlcgrids = rks_grad._initialize_grids(self)
+        ni = mf._numint
+        spin = int(self._unrestricted)
+        de += dft.grad_xc(ni, mol, grids, mf.xc, dm0, spin=spin)
+        if mf.do_nlc():
+            xc = mf.xc if ni.libxc.is_nlc(mf.xc) else mf.nlc
+            de += dft.grad_nlc(ni, mol, nlcgrids, xc, dm0, spin=spin)
+        return de
 
 
 class Gradients(_MojoGradMixin, rhf_grad.Gradients):

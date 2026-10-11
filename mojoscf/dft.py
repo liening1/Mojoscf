@@ -298,7 +298,7 @@ class NumInt(pyscf_numint.NumInt):
         Mojo kernels and the pair sums from :func:`vv10nlc`."""
         d = np.asarray(dm)
         nao = mol.nao_nr()
-        if (hermi != 1 or d.shape != (nao, nao) or not np.isrealobj(d) or not integrals.available(mol)
+        if (hermi != 1 or d.shape != (nao, nao) or not np.isrealobj(d) or not supported(mol)
                 or type(self).nlc_coeff is not pyscf_numint.NumInt.nlc_coeff):
             return super().nr_nlc_vxc(mol, grids, xc_code, dm, relativity, hermi, max_memory, verbose)
         coords, weights = _grid(grids)
@@ -630,6 +630,48 @@ def grad_xc(ni, mol, grids, xc_code, dms, spin=0):
     de = np.zeros((mol.natm, 3))
     for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:, 2:]):
         de[ia] = 2 * np.einsum("sxij,sij->x", vxc[:, :, p0:p1], dm[:, p0:p1])
+    return de
+
+
+def grad_nlc(ni, mol, grids, xc_code, dms, spin=0):
+    """VV10 term of the nuclear gradient at fixed grids, shape (natm, 3).
+
+    What pyscf's gradient adds from ``grad.rks.get_nlc_vxc`` (RKS and UKS
+    alike, for the total density; ``dms`` as from ``make_rdm1``, (2, nao,
+    nao) for ``spin=1``): the density on the NLC grid, the pair sums of
+    :func:`vv10nlc` and their contraction with the AO derivatives and the
+    density (``xc_grad_dm``, as a GGA) from the Mojo kernels.  Other
+    ``NumInt`` objects and more than one set of VV10 parameters (pyscf
+    raises) keep pyscf's ``get_nlc_vxc``.
+    """
+    from pyscf.grad import rks as rks_grad
+
+    nao = mol.nao_nr()
+    d = np.asarray(dms, dtype=np.float64).reshape(-1, nao, nao)
+    dm = np.ascontiguousarray(d.sum(axis=0) if spin else d[0])[None]
+    coefs = ni.nlc_coeff(xc_code)
+    if (not isinstance(ni, NumInt) or len(coefs) != 1 or type(ni).nlc_coeff is not pyscf_numint.NumInt.nlc_coeff
+            or not np.isrealobj(dms) or not supported(mol)):
+        vmat = rks_grad.get_nlc_vxc(ni, mol, grids, xc_code, dm[0])[1]
+        de = np.zeros((mol.natm, 3))
+        for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:, 2:]):
+            de[ia] = 2 * np.einsum("xij,ij->x", vmat[:, p0:p1], dm[0, p0:p1])
+        return de
+    orbitals = _orbitals(dms, 1 + spin, nao)
+    if orbitals is not None and spin:               # the total density from the alpha and beta orbitals
+        orbitals = (np.concatenate(orbitals[0], axis=1)[None], orbitals[1].reshape(1, -1))
+    coords, weights = _grid(grids)
+    rho = _rho(mol, coords, 1, dm, orbitals)[0]
+    (nlc_pars, fac), = coefs
+    vxc = vv10nlc(rho, coords, rho, weights, coords, nlc_pars)[1] * fac
+    wv = pyscf_xc_deriv.transform_vxc(rho, vxc, "GGA", spin=0)[:4] * weights
+    wv[0] *= 0.5
+    if orbitals is None:
+        orbitals = (np.zeros((1, nao, 0)), np.zeros((1, 0)))
+    de = np.empty((mol.natm, 3))
+    path, prefix = worker_blas()
+    get_extension().xc_grad_dm(integrals.basis_tables(mol), coords, 1, np.ascontiguousarray(wv[None]), dm,
+                               np.ascontiguousarray(orbitals[0]), np.ascontiguousarray(orbitals[1]), de, path, prefix)
     return de
 
 
