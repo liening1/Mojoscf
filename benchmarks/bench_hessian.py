@@ -23,6 +23,8 @@ import subprocess
 import sys
 
 CUCL4 = 'square_planar_atoms("Cu", ["Cl"] * 4, [2.25] * 4)'
+ETHYLENE = ('[("C", (0, 0, 0.6695)), ("C", (0, 0, -0.6695)), ("H", (0, 0.9289, 1.2321)), ("H", (0, -0.9289, 1.2321)), '
+            '("H", (0, 0.9289, -1.2321)), ("H", (0, -0.9289, -1.2321))]')
 
 # key: (label, atoms, basis, charge, spin, xc, density fitting)
 CASES = {
@@ -31,6 +33,10 @@ CASES = {
     "fc-pbe": ("ferrocene / def2-SVP PBE", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe", True),
     "fc-camb3lyp": ("ferrocene / def2-SVP CAM-B3LYP", "ferrocene_atoms()", "def2-svp", 0, 0, "camb3lyp", True),
     "cucl4-b3lyp": ("[CuCl4]2- doublet / def2-SVP B3LYP (UKS)", CUCL4, "def2-svp", -2, 1, "b3lyp", True),
+    # VV10 (pyscf's NLC Hessian is RKS only)
+    "c2h4-wb97mv": ("ethylene / def2-SVP wB97M-V", ETHYLENE, "def2-svp", 0, 0, "wb97m-v", True),
+    "zncl4-wb97mv": ("[ZnCl4]2- / def2-SVP wB97M-V", 'tetrahedral_atoms("Zn", "Cl", 2.29)', "def2-svp", -2, 0,
+                     "wb97m-v", True),
     # exact integrals (pyscf's default)
     "bz-b3lyp-x": ("benzene / def2-SVP B3LYP", "BENZENE_ATOMS", "def2-svp", 0, 0, "b3lyp", False),
     "bz-camb3lyp-x": ("benzene / def2-SVP CAM-B3LYP", "BENZENE_ATOMS", "def2-svp", 0, 0, "camb3lyp", False),

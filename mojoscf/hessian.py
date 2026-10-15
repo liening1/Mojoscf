@@ -143,10 +143,12 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
     with ``project``).  With exact integrals the Coulomb and exchange parts
     are J/K of the (symmetric) first-order densities of all vectors from one
     call of the Mojo kernels (:func:`mojoscf.dft.exact_jk`, long-range ones
-    included), projected to C^T V C_o.  None (pyscf's operator runs) without
-    an in-core DF tensor or exact integrals with pyscf's ``get_jk``, for
-    solvent models, NLC, short-range-only hybrids, fractional occupations and
-    MO tensors that do not fit in ``max_memory``.
+    included), projected to C^T V C_o.  VV10 functionals (RKS) add the response
+    of :class:`mojoscf.nlchess.Response` (pyscf's ``get_vnlc_resp``).  None
+    (pyscf's operator runs) without an in-core DF tensor or exact integrals
+    with pyscf's ``get_jk``, for solvent models, UKS with NLC, short-range-only
+    hybrids, fractional occupations and MO tensors that do not fit in
+    ``max_memory``.
     """
     from pyscf import lib
     from pyscf.scf import hf, rohf, uhf
@@ -170,8 +172,8 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
     except ImportError:  # pragma: no cover
         pass
     ks = isinstance(mf, hf.KohnShamDFT)
-    if ks and mf.do_nlc():
-        return None
+    if ks and mf.do_nlc() and unrestricted:
+        return None                          # pyscf has no UKS NLC Hessian
     full = 2.0 if not unrestricted else 1.0
     occs = [np.asarray(mo_occ)] if not unrestricted else [np.asarray(o) for o in mo_occ]
     if any(not np.all((o == 0) | (o == full)) for o in occs):
@@ -267,6 +269,12 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
                                     fxc, max_memory=max_memory)]
             return [ch.c.T @ v @ ch.co for ch, v in zip(chans, v1)]
 
+    nlc = None
+    if ks and mf.do_nlc():
+        from . import nlchess
+
+        nlc = nlchess.Response(mf, mo_coeff, mo_occ)
+
     def fx(mo1):
         mo1 = np.asarray(mo1)
         sizes = [ch.nmo * ch.nocc for ch in chans]
@@ -300,6 +308,10 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
             px = xc([(scale * (ch.c @ x), ch.co) for ch, x in zip(chans, xs)])
             for v, p in zip(vs, px):
                 v += p
+        if nlc is not None:                  # RKS: D1 = 2 (C x C_o^T + h.c.), as pyscf's gen_vind
+            ch = chans[0]
+            d = ch.c @ xs[0] @ ch.co.T
+            vs[0] += ch.c.T @ nlc(2.0 * (d + d.transpose(0, 2, 1))) @ ch.co
         out = np.empty_like(flat)
         off = 0
         for ch, v, n in zip(chans, vs, sizes):
@@ -379,8 +391,8 @@ def _df_jk_reason(hessobj, mo_coeff, mo_occ):
             return "solvent models"
     except ImportError:  # pragma: no cover
         pass
-    if isinstance(mf, hf.KohnShamDFT) and mf.do_nlc():
-        return "NLC functionals"
+    if isinstance(mf, hf.KohnShamDFT) and mf.do_nlc() and isinstance(mf, uhf.UHF):
+        return "UKS with NLC (pyscf has no UKS NLC Hessian)"
     if _hess_exchange_terms(mf) is None:
         return "short-range operator (omega < 0)"
     if getattr(mol, "omega", 0) or getattr(mf.with_df, "omega", None):
@@ -400,7 +412,7 @@ def _df_jk_reason(hessobj, mo_coeff, mo_occ):
 
 def _exact_jk_reason(hessobj, mo_coeff, mo_occ):
     """Why :func:`exact_jk_partial` cannot handle ``hessobj`` (None if it can): exact integrals with pyscf's
-    ``get_jk``, closed or high-spin open shells, no solvent model or NLC."""
+    ``get_jk``, closed or high-spin open shells, no solvent model, no UKS with NLC."""
     from pyscf.scf import hf, rohf, uhf
 
     from . import dft
@@ -419,8 +431,8 @@ def _exact_jk_reason(hessobj, mo_coeff, mo_occ):
             return "solvent models"
     except ImportError:  # pragma: no cover
         pass
-    if isinstance(mf, hf.KohnShamDFT) and mf.do_nlc():
-        return "NLC functionals"
+    if isinstance(mf, hf.KohnShamDFT) and mf.do_nlc() and isinstance(mf, uhf.UHF):
+        return "UKS with NLC (pyscf has no UKS NLC Hessian)"
     if _hess_exchange_terms(mf) is None:
         return "short-range operator (omega < 0)"
     if not np.isrealobj(mo_coeff):
@@ -1046,6 +1058,35 @@ def _is_ks(mf):
     return isinstance(mf, hf.KohnShamDFT)
 
 
+def _nlc_partial(hessobj, mo_coeff, mo_occ):
+    """pyscf's VV10 term of the partial Hessian (``_get_enlc_deriv2``, RKS; its pair sums from
+    :mod:`mojoscf.nlchess`), or 0 without NLC."""
+    from pyscf import lib
+    from pyscf.hessian import rks as rks_hess
+
+    mf = hessobj.base
+    if not (_is_ks(mf) and mf.do_nlc()):
+        return 0.0
+    max_memory = max(2000, mf.max_memory * 0.9 - lib.current_memory()[0])
+    return rks_hess._get_enlc_deriv2(hessobj, mo_coeff, mo_occ, max_memory)
+
+
+def _nlc_h1mo(hessobj, mo_coeff, mo_occ):
+    """pyscf's VV10 Fock derivatives (``_get_vnlc_deriv1``, RKS, with their grid response) projected as
+    :func:`xc_h1mo` returns them, or None without NLC."""
+    from pyscf import lib
+    from pyscf.hessian import rks as rks_hess
+
+    mf = hessobj.base
+    if not (_is_ks(mf) and mf.do_nlc()):
+        return None
+    max_memory = max(2000, mf.max_memory * 0.9 - lib.current_memory()[0])
+    v = rks_hess._get_vnlc_deriv1(hessobj, mo_coeff, mo_occ, max_memory)
+    c = np.asarray(mo_coeff)
+    co = c[:, np.asarray(mo_occ) > 0]
+    return [np.einsum("pi,axpq,qj->axij", c, np.asarray(v), co, optimize=True)]
+
+
 class _MojoHessMixin:
     """In front of pyscf's RHF/UHF/RKS/UKS Hessian classes (DF or not): the XC terms from the Mojo kernels,
     the Coulomb/exchange terms from :func:`df_jk_terms` (density fitting) or :func:`exact_jk_partial` and
@@ -1093,7 +1134,8 @@ class _MojoHessMixin:
             jk = exact_jk_partial(self, mo_coeff, mo_occ)
             jk = None if jk is None else (jk,)
         if jk is not None:
-            de2 = _hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
+            de2 = (_hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
+                   + _nlc_partial(self, mo_coeff, mo_occ))
             return de2[np.ix_(atm, atm)]
         if not _is_ks(mf):
             return super().partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, verbose)
@@ -1134,11 +1176,14 @@ class _MojoHessMixin:
         cs = [np.asarray(c) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff)]
         occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
         es = [np.asarray(e) for e in mo_energy] if unrestricted else [np.asarray(mo_energy)]
+        nlch1 = None
         if jk is not None:
-            de2 = _hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
+            de2 = (_hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
+                   + _nlc_partial(self, mo_coeff, mo_occ))
             de2 = de2[np.ix_(atmlst, atmlst)]
             if xch1 is None:
                 xch1 = _pyscf_xc_h1mo(self, mo_coeff, mo_occ)
+            nlch1 = _nlc_h1mo(self, mo_coeff, mo_occ)
             hcore_deriv = mf.nuc_grad_method().hcore_generator(mol)
             hmo = jk[1]
             for ia in atmlst:
@@ -1149,12 +1194,13 @@ class _MojoHessMixin:
             de2 = self.partial_hess_elec(mo_energy, mo_coeff, mo_occ, atmlst, max_memory, log)
             hmo = exact_h1mo(self, mo_coeff, mo_occ)
             if hmo is not None:
+                nlch1 = _nlc_h1mo(self, mo_coeff, mo_occ)
                 hcore_deriv = mf.nuc_grad_method().hcore_generator(mol)
                 for ia in atmlst:
                     h1 = hcore_deriv(ia)
                     for c, o, hm in zip(cs, occs, hmo):
                         hm[ia] += c.T @ h1 @ c[:, o > 0]
-            else:
+            else:                           # pyscf's make_h1 (its VV10 term included)
                 with _ZeroXC1(mol, unrestricted):
                     h1ao = self.make_h1(mo_coeff, mo_occ, None, atmlst, log)
                 h1s = list(h1ao) if unrestricted else [h1ao]
@@ -1179,7 +1225,7 @@ class _MojoHessMixin:
                 s1ao[:, :, p0:p1] += s1a[:, p0:p1].transpose(0, 2, 1)
                 sm[ia] = c.T @ s1ao @ co
             smo.append(sm)
-        for hm, xh in zip(hmo, xch1):
+        for hm, xh in zip(hmo, xch1 if nlch1 is None else [x + y for x, y in zip(xch1, nlch1)]):
             hm[atmlst] += xh[atmlst]
         mo1s, e1s = self._solve_mo1_mo(mo_energy, mo_coeff, mo_occ, hmo, smo, atmlst, max_memory, log)
         t1 = log.timer_debug1("solving MO1", *t1)

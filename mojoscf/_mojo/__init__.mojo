@@ -25,7 +25,7 @@ from _mojo.kernels import (
 from _mojo.diis import diis_update_buffers, diis_init_hmat
 from _mojo.dfjk import df_jk_core, factorize_density, block_size
 from _mojo.fcirdm import fci_dm123_core, fci_f3_core
-from _mojo.nlc import vv10_core, vv10_sym_core
+from _mojo.nlc import vv10_core, vv10_sym_core, vv10_uwabce_core, vv10_fxc_core, vv10_euw_w1_core, vv10_euw_gr_core
 from _mojo.dfmo import (
     df_mo_core, df_sandwich_core, cphf_k_core, casscf_ah_core, casscf_mo_core, packed_gather_core,
     packed_scatter_core,
@@ -76,6 +76,10 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_fci_f3]("fci_f3", docstring="fci_f3(linka, linkb, ci, eri, mode, buf1, buf2, fdm2, fdm3, seq_path, seq_prefix): pyscf's NEVPT 4-particle contractions (mode 0 NEVPTkern_cedf_aedf, 1 NEVPTkern_aedf_ecdf) before their completion: fdm3 for a >= c and fdm2.")
         m.def_function[py_vv10]("vv10", docstring="vv10(xyz, w0, k, vxyz, w0p, kp, rpw, f, u, w): the VV10 pair sums of pyscf's numint._vv10nlc (F already scaled by -3/2).")
         m.def_function[py_vv10_sym]("vv10_sym", docstring="vv10_sym(xyz, w0, k, rpw, f, u, w): vv10 with one grid as outer and inner points (symmetric pair denominators).")
+        m.def_function[py_vv10_uwabce]("vv10_uwabce", docstring="vv10_uwabce(xyz, w, rho, omega, kappa, u, wq, a, b, c, e): pyscf's VXC_vv10nlc_hessian_eval_UWABCE (pair sums of the VV10 Hessian).")
+        m.def_function[py_vv10_fxc]("vv10_fxc", docstring="vv10_fxc(xyz, omega, kappa, p1, p0, cg, y, o, seq_path, seq_prefix): pair part of pyscf's VXC_vv10nlc_hessian_eval_f_t as tile GEMMs; y, o (ntile, 2, 128, ntrial).")
+        m.def_function[py_vv10_euw_w1]("vv10_euw_w1", docstring="vv10_euw_w1(xyz, omega, kappa, y, o, seq_path, seq_prefix): pyscf's VXC_vv10nlc_hessian_eval_EUW_with_weight1 as tile GEMMs; y (ntile, 128, nd) = rho dw/dR, o (ntile, 3, 128, nd).")
+        m.def_function[py_vv10_euw_gr]("vv10_euw_gr", docstring="vv10_euw_gr(xyz, w, rho, omega, kappa, seg, out): pyscf's VXC_vv10nlc_hessian_eval_EUW_grid_response for points sorted by atom (seg int64 (natm + 1)); out (3, natm, 3, npad).")
         m.def_function[py_casscf_ah]("casscf_ah", docstring="casscf_ah(b, ncore, ncas, rmat, sa, v3, v34, seq_path, seq_prefix): v3 (ncas, nmo), v34 (ncore, nmo - ncore) += the MO-basis (2J - K) rows of a CASSCF orbital-Hessian step for the DF tensor b (nq, nmo, nmo), the core-noncore rotation rmat and sa = casdm1 r[active].")
         m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r (nmo, nset, nocc) += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)) with xs (nmo, nset, nocc), the MO-basis exchange of the orbital-Hessian response.")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k, nanti): J/K from 8-fold packed ERIs (the last nanti densities antisymmetric: K only).")
@@ -490,6 +494,52 @@ def py_vv10_sym(
     w: PythonObject,
 ) raises -> PythonObject:
     vv10_sym_core(Int(py=xyz.shape[0]), f64ptr(xyz), f64ptr(w0), f64ptr(k), f64ptr(rpw), f64ptr(f), f64ptr(u), f64ptr(w))
+    return PythonObject(None)
+
+
+def py_vv10_uwabce(
+    xyz: PythonObject, w: PythonObject, rho: PythonObject, omega: PythonObject, kappa: PythonObject, u: PythonObject,
+    wq: PythonObject, a: PythonObject, b: PythonObject, c: PythonObject, e: PythonObject,
+) raises -> PythonObject:
+    vv10_uwabce_core(
+        Int(py=xyz.shape[0]), f64ptr(xyz), f64ptr(w), f64ptr(rho), f64ptr(omega), f64ptr(kappa), f64ptr(u), f64ptr(wq),
+        f64ptr(a), f64ptr(b), f64ptr(c), f64ptr(e),
+    )
+    return PythonObject(None)
+
+
+def py_vv10_fxc(
+    xyz: PythonObject, omega: PythonObject, kappa: PythonObject, p1: PythonObject, p0: PythonObject, cg: PythonObject,
+    y: PythonObject, o: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    vv10_fxc_core(
+        blas_seq, Int(py=xyz.shape[0]), f64ptr(xyz), f64ptr(omega), f64ptr(kappa), f64ptr(p1), f64ptr(p0), f64ptr(cg),
+        Int(py=y.shape[3]), f64ptr(y), f64ptr(o),
+    )
+    return PythonObject(None)
+
+
+def py_vv10_euw_w1(
+    xyz: PythonObject, omega: PythonObject, kappa: PythonObject, y: PythonObject, o: PythonObject,
+    seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    vv10_euw_w1_core(
+        blas_seq, Int(py=xyz.shape[0]), f64ptr(xyz), f64ptr(omega), f64ptr(kappa), Int(py=y.shape[2]), f64ptr(y),
+        f64ptr(o),
+    )
+    return PythonObject(None)
+
+
+def py_vv10_euw_gr(
+    xyz: PythonObject, w: PythonObject, rho: PythonObject, omega: PythonObject, kappa: PythonObject, seg: PythonObject,
+    dst: PythonObject,
+) raises -> PythonObject:
+    vv10_euw_gr_core(
+        Int(py=xyz.shape[0]), f64ptr(xyz), f64ptr(w), f64ptr(rho), f64ptr(omega), f64ptr(kappa),
+        Int(py=seg.shape[0]) - 1, i64ptr(seg), f64ptr(dst),
+    )
     return PythonObject(None)
 
 
