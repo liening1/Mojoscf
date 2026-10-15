@@ -945,6 +945,29 @@ keeps pyscf's driver, nuclear term and CPHF solver and replaces the rest:
   operator from J/K of the first-order densities of all perturbations in
   one call of the integral-direct kernels (or the in-core ERIs).
   Range-separated hybrids add one long-range pass of each.
+* **VV10 functionals** (ωB97M-V, ωB97X-V, B97M-V, `mf.nlc`; RKS, as pyscf
+  has no UKS Hessian for them).  pyscf's analytical NLC terms
+  (`_get_enlc_deriv2`, `_get_vnlc_deriv1` with its grid response, and
+  `get_vnlc_resp` in every CPHF iteration) evaluate double sums over the NLC
+  grid in C: per-point sums U, W, A, B, C, E, the kernel applied to the trial
+  densities of all perturbations, grid-response and weight-derivative sums.
+  Each loops over all ordered pairs of points one at a time with three
+  divisions per pair, and the sums over trial densities and nuclear
+  displacements evaluate the pair terms again for every six trials or every
+  displacement.  `mojoscf.nlchess` answers these calls with Mojo kernels
+  (pyscf's `libdft` in `pyscf.hessian.rks` is wrapped at import): the
+  symmetric sums take each unordered pair once, the trial and displacement
+  sums are GEMMs of tiles of pair coefficients (one division per four
+  vectors of pairs) with the trial vectors, and the grid-response sums run
+  over the points of one atom at a time (all four agree with pyscf's C to
+  1e-12).  In the accelerated Hessian the CPHF response is native
+  (`nlchess.Response`: the densities and potential matrices of all
+  first-order densities from the XC kernels, the ground-state sums once)
+  and the Coulomb/exchange and semi-local XC terms take the native paths
+  above; the NLC energy and Fock derivatives are pyscf's functions on the
+  Mojo sums.  Same-SCF Hessians agree with pyscf to 2e-12 (exact integrals),
+  1e-11 with density fitting, and 1e-8 for ωB97M-V with density fitting (the
+  long-range metric, 7e-9 without the VV10 term).
 
 `benchmarks/bench_hessian.py`: pyscf versus `mojoscf.dft.accelerate`, each in
 its own process, density fitting (auxiliary-basis response included, pyscf's
@@ -985,7 +1008,7 @@ kernels, is bound by the throughput of its per-block GEMMs (stacking the
 response vectors of a block into larger GEMMs made it 18% slower: the
 per-vector GEMMs, rows x 128 points x rows, are already of medium size).
 
-PCM/SMD solvent models, NLC, `auxbasis_response < 2`, objects with a
+PCM/SMD solvent models, `auxbasis_response < 2`, objects with a
 `get_jk` of their own and short-range operators with omega < 0 run pyscf's
 code for the Coulomb/exchange part (pyscf's solvent terms included).
 
@@ -1494,6 +1517,7 @@ but slow for more than a few dozen orbitals.
 | Kohn-Sham XC (`NumInt.nr_rks`/`nr_uks`, LDA/GGA/meta-GGA), with `mojoscf.dft.accelerate` | Python loop over blocks: C AO values, NumPy/C GEMMs, libxc per block | Mojo (`_mojo/numint.mojo`): two passes over the grid (densities; potential matrix) around one libxc call; screened shells per block of 128 points, SIMD AO values, per-block GEMMs; pyscf's grids and libxc |
 | Kohn-Sham gradients (`grad.rks`/`uks`, DF or not) | pyscf `get_vxc` (C AO second derivatives, NumPy contractions) + J/K derivative matrices | Mojo: XC term contracted with the density inside one pass over AO second derivatives; Coulomb/exact-exchange term from `grad2e`/`grad2e_df` |
 | VV10 non-local correlation (`numint._vv10nlc` in `nr_nlc_vxc` and the NLC gradient) | C double loop over all ordered pairs of grid points (OpenMP), scalar; densities and potential by the Python block loop | Mojo (`_mojo/nlc.mojo`): SIMD over cached tiles, each unordered pair once (symmetric denominators), one division per four vectors of pairs; densities, potential matrix and gradient contraction from the XC kernels |
+| VV10 terms of the analytical Hessian (`pyscf.hessian.rks`: `_get_enlc_deriv2`, `_get_vnlc_deriv1`, `get_vnlc_resp` in every CPHF iteration) | C double loops over all ordered pairs of NLC grid points, three divisions per pair, the pair terms evaluated again for every six trial densities (`f_t`) or every grid-weight derivative | Mojo (`_mojo/nlc.mojo`, `mojoscf.nlchess`): the symmetric sums once per unordered pair, the trial and weight-derivative sums as GEMMs of tiles of pair coefficients, the grid-response sums per atom; the CPHF response from the XC kernels with the ground-state sums once |
 | XC response kernels (`cache_xc_kernel`, `nr_rks_fxc`, `nr_uks_fxc`: TDDFT, CPHF) | Python loop over blocks per density: C AO values, NumPy GEMMs and `einsum` | Mojo (`xc_fxc_core`): one fused pass, response densities, kernel contraction and potential per block; for transition densities from their occupied-virtual factors |
 | Analytical Hessians (`pyscf.hessian.rks`/`uks`, DF or not): XC second-derivative terms, first-order Fock matrices, CPHF | Python loops over grid blocks (AO values up to third derivatives, one nao x nao matrix per atom and direction), per-atom `einsum`s over libcint derivative integrals with HDF5 intermediates (DF), per-atom `_get_jk` calls over libcint derivative integrals (exact), AO first-order densities through `get_jk` and `nr_rks_fxc` per CPHF iteration | Mojo (`xc_hess_core`, `xc_h1_core`, `hess_df3c_core`, `int3c2e_ip1_core`, `cphf_k_core`; exact: `hess2e_core`, `h1_2e_core`) + BLAS: XC terms contracted inside one grid pass, Fock derivatives and CPHF in the MO basis, second-derivative integrals contracted as produced, DF response vectors whitened with the metric's Cholesky factor, exact first-order Fock matrices of all atoms from one 8-fold pass; pyscf's driver and CPHF solver |
 | TDA/TDDFT/TDHF response (`pyscf.tdscf` `gen_vind`), DF | AO transition densities through `get_jk` (DF with non-symmetric densities: Python loop, `einsum`) and the XC kernel | Mojo (`_mojo/dfmo.mojo`, `mojoscf.tdscf`): MO-basis DF tensors once, Coulomb and exchange of all trial vectors in the occupied-virtual space (per-Q GEMMs), XC response projected in the kernel; pyscf's Davidson solvers |
@@ -1525,7 +1549,7 @@ mojoscf/
   _mojo/gradients.mojo two-electron gradient and exact Hessian terms, exact and density-fitted
   _mojo/qmmm.mojo      potential of MM point/Gaussian charges, its derivative, forces on the charges
   _mojo/numint.mojo    XC integration on pyscf's grids: AO values and derivatives, densities, XC matrices, XC gradient, response kernels
-  _mojo/nlc.mojo       VV10 non-local correlation: the pair sums over the NLC grid
+  _mojo/nlc.mojo       VV10 non-local correlation: the pair sums over the NLC grid (energy, potential, Hessian terms)
   _mojo/grids.mojo     Becke partition of pyscf's grids and its nuclear derivatives (weight response)
   _mojo/pdft.mojo      MC-PDFT: on-top pair density and its potential and gradient terms
   _mojo/fcirdm.mojo    FCI 1-, 2- and 3-particle density matrices; NEVPT2's 4-particle contractions
@@ -1538,6 +1562,7 @@ mojoscf/
   scf.py               RHF/UHF classes, kernel(), accelerate()
   grad.py              RHF/UHF and RKS/UKS nuclear gradient classes, exact and DF (nuc_grad_method)
   dft.py               Kohn-Sham: NumInt (XC integration), XC and VV10 gradient terms, accelerate() for pyscf RKS/UKS objects
+  nlchess.py           the VV10 pair sums of pyscf's analytical Hessian and the native VV10 CPHF response
   casscf.py            DF-CASSCF integrals, orbital Hessian, gradients and DF-NEVPT2 integrals (pyscf.mcscf, pyscf.mrpt)
   mcpdft.py            MC-PDFT (pyscf.mcpdft) on the Mojo XC kernels
   fcirdm.py            FCI 3-particle density matrices and NEVPT2's 4-particle contractions
@@ -1676,9 +1701,11 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   for LDA, GGA and meta-GGA, the Coulomb/exchange terms and the CPHF
   operator for density-fitted references (pyscf's `df.DF` with the tensor
   in memory or memory-mapped, `auxbasis_response = 2`) and exact integrals (in-core or
-  integral-direct), global and range-separated hybrids; NLC, solvent
-  models, objects with their own `get_jk` and short-range operators with
-  omega < 0 run pyscf's code for the parts they touch.
+  integral-direct), global and range-separated hybrids, and VV10 (RKS; the
+  NLC energy and Fock derivatives are pyscf's functions on the Mojo pair
+  sums of `mojoscf.nlchess`, the CPHF response native); solvent models,
+  objects with their own `get_jk` and short-range operators with omega < 0
+  run pyscf's code for the parts they touch.
 * QM/MM (`pyscf.qmmm.mm_charge`, point or Gaussian MM charges) runs on the
   native loop with the MM-charge terms of the Hamiltonian and of the
   gradients (QM atoms and MM charges) from the engine, for QM shells up to
