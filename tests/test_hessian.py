@@ -237,7 +237,8 @@ def test_df_jk_terms_fallbacks():
 
 
 def test_solvent_hessian_keeps_pyscf_solvent_terms():
-    """PCM: pyscf's solvent Hessian wraps the accelerated one; its solvent terms stay in (J/K via pyscf)."""
+    """PCM: pyscf's solvent Hessian wraps the accelerated one; its solvent terms stay in (the J/K terms native,
+    the solvent's Fock-derivative term and response added to the native paths)."""
     mol = gto.M(atom=WATER, basis="sto-3g", verbose=0)
 
     def make():
@@ -251,7 +252,7 @@ def test_solvent_hessian_keeps_pyscf_solvent_terms():
     ref.kernel()
     h = mf.Hessian()
     assert isinstance(h, mhess._MojoHessMixin)
-    assert mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) == "solvent models"
+    assert mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
     assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-7
 
 
