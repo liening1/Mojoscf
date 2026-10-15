@@ -36,7 +36,7 @@ from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_i
 from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core, h1_2e_core
 from _mojo.gradients import grad2e_core, grad2e_pairs_core, hess2e_core, grad2c_core, df_grad_rhs, grad_df3c_core, int3c2e_ip1_core, hess_df3c_core
 from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core, mm_potential_sets_core, mm_esp_grad_core, mm_hess_core
-from _mojo.pcm import pcm_ds_core, pcm_pair_core
+from _mojo.pcm import pcm_ds_core, pcm_pair_core, pcm_dx_atoms_core, pcm_d2x_atoms_core
 from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core, xc_hess_core, xc_h1_core
 from _mojo.pdft import ontop_pi_core, ontop_grad_core, ontop_paaa_core, ontop_density_core
 from _mojo.grids import becke_response_core
@@ -117,6 +117,8 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_mm_potential]("mm_potential", docstring="mm_potential(basis, table, coords, weights, zetas, point, out): sum_k w_k (ij|k) for point or unit Gaussian charges (nao, nao).")
         m.def_function[py_pcm_ds]("pcm_ds", docstring="pcm_ds(table, coords, zeta, switch, norm, rvdw, with_d, s, d): pyscf's PCM S (and D) matrices (n, n).")
         m.def_function[py_pcm_pair]("pcm_pair", docstring="pcm_pair(table, coords, zeta, norm, kind, a, b, g): G_p = a_p sum_j dX_pj b_j - b_p sum_i a_i dX_ip for X = S (kind 0) or D (1), g (n, 3).")
+        m.def_function[py_pcm_dx_atoms]("pcm_dx_atoms", docstring="pcm_dx_atoms(table, coords, zeta, norm, kind, q, catom, out): sum_{j on A, j != i} dX_ij/dr_i q_j (natm, 3, n) for X = S, D, D^T (kind 0, 1, 2); catom int64 (n).")
+        m.def_function[py_pcm_d2x_atoms]("pcm_d2x_atoms", docstring="pcm_d2x_atoms(table, coords, zeta, norm, kind, v, q, catom, out): pyscf's get_v_dot_d2X_dot_q pair part (natm, natm, 3, 3) for X = S, D, D^T (kind 0, 1, 2).")
         m.def_function[py_mm_esp]("mm_esp", docstring="mm_esp(basis, table, coords, zetas, point, dms, out): sum_ij D_s,ij (ij|k) for symmetric dms (nset, nao, nao) at point or unit Gaussian charges, out (nset, nch).")
         m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces, atoms): sum_k w_k (nabla i j|k) (3, nao, nao), sum_ij D_ij w_k (ij|nabla k) (nch, 3), 2 sum_{i on A} D_ij sum_k w_k (nabla i j|k) (natm, 3); an empty output is skipped.")
         m.def_function[py_mm_potential_sets]("mm_potential_sets", docstring="mm_potential_sets(basis, table, coords, zetas, point, weights, deriv, out): sum_k w_s,k (ij|k) (nset, nao, nao) for weights (nset, nch), or with deriv sum_k w_s,k (nabla_x i j|k) (nset, 3, nao, nao).")
@@ -1118,6 +1120,32 @@ def py_pcm_ds(
     pcm_ds_core(
         boys, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(zeta), f64ptr(switch), f64ptr(norm), f64ptr(rvdw),
         Bool(py=with_d), f64ptr(s), f64ptr(d),
+    )
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_pcm_dx_atoms(
+    table: PythonObject, coords: PythonObject, zeta: PythonObject, norm: PythonObject, kind: PythonObject,
+    q: PythonObject, catom: PythonObject, dst: PythonObject,
+) raises -> PythonObject:
+    var boys = _boys(table)
+    pcm_dx_atoms_core(
+        boys, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(zeta), f64ptr(norm), Int(py=kind), f64ptr(q),
+        i64ptr(catom), Int(py=dst.shape[0]), f64ptr(dst),
+    )
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_pcm_d2x_atoms(
+    table: PythonObject, coords: PythonObject, zeta: PythonObject, norm: PythonObject, kind: PythonObject,
+    v: PythonObject, q: PythonObject, catom: PythonObject, dst: PythonObject,
+) raises -> PythonObject:
+    var boys = _boys(table)
+    pcm_d2x_atoms_core(
+        boys, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(zeta), f64ptr(norm), Int(py=kind), f64ptr(v),
+        f64ptr(q), i64ptr(catom), Int(py=dst.shape[0]), f64ptr(dst),
     )
     _ = boys^
     return PythonObject(None)

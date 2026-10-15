@@ -35,12 +35,18 @@ K q = R v twice.  With :func:`attach` the solvent object uses
   atom (:func:`esp_grad_table`); the second-derivative integrals of
   ``analytical_hess_qv`` (``ipip1``, ``ipvip1``, ``ip1ip2``, ``ipip2``) are
   one pass of :func:`mojoscf.integrals.mm_hess_terms`; ``get_dqsym_dx``
-  (three calls per Hessian) is kept per density.
+  (three calls per Hessian) is kept per density.  In the solver term
+  (``analytical_hess_solver``) and ``get_dqsym_dx`` pyscf's dense surface
+  derivative arrays (dS, dD (n, n, 3); d2S, d2D (3, 3, n, n); d2F, d2A,
+  d2Sii (natm, natm, 3, 3, n)) are replaced by stand-ins whose contractions
+  are evaluated on the fly (``_mojo/pcm.mojo`` per atom pair; the switching
+  function per block of points over the atoms it depends on), and the
+  solves with K reuse its LU factorisation: memory O(n natm) instead of
+  O(n^2 + n natm^2), pyscf's own assembly of the terms unchanged.
 
-The surface itself, the switching-function derivatives, the surface-matrix
-second derivatives of the Hessian's solver term, the nuclear and the
-cavity-dispersion (SMD) terms stay pyscf's.  Results agree with pyscf's to
-the precision of the integrals.
+The surface itself, the switching-function first derivatives, the nuclear
+and the cavity-dispersion (SMD) terms stay pyscf's.  Results agree with
+pyscf's to the precision of the integrals.
 
 >>> mf = dft.RKS(mol, xc="b3lyp").density_fit().PCM()
 >>> mojoscf.dft.accelerate(mf)        # attaches the solvent kernels too
@@ -463,6 +469,179 @@ def analytical_hess_qv(pcmobj, dm, verbose=None):
     return -d2e
 
 
+class _SurfDeriv:
+    """Stands in for one of the dense surface derivative arrays of pyscf's PCM Hessian (``dS``, ``dD``
+    (n, n, 3), ``d2S``, ``d2D`` (3, 3, n, n), ``d2F``, ``d2A``, ``d2Sii`` (natm, natm, 3, 3, n)) while
+    ``analytical_hess_solver`` and ``get_dqsym_dx`` run for a solvent object with the Mojo mixin: the
+    helpers that contract them (``get_dS_dot_q``, ``get_v_dot_d2S_dot_q``, ...) evaluate the contraction
+    instead (``_mojo/pcm.mojo``, :func:`_d2f_contract`), so no (n, n) or (natm, natm, n) array is formed."""
+
+    def __init__(self, surface, kind, **extra):
+        self.surface = surface
+        self.kind = kind
+        self.__dict__.update(extra)
+
+
+_LAZY = []          # the solvent objects whose Hessian terms run with _SurfDeriv stand-ins
+
+
+class _lazy_surface:
+    def __init__(self, pcmobj):
+        self.pcmobj = pcmobj
+
+    def __enter__(self):
+        _LAZY.append(self.pcmobj)
+
+    def __exit__(self, *exc):
+        _LAZY.pop()
+
+
+def _charge_atoms(surface):
+    gridslice = surface["gslice_by_atom"]
+    catom = np.empty(np.shape(surface["grid_coords"])[0], dtype=np.int64)
+    for ia, (g0, g1) in enumerate(gridslice):
+        catom[g0:g1] = ia
+    return catom
+
+
+def _surface_args(surface):
+    return (integrals._boys_table(), np.ascontiguousarray(surface["grid_coords"], dtype=np.float64),
+            np.ascontiguousarray(surface["charge_exp"], dtype=np.float64),
+            np.ascontiguousarray(surface["norm_vec"], dtype=np.float64))
+
+
+_KINDS = {"S": 0, "D": 1, "DT": 2}
+
+
+def _dx_atoms(surface, kind, q):
+    """P[A, x, i] = sum_{j on A, j != i} dX_ij/dr_i,x q_j (natm, 3, n) for X = S, D or D^T."""
+    natm = len(surface["gslice_by_atom"])
+    out = np.empty((natm, 3, np.shape(surface["grid_coords"])[0]))
+    get_extension().pcm_dx_atoms(*_surface_args(surface), _KINDS[kind], np.ascontiguousarray(q, dtype=np.float64),
+                                 _charge_atoms(surface), out)
+    return out
+
+
+def _dX_dot_q(dX, kind, q, atmlst, gridslice, dSii=None):
+    """pyscf's ``get_dS_dot_q`` / ``get_dD_dot_q`` / ``get_dDT_dot_q`` from :func:`_dx_atoms`."""
+    P = _dx_atoms(dX.surface, kind, q)
+    rows = P.sum(axis=0)
+    if dSii is None:
+        out = np.zeros((len(atmlst), 3, P.shape[2]))
+    else:
+        out = np.einsum("iAd,i->Adi", dSii[:, atmlst, :], q)
+    for i_atom in atmlst:
+        g0, g1 = gridslice[i_atom]
+        out[i_atom, :, g0:g1] += rows[:, g0:g1]
+        out[i_atom] -= P[i_atom]
+    return out
+
+
+def _d2x_atoms(surface, kind, v, q):
+    """pyscf's ``get_v_dot_d2X_dot_q`` pair part (natm, natm, 3, 3) for X = S, D or D^T."""
+    natm = len(surface["gslice_by_atom"])
+    out = np.empty((natm, natm, 3, 3))
+    get_extension().pcm_d2x_atoms(*_surface_args(surface), _KINDS[kind], np.ascontiguousarray(v, dtype=np.float64),
+                                  np.ascontiguousarray(q, dtype=np.float64), _charge_atoms(surface), out)
+    return out
+
+
+def _d2f_contract(surface, method, w):
+    """sum_i w_i d2f_i (natm, natm, 3, 3), with pyscf's ``get_d2F_d2A`` giving d2F[..., i] = F_i d2f_i and
+    d2A[..., i] = A_i d2f_i: the same formulas per block of points of one atom, contracted at once and over
+    the atoms with a nonzero switching-function derivative only (the others contribute exact zeros)."""
+    from scipy.special import erf
+
+    from pyscf.solvent.grad.pcm import grad_switch_h
+    from pyscf.solvent.hessian.pcm import gradgrad_switch_h
+    from pyscf.solvent.pcm import switch_h
+
+    method = method.upper()
+    if method not in ("SWIG", "ISWIG"):
+        raise NotImplementedError(f"surface_discretization_method = {method} not recognized")
+    atom_coords = surface["atom_coords"]
+    grid_coords = surface["grid_coords"]
+    natom = atom_coords.shape[0]
+    w = np.asarray(w, dtype=np.float64)
+    eye = np.eye(3)
+    out = np.zeros((natom, natom, 3, 3))
+    for G, (p0, p1) in enumerate(surface["gslice_by_atom"]):
+        wq = w[p0:p1]
+        if p1 <= p0 or not wq.any():
+            continue
+        si_rJ = grid_coords[p0:p1, None, :] - atom_coords
+        norm_si_rJ = np.linalg.norm(si_rJ, axis=-1)
+        si_rJ[:, G, :] = 0.0
+        if method == "SWIG":
+            R_sw_J = surface["R_sw_J"]
+            diJ = (norm_si_rJ - surface["R_in_J"]) / R_sw_J
+            diJ[:, G] = 1.0
+            diJ[diJ < 1e-8] = 0.0
+            si_rJ[diJ < 1e-8] = 0.0
+            fiJ, dfiJ, d2fiJ = switch_h(diJ), grad_switch_h(diJ), gradgrad_switch_h(diJ)
+            scale = np.broadcast_to(R_sw_J, fiJ.shape)
+        else:
+            xi = surface["charge_exp"][p0:p1, None]
+            R_J = surface["R_J"]
+            ep = xi * (R_J + norm_si_rJ)
+            em = xi * (R_J - norm_si_rJ)
+            fiJ = 1 - 0.5 * (erf(ep) + erf(em))
+            dfiJ = 1 / np.sqrt(np.pi) * xi * (np.exp(-em ** 2) - np.exp(-ep ** 2))
+            dfiJ[:, G] = 0
+            d2fiJ = 2.0 / np.sqrt(np.pi) * xi ** 2 * (em * np.exp(-em ** 2) + ep * np.exp(-ep ** 2))
+            scale = np.ones_like(fiJ)
+        act = np.flatnonzero((dfiJ != 0).any(axis=0) | (d2fiJ != 0).any(axis=0))
+        act = act[act != G]               # the grid atom's own terms vanish (si_rJ = 0, dfiJ = 0)
+        if act.size == 0:
+            continue
+        f, df, d2f = fiJ[:, act], dfiJ[:, act], d2fiJ[:, act]
+        nr, si, rs = norm_si_rJ[:, act], si_rJ[:, act], scale[:, act]
+        b = (df / (f * nr * rs))[:, :, None] * si                     # (q, J, 3)
+        t = np.einsum("q,qJd,qKD->JKdD", wq, b, b, optimize=True)      # off-diagonal J != K
+        terms = (d2f / (nr ** 2 * rs) - df / nr ** 3) / (f * rs)
+        diag = np.einsum("q,qJ,qJd,qJD->JdD", wq, terms, si, si, optimize=True)
+        diag += np.einsum("q,qJ->J", wq, df / nr / (f * rs))[:, None, None] * eye
+        idx = np.arange(act.size)
+        t[idx, idx] = diag
+        out[np.ix_(act, act)] += t
+        off = -t.sum(axis=1)                                         # (J, 3, 3)
+        out[G, act] += off.transpose(0, 2, 1)
+        out[act, G] += off
+        out[G, G] += t.sum(axis=(0, 1))
+    return out
+
+
+def _d2sii_dot(d2Sii, w):
+    """d2Sii @ w (natm, natm, 3, 3) for pyscf's dense d2Sii or its stand-in (``get_d2Sii``)."""
+    if not isinstance(d2Sii, _SurfDeriv):
+        return d2Sii @ w
+    surf = d2Sii.surface
+    F = np.asarray(surf["switch_fun"])
+    c = (2.0 / np.pi) ** 0.5 * np.asarray(surf["charge_exp"]) * np.asarray(w)
+    dF = np.asarray(d2Sii.dF)
+    out = 2.0 * np.einsum("iAa,iBb,i->ABab", dF, dF, c / F ** 3, optimize=True)
+    out -= _d2f_contract(surf, d2Sii.d2F.method, c / F)
+    return out
+
+
+def _k_inverse(K, X, from_left):
+    """K^-1 X^T (``from_left``) or K^-T X^T for the solvent object in ``_LAZY`` with its cached LU of K
+    (pyscf solves K, or K^T, afresh in every call); None if K is not that object's matrix."""
+    if not _LAZY:
+        return None
+    pcmobj = _LAZY[-1]
+    Kint = pcmobj._intermediates.get("K")
+    if Kint is None:
+        return None
+    if K is Kint:
+        trans = not from_left
+    elif K.base is Kint and K.shape == Kint.shape[::-1] and K.strides == Kint.strides[::-1]:
+        trans = from_left
+    else:
+        return None
+    return pcmobj._k_solve(X, trans=trans)
+
+
 def _install_hess_hooks():
     """Route pyscf's ``solvent.hessian.pcm`` functions (imported at call time by PCM.hess and SMD.hess, and
     looked up by ``WithSolventHess.make_h1``) to the Mojo versions above for solvent objects with the Mojo
@@ -490,15 +669,112 @@ def _install_hess_hooks():
         return ours(pcmobj, dm) and list(atmlst) == list(range(pcmobj.mol.natm))
 
     def dqsym(orig, pcmobj, dm, atmlst):
-        return _cached(pcmobj, ("mojoscf_dqdx", tuple(atmlst)), dm, lambda: orig(pcmobj, dm, atmlst))
+        def compute():
+            with _lazy_surface(pcmobj):
+                return orig(pcmobj, dm, atmlst)
+
+        return _cached(pcmobj, ("mojoscf_dqdx", tuple(atmlst)), dm, compute)
 
     def hess_ok(pcmobj, dm, *args, **kwargs):
         return ours(pcmobj, dm) and integrals.mm_hess_supported(pcmobj.mol)
+
+    def lazy(orig, pcmobj, dm, *args, **kwargs):
+        with _lazy_surface(pcmobj):
+            return orig(pcmobj, dm, *args, **kwargs)
 
     wrap("get_dvgrids", lambda orig, *a, **k: get_dvgrids(*a, **k), all_atoms)
     wrap("get_dqsym_dx", dqsym)
     wrap("analytical_grad_vmat", lambda orig, *a, **k: analytical_grad_vmat(*a, **k))
     wrap("analytical_hess_qv", lambda orig, *a, **k: analytical_hess_qv(*a, **k), hess_ok)
+    wrap("analytical_hess_solver", lazy)
+
+    # the surface derivative arrays and their contractions (stand-ins only while _LAZY is set)
+    def helper(name, mojo_fn):
+        orig = getattr(pcm_hess, name)
+        if getattr(orig, "_mojoscf_orig", None) is not None:
+            return
+
+        def dispatch(*args, **kwargs):
+            out = mojo_fn(*args, **kwargs)
+            return orig(*args, **kwargs) if out is NotImplemented else out
+
+        dispatch.__doc__ = orig.__doc__
+        dispatch._mojoscf_orig = orig
+        setattr(pcm_hess, name, dispatch)
+
+    def get_dD_dS(surface, dF, with_S=True, with_D=False):
+        if not _LAZY:
+            return NotImplemented
+        dSii_dF = -np.asarray(surface["charge_exp"]) * (2.0 / np.pi) ** 0.5 / np.asarray(surface["switch_fun"]) ** 2
+        dSii = dSii_dF[:, None, None] * dF
+        return (_SurfDeriv(surface, "D") if with_D else None), _SurfDeriv(surface, "S"), dSii
+
+    def get_d2D_d2S(surface, with_S=True, with_D=False, stream=None):
+        if not _LAZY:
+            return NotImplemented
+        return (_SurfDeriv(surface, "D") if with_D else None), _SurfDeriv(surface, "S")
+
+    def get_d2F_d2A(surface, surface_discretization_method="SWIG"):
+        if not _LAZY:
+            return NotImplemented
+        return (_SurfDeriv(surface, "d2F", method=surface_discretization_method),
+                _SurfDeriv(surface, "d2A", method=surface_discretization_method))
+
+    def get_d2Sii(surface, dF, d2F, stream=None):
+        if not isinstance(d2F, _SurfDeriv):
+            return NotImplemented
+        return _SurfDeriv(surface, "d2Sii", dF=dF, d2F=d2F)
+
+    def get_dS_dot_q(dS, dSii, q, atmlst, gridslice):
+        if not isinstance(dS, _SurfDeriv):
+            return NotImplemented
+        return _dX_dot_q(dS, "S", q, atmlst, gridslice, dSii)
+
+    def get_dD_dot_q(dD, q, atmlst, gridslice, ngrids):
+        if not isinstance(dD, _SurfDeriv):
+            return NotImplemented
+        return _dX_dot_q(dD, "D", q, atmlst, gridslice)
+
+    def get_dDT_dot_q(dD, q, atmlst, gridslice, ngrids):
+        if not isinstance(dD, _SurfDeriv):
+            return NotImplemented
+        return _dX_dot_q(dD, "DT", q, atmlst, gridslice)
+
+    def get_v_dot_d2S_dot_q(d2S, d2Sii, v_left, q_right, natom, gridslice):
+        if not isinstance(d2S, _SurfDeriv):
+            return NotImplemented
+        return _d2sii_dot(d2Sii, v_left * q_right) + _d2x_atoms(d2S.surface, "S", v_left, q_right)
+
+    def get_v_dot_d2D_dot_q(d2D, v_left, q_right, natom, gridslice):
+        if not isinstance(d2D, _SurfDeriv):
+            return NotImplemented
+        return _d2x_atoms(d2D.surface, "D", v_left, q_right)
+
+    def get_v_dot_d2DT_dot_q(d2D, v_left, q_right, natom, gridslice):
+        if not isinstance(d2D, _SurfDeriv):
+            return NotImplemented
+        return _d2x_atoms(d2D.surface, "DT", v_left, q_right)
+
+    def get_v_dot_d2A_dot_q(d2A, v_left, q_right):
+        if not isinstance(d2A, _SurfDeriv):
+            return NotImplemented
+        return _d2f_contract(d2A.surface, d2A.method, v_left * q_right * np.asarray(d2A.surface["area"]))
+
+    def inverse_k(K, Adj_term):
+        nA, nd, nj = Adj_term.shape
+        x = _k_inverse(K, Adj_term.reshape(nA * nd, nj).T, True)
+        return NotImplemented if x is None else x.T.reshape(nA, nd, nj)
+
+    def inverse_k_right(Adi_term, K):
+        nA, nd, nj = Adi_term.shape
+        x = _k_inverse(K, Adi_term.reshape(nA * nd, nj).T, False)
+        return NotImplemented if x is None else x.T.reshape(nA, nd, nj)
+
+    for fn in (get_dD_dS, get_d2D_d2S, get_d2F_d2A, get_d2Sii, get_dS_dot_q, get_dD_dot_q, get_dDT_dot_q,
+               get_v_dot_d2S_dot_q, get_v_dot_d2D_dot_q, get_v_dot_d2DT_dot_q, get_v_dot_d2A_dot_q):
+        helper(fn.__name__, fn)
+    helper("einsum_ij_Adj_Adi_inverseK", inverse_k)
+    helper("einsum_Adi_ij_Adj_inverseK", inverse_k_right)
 
 
 def attach(mf):

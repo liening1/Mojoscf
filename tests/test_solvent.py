@@ -254,3 +254,65 @@ def test_hessian_terms_match_pyscf(model):
     close(h1, np.einsum("pi,axpq,qj->axij", c, orig("analytical_grad_vmat")(s, dm), c[:, o > 0]))
     q = np.random.default_rng(2).normal(size=(5, s.surface["grid_coords"].shape[0]))
     close(s._get_vmat(q), pcm.PCM._get_vmat(s, q))
+
+
+def test_surface_derivative_kernels_match_pyscf():
+    """The per-atom contractions of the S and D derivatives (first and second, S, D and D^T) against
+    pyscf's dense (n, n, 3) and (3, 3, n, n) arrays."""
+    from pyscf.solvent.grad import pcm as pcm_grad
+    from pyscf.solvent.hessian import pcm as pcm_hess
+
+    solvent._install_hess_hooks()
+    mol = gto.M(atom=WATER + "; Cl 2.5 0.3 -0.4", basis="def2-svp", charge=-1, verbose=0)
+    s = dft.RKS(mol).PCM().with_solvent
+    s.build()
+    surf = s.surface
+    gslice = surf["gslice_by_atom"]
+    ng, natm = surf["grid_coords"].shape[0], mol.natm
+    rng = np.random.default_rng(0)
+    q, v = rng.normal(size=ng), rng.normal(size=ng)
+    dF, _ = pcm_grad.get_dF_dA(surf)
+    dD, dS, _ = pcm_grad.get_dD_dS(surf, dF, with_D=True, with_S=True)
+    for kind, dX in (("S", dS), ("D", dD), ("DT", -dD.transpose(1, 0, 2))):
+        ref = np.array([np.einsum("ijx,j->xi", dX[:, p0:p1], q[p0:p1]) for p0, p1 in gslice])
+        got = solvent._dx_atoms(surf, kind, q)
+        assert abs(got - ref).max() < 1e-12 * abs(ref).max(), kind
+    d2D, d2S = pcm_hess.get_d2D_d2S._mojoscf_orig(surf, with_S=True, with_D=True)
+    zero = np.zeros((natm, natm, 3, 3, ng))
+    for kind, ref in (("S", pcm_hess.get_v_dot_d2S_dot_q._mojoscf_orig(d2S, zero, v, q, natm, gslice)),
+                      ("D", pcm_hess.get_v_dot_d2D_dot_q._mojoscf_orig(d2D, v, q, natm, gslice)),
+                      ("DT", pcm_hess.get_v_dot_d2DT_dot_q._mojoscf_orig(d2D, v, q, natm, gslice))):
+        got = solvent._d2x_atoms(surf, kind, v, q)
+        # pyscf's closed forms of the D derivatives lose ~1e-11 to cancellation; the kernel uses Boys functions
+        assert abs(got - ref).max() < 1e-10 * abs(ref).max(), kind
+    for method in ("SWIG", "ISWIG"):
+        s.surface_discretization_method = method
+        s.build()
+        surf = s.surface
+        ng = surf["grid_coords"].shape[0]
+        w = rng.normal(size=ng)
+        d2F, d2A = pcm_hess.get_d2F_d2A._mojoscf_orig(surf, method)
+        assert abs(solvent._d2f_contract(surf, method, w * surf["area"]) - d2A @ w).max() < 1e-12 * abs(d2A @ w).max()
+        assert abs(solvent._d2f_contract(surf, method, w * surf["switch_fun"]) - d2F @ w).max() < 1e-12 * abs(d2F @ w).max()
+
+
+@pytest.mark.parametrize("model, disc", [("C-PCM", "SWIG"), ("IEF-PCM", "SWIG"), ("SS(V)PE", "SWIG"),
+                                         ("SMD", "SWIG"), ("IEF-PCM", "ISWIG")])
+def test_hessian_solver_term_matches_pyscf(model, disc):
+    """pyscf's analytical_hess_solver and get_dqsym_dx with the surface derivatives contracted on the fly
+    (no (n, n) derivative arrays, the cached LU of K) against pyscf's dense evaluation."""
+    from pyscf.solvent.hessian import pcm as pcm_hess
+
+    mol = gto.M(atom=WATER + "; Cl 2.5 0.3 -0.4", basis="def2-svp", charge=-1, verbose=0)
+    mf = _make(mol, model)
+    mf.with_solvent.surface_discretization_method = disc
+    mf = mojoscf.dft.accelerate(mf).run(conv_tol=1e-9)
+    s = mf.with_solvent
+    dm = mf.make_rdm1()
+    natm = mol.natm
+
+    def close(a, b, tol=1e-11):
+        assert abs(a - b).max() <= tol * abs(b).max(), abs(a - b).max() / abs(b).max()
+
+    close(pcm_hess.get_dqsym_dx(s, dm, range(natm)), pcm_hess.get_dqsym_dx._mojoscf_orig(s, dm, range(natm)))
+    close(pcm_hess.analytical_hess_solver(s, dm), pcm_hess.analytical_hess_solver._mojoscf_orig(s, dm))
