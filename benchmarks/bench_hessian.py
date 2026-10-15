@@ -1,7 +1,8 @@
 """Analytical Hessians: pyscf versus mojoscf (dft.accelerate + mojoscf.hessian), each in its own process.
 
 For each system the script converges the Kohn-Sham SCF (density fitting or
-exact integrals as the case says; conv_tol 1e-10, pyscf's default grids;
+exact integrals as the case says, in a PCM/SMD solvent (water) for the
+solvent cases; conv_tol 1e-10, pyscf's default grids;
 accelerated with ``mojoscf.dft.accelerate`` for mojoscf, whose
 ``mf.Hessian()`` then carries the Mojo kernels) and computes the nuclear
 Hessian with pyscf's driver (auxiliary-basis response included, pyscf's
@@ -26,7 +27,7 @@ CUCL4 = 'square_planar_atoms("Cu", ["Cl"] * 4, [2.25] * 4)'
 ETHYLENE = ('[("C", (0, 0, 0.6695)), ("C", (0, 0, -0.6695)), ("H", (0, 0.9289, 1.2321)), ("H", (0, -0.9289, 1.2321)), '
             '("H", (0, 0.9289, -1.2321)), ("H", (0, -0.9289, -1.2321))]')
 
-# key: (label, atoms, basis, charge, spin, xc, density fitting)
+# key: (label, atoms, basis, charge, spin, xc, density fitting[, solvent model])
 CASES = {
     "bz-b3lyp": ("benzene / def2-SVP B3LYP", "BENZENE_ATOMS", "def2-svp", 0, 0, "b3lyp", True),
     "fc-pbe0": ("ferrocene / def2-SVP PBE0", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", True),
@@ -42,6 +43,10 @@ CASES = {
     "bz-camb3lyp-x": ("benzene / def2-SVP CAM-B3LYP", "BENZENE_ATOMS", "def2-svp", 0, 0, "camb3lyp", False),
     "cucl4-b3lyp-x": ("[CuCl4]2- doublet / def2-SVP B3LYP (UKS)", CUCL4, "def2-svp", -2, 1, "b3lyp", False),
     "fc-pbe0-x": ("ferrocene / def2-SVP PBE0", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", False),
+    # implicit solvation (water); the eighth entry is the solvent model
+    "nico4-cpcm": ("Ni(CO)4 / def2-SVP B3LYP, C-PCM", 'tetrahedral_atoms("Ni", "CO", 1.82)', "def2-svp", 0, 0,
+                   "b3lyp", True, "C-PCM"),
+    "cucl4-smd": ("[CuCl4]2- doublet / def2-SVP B3LYP, SMD (UKS)", CUCL4, "def2-svp", -2, 1, "b3lyp", True, "SMD"),
 }
 
 WORKER = r'''
@@ -64,6 +69,12 @@ else:   # the reference must be plain pyscf: mojoscf patches some pyscf function
 mf = (dft.UKS if %(spin)d else dft.RKS)(mol, xc=%(xc)r)
 if %(df)r:
     mf = mf.density_fit()
+if %(solvent)r == "SMD":
+    mf = mf.SMD()
+    mf.with_solvent.solvent = "water"
+elif %(solvent)r:
+    mf = mf.PCM()
+    mf.with_solvent.method = %(solvent)r
 mf.verbose = 0; mf.conv_tol = 1e-10; mf.max_cycle = 100
 if driver == "mojoscf":
     mojoscf.dft.accelerate(mf)
@@ -78,9 +89,10 @@ print(json.dumps(dict(tscf=tscf, thess=thess, hess=np.asarray(hess).ravel().toli
 
 
 def run(case, driver, bench_dir):
-    _, atoms, basis, charge, spin, xc, df = CASES[case]
+    _, atoms, basis, charge, spin, xc, df = CASES[case][:7]
+    solvent = CASES[case][7] if len(CASES[case]) > 7 else ""
     code = WORKER % dict(bench_dir=bench_dir, atoms=atoms, basis=basis, charge=charge, spin=spin, xc=xc,
-                         driver=driver, df=df)
+                         driver=driver, df=df, solvent=solvent)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     return json.loads(out.stdout.strip().splitlines()[-1])
 

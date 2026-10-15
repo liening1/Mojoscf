@@ -736,6 +736,10 @@ terms dominate these runs (ferrocene: 98 s of the SCF in `int3c2e`, 18 s in
 the potential at the points and the charge matrix cost 0.14 s and 0.25 s
 per cycle for ferrocene's 2404 points.
 
+Analytical Hessians of solvated molecules (`mf.Hessian()` of an accelerated
+object) take the native Hessian paths with the solvent terms from these and
+further kernels: see the solvent item of the Analytical Hessians section.
+
 ### Excited states (TDDFT, TDA)
 
 pyscf's linear-response solvers (`pyscf.tdscf`) need, in every Davidson
@@ -968,6 +972,34 @@ keeps pyscf's driver, nuclear term and CPHF solver and replaces the rest:
   Mojo sums.  Same-SCF Hessians agree with pyscf to 2e-12 (exact integrals),
   1e-11 with density fitting, and 1e-8 for ωB97M-V with density fitting (the
   long-range metric, 7e-9 without the VV10 term).
+* **Solvent models** (PCM family, SMD; `pyscf.solvent.hessian.pcm`, RKS and
+  UKS).  pyscf's solvent Hessian adds the solvent's response to the
+  first-order densities in every CPHF iteration (their potential at the
+  surface points, the PCM equations, the potential matrices of the induced
+  charges, one `int3c2e` pass per set of charges), the solvent term of the
+  first-order Fock matrices (`analytical_grad_vmat`: an `int3c2e` pass per
+  atom and direction for the relaxed charges) and the solvent's second
+  derivatives: integral terms (`analytical_hess_qv`: `int3c2e_ipip1`,
+  `ipvip1`, `ip1ip2`, `ipip2` and a `grad_qv` per atom and direction) and
+  surface terms (`analytical_hess_solver`, `get_dqsym_dx`: the first and
+  second geometry derivatives of the surface matrices S and D as dense
+  (n, n, 3) and (3, 3, n, n) arrays, of the switching function as
+  (natm, natm, 3, 3, n) arrays, and a fresh solve with K in each
+  contraction).  With the solvent kernels of `mojoscf.solvent` the Hessian
+  keeps the native J/K, XC and CPHF paths and adds the solvent response to
+  the total first-order density in the MO basis (pyscf's
+  `vind_with_solvent`); the potential matrices of all charge sets come from
+  one pass of the charge-lane kernel, the potential derivatives at the
+  surface for every atom from one table (for `get_dvgrids` and all the
+  `grad_qv` calls), and the second derivatives over basis-function and
+  charge centres from one pass with the 21-component pair table contracted
+  with the density (`_mojo/qmmm.mojo`).  The surface terms keep pyscf's
+  assembly with stand-ins for its dense arrays whose contractions are
+  evaluated on the fly (`_mojo/pcm.mojo`; the switching function per block
+  of points over the atoms it depends on) and the cached LU of K, so their
+  memory grows as n natm instead of n^2 (n surface points: 9 n^2 words for
+  each of d2S and d2D in pyscf).  Same-SCF Hessians agree with pyscf to
+  1e-8 (C-PCM, IEF-PCM, SMD), the individual terms to 1e-11.
 
 `benchmarks/bench_hessian.py`: pyscf versus `mojoscf.dft.accelerate`, each in
 its own process, density fitting (auxiliary-basis response included, pyscf's
@@ -1017,9 +1049,9 @@ kernels, is bound by the throughput of its per-block GEMMs (stacking the
 response vectors of a block into larger GEMMs made it 18% slower: the
 per-vector GEMMs, rows x 128 points x rows, are already of medium size).
 
-PCM/SMD solvent models, `auxbasis_response < 2`, objects with a
-`get_jk` of their own and short-range operators with omega < 0 run pyscf's
-code for the Coulomb/exchange part (pyscf's solvent terms included).
+`auxbasis_response < 2`, objects with a `get_jk` of their own and
+short-range operators with omega < 0 run pyscf's code for the
+Coulomb/exchange part.
 
 ### QM/MM
 
@@ -1540,6 +1572,7 @@ but slow for more than a few dozen orbitals.
 | SA-CASSCF nuclear gradient (`mc.nuc_grad_method().kernel(state=i)` after `mc.state_average_`): the Lagrange terms (`df.grad.sacasscf.Lorb_dot_dgorb_dx`, `Lci_dot_dgci_dx`) | per term a DF gradient J/K of four (orbital term) or two (CI term) densities and one or two further passes for the active 2-RDM terms (`solve_df_rdm2`, `grad_elec_dferi`), each with its auxiliary response | both terms in one pass of the Mojo DF gradient kernels (`integrals.grad2e_df_terms`): Coulomb, exchange and 2-RDM terms with one rotated orbital in the basis [C_core, C_act, C_core L, C_act L] (orbital term) and with the symmetrised transition densities in the same basis (CI term), one J/K build for their densities; pyscf's generalized Fock matrices and response solver |
 | MC-PDFT (`pyscf.mcpdft`): on-top energies, effective potentials, Hellmann-Feynman gradient | Python loops over grid blocks: AO values, spin, core and active densities (`make_rho`), the active orbitals on the grid and the on-top pair density by NumPy products and `tensordot` with the cumulant, libxc per block, the grid rebuilt for every state; for the gradient per atom grid AO second derivatives and NumPy contractions, the Becke weight derivatives as (natm, natm, 3) arrays per point, a DF gradient J/K (K unused) for the Coulomb term | Mojo (`_mojo/pdft.mojo`, `_mojo/grids.mojo`): spin densities and on-top pair densities of all states in one pass, the functional once per state on the whole grid (pyscf's `eval_ot`), the grid reused; the potentials with the XC potential-matrix kernel and one pass for the paaa block; the gradient's orbital terms with the XC gradient kernel (kernel v_rho + v_Pi rho/2) and one pass for the cumulant term, grid-point terms from the same per-atom sums, Becke weight derivatives contracted with the energy density point by point, the Coulomb term from the Mojo DF derivative integrals |
 | PCM/SMD solvation (`pyscf.solvent`): potential at the surface points, surface-charge matrix, S/D matrices, gradient | C (libcint `int3c2e`, `int3c2e_ip1/ip2` with the surface fakemol) + NumPy (einsum, (3, n, n) derivative arrays, two dense solves per cycle) | Mojo (`_mojo/qmmm.mojo`, `_mojo/pcm.mojo`): density-contracted potential pass, charge-lane potential matrix, S/D and their contracted derivatives (Boys-function erf); LU factorisation of K kept per build |
+| PCM/SMD Hessian (`pyscf.solvent.hessian.pcm`): solvent response in the CPHF, solvent Fock derivatives, `analytical_hess_qv`, `analytical_hess_solver` | C (libcint `int3c2e` per set of charges and per atom and direction, `int3c2e_ip1/ip2/ipip1/ipvip1/ip1ip2/ipip2`) + NumPy (dense (n, n, 3), (3, 3, n, n) and (natm, natm, 3, 3, n) surface derivative arrays, a dense solve with K per contraction), AO first-order densities | Mojo (`_mojo/qmmm.mojo`: potential matrices of many charge sets in one pass, per-atom potential derivatives at the surface, the second-derivative pass; `_mojo/pcm.mojo`: S/D first and second derivatives contracted on the fly) with pyscf's assembly, the cached LU of K, the solvent response in the MO-basis CPHF |
 | QM/MM charges (`pyscf.qmmm`): potential, its derivative, forces on the MM charges | C (libcint `int1e_grids`, `int1e_grids_ip`, `int3c2e_ip2`, one integral matrix per block of 200 charges) + NumPy | Mojo (`_mojo/qmmm.mojo`): one pass over the shell pairs with the charges as SIMD lanes, contracted on the fly (the gradient pass with density-contracted Hermite matrices gives the QM-atom term and all charge forces at once); nucleus-charge terms NumPy as in pyscf |
 
 Source layout:
@@ -1556,13 +1589,13 @@ mojoscf/
   _mojo/integrals.mojo Gaussian integral engine (Boys function, Hermite recursions, S/T/V, ERIs, 3c2e/2c2e)
   _mojo/directjk.mojo  integral-direct J/K (screening, 8-fold digestion) for direct SCF; derivative J/K matrices (gradients, Hessian first-order Fock)
   _mojo/gradients.mojo two-electron gradient and exact Hessian terms, exact and density-fitted
-  _mojo/qmmm.mojo      potential of MM point/Gaussian charges, its derivative, forces on the charges
+  _mojo/qmmm.mojo      potential of MM point/Gaussian charges, its derivatives, forces on the charges; PCM Hessian integral terms
   _mojo/numint.mojo    XC integration on pyscf's grids: AO values and derivatives, densities, XC matrices, XC gradient, response kernels
   _mojo/nlc.mojo       VV10 non-local correlation: the pair sums over the NLC grid (energy, potential, Hessian terms)
   _mojo/grids.mojo     Becke partition of pyscf's grids and its nuclear derivatives (weight response)
   _mojo/pdft.mojo      MC-PDFT: on-top pair density and its potential and gradient terms
   _mojo/fcirdm.mojo    FCI 1-, 2- and 3-particle density matrices; NEVPT2's 4-particle contractions
-  _mojo/pcm.mojo       PCM surface matrices S, D and their contracted geometry derivatives
+  _mojo/pcm.mojo       PCM surface matrices S, D and their contracted first and second geometry derivatives
   _mojo/__init__.mojo  Python bindings (module mojoscf._mojoscf)
   _backend.py          build/load the extension, discover BLAS/LAPACK
   kernels.py           NumPy-facing wrappers
@@ -1575,7 +1608,7 @@ mojoscf/
   casscf.py            DF-CASSCF integrals, orbital Hessian, gradients and DF-NEVPT2 integrals (pyscf.mcscf, pyscf.mrpt)
   mcpdft.py            MC-PDFT (pyscf.mcpdft) on the Mojo XC kernels
   fcirdm.py            FCI 3-particle density matrices and NEVPT2's 4-particle contractions
-  solvent.py           PCM/SMD (pyscf.solvent) with the Mojo kernels: attach()
+  solvent.py           PCM/SMD (pyscf.solvent) with the Mojo kernels: attach(); SCF, gradient and Hessian terms
   tdscf.py             TDA/TDDFT/TDHF (pyscf.tdscf) with the response in the occupied-virtual space
   tdgrad.py            excited-state gradients (pyscf.grad.tdrhf/tdrks/tduks) with the Mojo kernels
   stability.py         SCF stability analysis (pyscf.scf.stability) with the occupied-virtual response
@@ -1712,9 +1745,10 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   in memory or memory-mapped, `auxbasis_response = 2`) and exact integrals (in-core or
   integral-direct), global and range-separated hybrids, and VV10 (RKS; the
   NLC energy and Fock derivatives are pyscf's functions on the Mojo pair
-  sums of `mojoscf.nlchess`, the CPHF response native); solvent models,
-  objects with their own `get_jk` and short-range operators with omega < 0
-  run pyscf's code for the parts they touch.
+  sums of `mojoscf.nlchess`, the CPHF response native) and PCM/SMD solvent
+  models (the solvent terms from the solvent kernels below); objects with
+  their own `get_jk` and short-range operators with omega < 0 run pyscf's
+  code for the parts they touch.
 * QM/MM (`pyscf.qmmm.mm_charge`, point or Gaussian MM charges) runs on the
   native loop with the MM-charge terms of the Hamiltonian and of the
   gradients (QM atoms and MM charges) from the engine, for QM shells up to
@@ -1727,8 +1761,10 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   and SMD get the Mojo kernels with `mojoscf.solvent.attach` (done by
   `mojoscf.dft.accelerate`); the native Hartree-Fock loop does not take
   solvent objects (they override `get_fock`), so HF in solvent runs pyscf's
-  loop with the Mojo solvent terms.  ddCOSMO/ddPCM and the solvent
-  Hessians keep pyscf's code.
+  loop with the Mojo solvent terms.  Analytical Hessians include the
+  solvent terms (the second-derivative integral pass needs shells up to f;
+  with g shells `analytical_hess_qv` is pyscf's).  ddCOSMO/ddPCM keep
+  pyscf's code.
 * The first call in a process starts the Mojo runtime and loads BLAS
   (about 50 ms); time a second run when benchmarking tiny systems.
 * BLAS/LAPACK: the LP64 interface and the ILP64 one with `_64_`-suffixed
