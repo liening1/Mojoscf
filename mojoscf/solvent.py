@@ -24,7 +24,21 @@ K q = R v twice.  With :func:`attach` the solvent object uses
   (``_mojo/pcm.mojo``), instead of pyscf's (3, n, n) derivative arrays and
   einsums; erf comes from the engine's Boys function.
 
-The surface itself, the switching-function derivatives, the nuclear and the
+* Hessians (``pyscf.solvent.hessian.pcm``, also SMD's): the integral terms
+  run on Mojo kernels for solvent objects with the mixin.  ``_get_vmat`` of
+  many charge sets (the CPHF response, the relaxed-charge Fock derivatives)
+  is one pass (:func:`mojoscf.integrals.int1e_grids_sum_sets`);
+  ``analytical_grad_vmat`` uses that pass with per-atom charge sets for its
+  ``int3c2e_ip2`` term (translational invariance) instead of one ``int3c2e``
+  pass per atom and direction; ``get_dvgrids`` and the ``grad_qv`` calls of
+  ``analytical_hess_qv`` come from one table of potential derivatives per
+  atom (:func:`esp_grad_table`); the second-derivative integrals of
+  ``analytical_hess_qv`` (``ipip1``, ``ipvip1``, ``ip1ip2``, ``ipip2``) are
+  one pass of :func:`mojoscf.integrals.mm_hess_terms`; ``get_dqsym_dx``
+  (three calls per Hessian) is kept per density.
+
+The surface itself, the switching-function derivatives, the surface-matrix
+second derivatives of the Hessian's solver term, the nuclear and the
 cavity-dispersion (SMD) terms stay pyscf's.  Results agree with pyscf's to
 the precision of the integrals.
 
@@ -41,7 +55,8 @@ from pyscf import lib
 from . import integrals
 from ._backend import get_extension
 
-__all__ = ["attach", "supported", "get_D_S", "grad_qv", "grad_solver"]
+__all__ = ["attach", "supported", "get_D_S", "grad_qv", "grad_solver", "esp_grad_table", "get_dvgrids",
+           "analytical_grad_vmat", "grad_vmat_mo", "analytical_hess_qv"]
 
 
 def supported(pcmobj) -> bool:
@@ -178,12 +193,14 @@ class _MojoPCMMixin:
         return integrals.int1e_grids_dm(self.mol, dms, coords, zetas).reshape(dms.shape[0], -1)
 
     def _get_vmat(self, q):
-        """-sum_k q_k (ij|k) for each set of surface charges ``q``."""
+        """-sum_k q_k (ij|k) for each set of surface charges ``q`` (all sets from one pass)."""
         if not supported(self):
             return super()._get_vmat(q)
         coords, zetas = _surface(self)
         q = np.asarray(q, dtype=np.float64).reshape(-1, coords.shape[0])
-        return np.array([-integrals.int1e_grids_sum(self.mol, coords, qi, zetas) for qi in q])
+        if q.shape[0] == 1:
+            return -integrals.int1e_grids_sum(self.mol, coords, q[0], zetas)[None]
+        return -integrals.int1e_grids_sum_sets(self.mol, coords, q, zetas)
 
     def _k_solve(self, b, trans=False):
         """K^-1 b (``trans``: K^-T b) with the LU factorisation of K, computed once per build."""
@@ -282,6 +299,208 @@ def _install_grad_hooks():
     wrap(smd_grad, "grad_solver", smd_solver)
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Hessians (pyscf.solvent.hessian.pcm, also used by SMD)
+
+
+def _with_dm(pcmobj, dm):
+    """pyscf's preamble of its solvent derivative functions: the intermediates (q, v_grids) of ``dm``."""
+    if not pcmobj._intermediates:
+        pcmobj.build()
+    dm_cache = pcmobj._intermediates.get("dm", None)
+    if dm_cache is None or np.linalg.norm(dm_cache - dm) >= 1e-10:
+        pcmobj._get_vind(dm)
+
+
+def _cached(pcmobj, key, dm, compute):
+    """``compute()`` once per density: kept with the intermediates (``build`` drops it)."""
+    inter = pcmobj._intermediates
+    hit = inter.get(key)
+    if hit is not None and hit[0].shape == np.shape(dm) and np.array_equal(hit[0], dm):
+        return hit[1]
+    value = compute()
+    inter[key] = (np.array(dm, dtype=np.float64, copy=True), value)
+    return value
+
+
+def esp_grad_table(pcmobj, dm):
+    """``g[A, x, k] = 2 sum_{i on A, j} D_ij (nabla_x i j|k)`` at the surface charges (natm, 3, ngrids)
+    (:func:`mojoscf.integrals.int1e_grids_ip_dm_atoms`), once per density.
+
+    It carries every first derivative of the density's potential at the
+    surface: through the basis functions of atom A ``-g[A]``, through the
+    position of charge k ``g.sum(axis=0)[:, k]``.
+    """
+    coords, zetas = _surface(pcmobj)
+    dm = np.asarray(dm, dtype=np.float64)
+
+    def compute():
+        return integrals.int1e_grids_ip_dm_atoms(pcmobj.mol, 0.5 * (dm + dm.T), coords, zetas)
+
+    return _cached(pcmobj, "mojoscf_esp_grad", dm, compute)
+
+
+def get_dvgrids(pcmobj, dm, atmlst):
+    """pyscf's ``get_dvgrids`` (natm, 3, ngrids): the derivatives of the surface potential, its electronic
+    part (pyscf's ``int3c2e_ip1``/``int3c2e_ip2`` passes) from :func:`esp_grad_table`."""
+    from pyscf import gto
+
+    mol = pcmobj.mol
+    atmlst = list(atmlst)
+    gridslice = pcmobj.surface["gslice_by_atom"]
+    charge_exp = pcmobj.surface["charge_exp"]
+    grid_coords = pcmobj.surface["grid_coords"]
+    atom_coords = mol.atom_coords(unit="B")[atmlst]
+    atom_charges = np.asarray(mol.atom_charges(), dtype=np.float64)[atmlst]
+    fakemol_nuc = gto.fakemol_for_charges(atom_coords)
+    fakemol = gto.fakemol_for_charges(grid_coords, expnt=charge_exp ** 2)
+    int2c2e_ip1 = mol._add_suffix("int2c2e_ip1")
+    v_ng_ip1 = np.array(gto.mole.intor_cross(int2c2e_ip1, fakemol_nuc, fakemol))
+    dv = np.einsum("dAq,A->Adq", v_ng_ip1, atom_charges)
+    v_ng_ip2 = np.array(gto.mole.intor_cross(int2c2e_ip1, fakemol, fakemol_nuc))
+    for i_atom in atmlst:
+        g0, g1 = gridslice[i_atom]
+        dv[i_atom, :, g0:g1] += np.einsum("dqA,A->dq", v_ng_ip2[:, g0:g1, :], atom_charges)
+    g = esp_grad_table(pcmobj, dm)
+    dv[atmlst] -= g[atmlst]
+    d_charge = g.sum(axis=0)                 # -sum_ij D_ij (ij|nabla k)
+    for i_atom in atmlst:
+        g0, g1 = gridslice[i_atom]
+        dv[i_atom, :, g0:g1] += d_charge[:, g0:g1]
+    return dv
+
+
+def _grad_vmat_blocks(pcmobj, dm, atmlst, max_memory):
+    """pyscf's ``analytical_grad_vmat`` for blocks of the atoms ``atmlst``: yields (positions, (n, 3, nao, nao)).
+
+    d/dA of -sum_k q_k (ij|k) (pyscf's sign) at fixed and at relaxed charges:
+    sum_k q_k (nabla i j|k) on the rows and columns of A's functions (``int3c2e_ip1``),
+    sum_{k on A} q_k (ij|nabla k) = -(M_A + M_A^T) with M_A = sum_{k on A} q_k (nabla i j|k)
+    (``int3c2e_ip2``; translational invariance), and sum_k (ij|k) dq_k/dA (pyscf's
+    ``int3c2e`` pass per atom and direction): one multi-set pass each per block.
+    """
+    from pyscf.solvent.hessian import pcm as pcm_hess
+
+    _with_dm(pcmobj, dm)
+    mol = pcmobj.mol
+    nao = mol.nao_nr()
+    coords, zetas = _surface(pcmobj)
+    ng = coords.shape[0]
+    q_sym = pcmobj._intermediates["q_sym"]
+    gridslice = pcmobj.surface["gslice_by_atom"]
+    aoslice = mol.aoslice_by_atom()
+    m = integrals.int1e_grids_ip_sum(mol, coords, q_sym, zetas)
+    dqdx = np.asarray(pcm_hess.get_dqsym_dx(pcmobj, dm, atmlst))
+    blk = max(1, min(len(atmlst), int(max_memory * 1e6 / 8 / (12 * nao * nao))))
+    for b0 in range(0, len(atmlst), blk):
+        pos = list(range(b0, min(b0 + blk, len(atmlst))))
+        atoms = [atmlst[i] for i in pos]
+        masks = np.zeros((len(atoms), ng))
+        for i, ia in enumerate(atoms):
+            g0, g1 = gridslice[ia]
+            masks[i, g0:g1] = q_sym[g0:g1]
+        dv = integrals.int1e_grids_sum_sets(mol, coords, masks, zetas, deriv=True)
+        dv += dv.transpose(0, 1, 3, 2)
+        dv *= -1.0
+        dv += integrals.int1e_grids_sum_sets(mol, coords, dqdx[pos].reshape(-1, ng), zetas).reshape(dv.shape)
+        for i, ia in enumerate(atoms):
+            p0, p1 = aoslice[ia, 2:]
+            dv[i, :, p0:p1] += m[:, p0:p1]
+            dv[i, :, :, p0:p1] += m[:, p0:p1].transpose(0, 2, 1)
+        yield pos, dv
+
+
+def analytical_grad_vmat(pcmobj, dm, atmlst=None, verbose=None):
+    """pyscf's ``analytical_grad_vmat`` (len(atmlst), 3, nao, nao) on the Mojo kernels (see ``_grad_vmat_blocks``)."""
+    mol = pcmobj.mol
+    atmlst = list(range(mol.natm)) if atmlst is None else list(atmlst)
+    nao = mol.nao_nr()
+    out = np.empty((len(atmlst), 3, nao, nao))
+    for pos, dv in _grad_vmat_blocks(pcmobj, dm, atmlst, max(pcmobj.max_memory - lib.current_memory()[0], 500)):
+        out[pos] = dv
+    return out
+
+
+def grad_vmat_mo(pcmobj, dm, mo_coeffs, mo_occs, atmlst=None, max_memory=2000):
+    """:func:`analytical_grad_vmat` projected on the orbitals: one (natm, 3, nmo, nocc) array per channel
+    (``C^T dV C_occ``), the AO matrices formed a block of atoms at a time."""
+    mol = pcmobj.mol
+    atmlst = list(range(mol.natm)) if atmlst is None else list(atmlst)
+    occ = [np.asarray(c)[:, np.asarray(o) > 0] for c, o in zip(mo_coeffs, mo_occs)]
+    out = [np.zeros((mol.natm, 3, np.shape(c)[1], co.shape[1])) for c, co in zip(mo_coeffs, occ)]
+    for pos, dv in _grad_vmat_blocks(pcmobj, dm, atmlst, max_memory):
+        for c, co, h in zip(mo_coeffs, occ, out):
+            c = np.asarray(c)
+            for i, dvi in zip(pos, dv):
+                h[atmlst[i]] = np.einsum("pi,xpq,qj->xij", c, dvi, co, optimize=True)
+    return out
+
+
+def analytical_hess_qv(pcmobj, dm, verbose=None):
+    """pyscf's ``analytical_hess_qv``: -d^2/dA dB of sum_k q_k sum_ij D_ij (ij|k) at fixed q (the
+    ``int3c2e_ipip1``, ``ipvip1``, ``ip1ip2`` and ``ipip2`` terms) from one pass of
+    :func:`mojoscf.integrals.mm_hess_terms`, plus the response of q (``grad_qv`` for each dq/dx) from
+    :func:`esp_grad_table`."""
+    from pyscf.solvent.hessian import pcm as pcm_hess
+
+    _with_dm(pcmobj, dm)
+    mol = pcmobj.mol
+    dm = np.asarray(dm, dtype=np.float64)
+    coords, zetas = _surface(pcmobj)
+    gridslice = pcmobj.surface["gslice_by_atom"]
+    q_sym = pcmobj._intermediates["q_sym"]
+    catom = np.empty(coords.shape[0], dtype=np.int64)
+    for ia, (g0, g1) in enumerate(gridslice):
+        catom[g0:g1] = ia
+    d2e = integrals.mm_hess_terms(mol, 0.5 * (dm + dm.T), coords, q_sym, catom, zetas)
+    dqdx = np.asarray(pcm_hess.get_dqsym_dx(pcmobj, dm, range(mol.natm)))     # (natm, 3, ngrids)
+    g = esp_grad_table(pcmobj, dm)
+    # grad_qv with the charges dq/dA_x: sum_k g[B, y, k] q_k + sum_{k on B} q_k sum_ij D_ij (ij|nabla_y k)
+    d2e += np.einsum("Byk,Axk->ABxy", g, dqdx, optimize=True)
+    d_charge = -g.sum(axis=0)
+    for ib, (g0, g1) in enumerate(gridslice):
+        d2e[:, ib] += np.einsum("Axk,yk->Axy", dqdx[:, :, g0:g1], d_charge[:, g0:g1])
+    return -d2e
+
+
+def _install_hess_hooks():
+    """Route pyscf's ``solvent.hessian.pcm`` functions (imported at call time by PCM.hess and SMD.hess, and
+    looked up by ``WithSolventHess.make_h1``) to the Mojo versions above for solvent objects with the Mojo
+    mixin; ``get_dqsym_dx`` (three calls per Hessian) is kept per density.  pyscf's code runs for all others."""
+    from pyscf.solvent.hessian import pcm as pcm_hess
+
+    def ours(pcmobj, dm, *args, **kwargs):
+        return isinstance(pcmobj, _MojoPCMMixin) and supported(pcmobj) and np.ndim(dm) == 2
+
+    def wrap(name, mojo_fn, accept=ours):
+        orig = getattr(pcm_hess, name)
+        if getattr(orig, "_mojoscf_orig", None) is not None:
+            return
+
+        def dispatch(pcmobj, dm, *args, **kwargs):
+            if accept(pcmobj, dm, *args, **kwargs):
+                return mojo_fn(orig, pcmobj, dm, *args, **kwargs)
+            return orig(pcmobj, dm, *args, **kwargs)
+
+        dispatch.__doc__ = orig.__doc__
+        dispatch._mojoscf_orig = orig
+        setattr(pcm_hess, name, dispatch)
+
+    def all_atoms(pcmobj, dm, atmlst, *args, **kwargs):
+        return ours(pcmobj, dm) and list(atmlst) == list(range(pcmobj.mol.natm))
+
+    def dqsym(orig, pcmobj, dm, atmlst):
+        return _cached(pcmobj, ("mojoscf_dqdx", tuple(atmlst)), dm, lambda: orig(pcmobj, dm, atmlst))
+
+    def hess_ok(pcmobj, dm, *args, **kwargs):
+        return ours(pcmobj, dm) and integrals.mm_hess_supported(pcmobj.mol)
+
+    wrap("get_dvgrids", lambda orig, *a, **k: get_dvgrids(*a, **k), all_atoms)
+    wrap("get_dqsym_dx", dqsym)
+    wrap("analytical_grad_vmat", lambda orig, *a, **k: analytical_grad_vmat(*a, **k))
+    wrap("analytical_hess_qv", lambda orig, *a, **k: analytical_hess_qv(*a, **k), hess_ok)
+
+
 def attach(mf):
     """Give the PCM/SMD solvent of ``mf`` (``mf.with_solvent``, or a solvent object itself) the Mojo
     kernels, in place; returns ``mf``.  Objects without such a solvent are returned unchanged."""
@@ -292,4 +511,5 @@ def attach(mf):
         lib.set_class(solvent, (_MojoPCMMixin, type(solvent)))
         solvent._intermediates = {}         # rebuild with the Mojo surface matrices
         _install_grad_hooks()
+        _install_hess_hooks()
     return mf

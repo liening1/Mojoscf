@@ -1070,13 +1070,17 @@ def _solvent_h1mo(hessobj, mo_coeff, mo_occ):
     solvent = _solvent(mf)
     if solvent is None or not isinstance(hessobj, WithSolventHess):
         return None
+    from . import solvent as msolvent
+
     dm = np.asarray(mf.make_rdm1(ao_repr=True))
     if dm.ndim == 3:
         dm = dm[0] + dm[1]
-    dv = np.asarray(analytical_grad_vmat(solvent, dm, atmlst=range(hessobj.mol.natm), verbose=hessobj.verbose))
     unrestricted = np.asarray(mo_coeff).ndim == 3
     cs = [np.asarray(c) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff)]
     occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
+    if isinstance(solvent, msolvent._MojoPCMMixin) and msolvent.supported(solvent):
+        return msolvent.grad_vmat_mo(solvent, dm, cs, occs, max_memory=max(hessobj.max_memory, 500))
+    dv = np.asarray(analytical_grad_vmat(solvent, dm, atmlst=range(hessobj.mol.natm), verbose=hessobj.verbose))
     return [np.einsum("pi,axpq,qj->axij", c, dv, c[:, o > 0], optimize=True) for c, o in zip(cs, occs)]
 
 

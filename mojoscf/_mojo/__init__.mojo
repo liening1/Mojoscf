@@ -35,7 +35,7 @@ from _mojo.driver import scf_kernel, f64ptr
 from _mojo.integrals import Basis, BoysTable, int1e_core, int1e_ip_core, int1e_iprinv_dm_core, eri_s8_core, int3c2e_core, int2c2e_core
 from _mojo.directjk import DirectJK, basis_from_py, jk_ip1_core, h1_2e_core
 from _mojo.gradients import grad2e_core, grad2e_pairs_core, hess2e_core, grad2c_core, df_grad_rhs, grad_df3c_core, int3c2e_ip1_core, hess_df3c_core
-from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core
+from _mojo.qmmm import mm_potential_core, mm_grad_core, mm_esp_core, mm_potential_sets_core, mm_esp_grad_core, mm_hess_core
 from _mojo.pcm import pcm_ds_core, pcm_pair_core
 from _mojo.numint import eval_ao_core, xc_rho_core, xc_vmat_core, xc_grad_core, xc_grad_dm_core, xc_fxc_core, xc_hess_core, xc_h1_core
 from _mojo.pdft import ontop_pi_core, ontop_grad_core, ontop_paaa_core, ontop_density_core
@@ -119,6 +119,9 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_pcm_pair]("pcm_pair", docstring="pcm_pair(table, coords, zeta, norm, kind, a, b, g): G_p = a_p sum_j dX_pj b_j - b_p sum_i a_i dX_ip for X = S (kind 0) or D (1), g (n, 3).")
         m.def_function[py_mm_esp]("mm_esp", docstring="mm_esp(basis, table, coords, zetas, point, dms, out): sum_ij D_s,ij (ij|k) for symmetric dms (nset, nao, nao) at point or unit Gaussian charges, out (nset, nch).")
         m.def_function[py_mm_grad]("mm_grad", docstring="mm_grad(basis, table, coords, weights, zetas, point, dm, mat, forces, atoms): sum_k w_k (nabla i j|k) (3, nao, nao), sum_ij D_ij w_k (ij|nabla k) (nch, 3), 2 sum_{i on A} D_ij sum_k w_k (nabla i j|k) (natm, 3); an empty output is skipped.")
+        m.def_function[py_mm_potential_sets]("mm_potential_sets", docstring="mm_potential_sets(basis, table, coords, zetas, point, weights, deriv, out): sum_k w_s,k (ij|k) (nset, nao, nao) for weights (nset, nch), or with deriv sum_k w_s,k (nabla_x i j|k) (nset, 3, nao, nao).")
+        m.def_function[py_mm_esp_grad]("mm_esp_grad", docstring="mm_esp_grad(basis, table, coords, zetas, point, dm, out): 2 sum_{i on A, j} D_ij (nabla_x i j|k) (natm, 3, nch) for a symmetric dm.")
+        m.def_function[py_mm_hess]("mm_hess", docstring="mm_hess(basis, table, coords, weights, zetas, point, catom, dm, out): second derivatives (natm, natm, 3, 3) of sum_k w_k sum_ij D_ij (ij|k), charge k moving with atom catom[k] (int64).")
         m.def_function[py_int1e_iprinv_dm]("int1e_iprinv_dm", docstring="int1e_iprinv_dm(basis, table, centers, dm, out): sum_ij D_ij <nabla i|1/|r-R_c||j> per centre (ncenter, 3).")
         m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol, omega): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk (omega > 0: erf(omega r) / r).")
         m.def_function[py_h1_2e]("h1_2e", docstring="h1_2e(basis, table, dmj, dmk, tol, out, omega): d/dR_Ax J[Dj_s] and K[Dk_s] for every atom and direction, (natm, 3, nj + nk, nao, nao).")
@@ -884,6 +887,50 @@ def py_mm_grad(
         bs, boys, Int(py=weights.shape[0]), f64ptr(coords), f64ptr(weights), f64ptr(zetas), Bool(py=point),
         f64ptr(dm), Int(py=mat.size) > 0, f64ptr(mat), Int(py=forces.size) > 0, f64ptr(forces),
         Int(py=atoms.size) > 0, f64ptr(atoms),
+    )
+    _ = bs^
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_mm_potential_sets(
+    basis: PythonObject, table: PythonObject, coords: PythonObject, zetas: PythonObject, point: PythonObject,
+    weights: PythonObject, deriv: PythonObject, dst: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var boys = _boys(table)
+    mm_potential_sets_core(
+        bs, boys, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(zetas), Bool(py=point), Int(py=weights.shape[0]),
+        f64ptr(weights), Bool(py=deriv), f64ptr(dst),
+    )
+    _ = bs^
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_mm_esp_grad(
+    basis: PythonObject, table: PythonObject, coords: PythonObject, zetas: PythonObject, point: PythonObject,
+    dm: PythonObject, dst: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var boys = _boys(table)
+    mm_esp_grad_core(
+        bs, boys, Int(py=coords.shape[0]), f64ptr(coords), f64ptr(zetas), Bool(py=point), f64ptr(dm), f64ptr(dst)
+    )
+    _ = bs^
+    _ = boys^
+    return PythonObject(None)
+
+
+def py_mm_hess(
+    basis: PythonObject, table: PythonObject, coords: PythonObject, weights: PythonObject, zetas: PythonObject,
+    point: PythonObject, catom: PythonObject, dm: PythonObject, dst: PythonObject,
+) raises -> PythonObject:
+    var bs = _basis(basis)
+    var boys = _boys(table)
+    mm_hess_core(
+        bs, boys, Int(py=weights.shape[0]), f64ptr(coords), f64ptr(weights), f64ptr(zetas), Bool(py=point),
+        i64ptr(catom), f64ptr(dm), f64ptr(dst),
     )
     _ = bs^
     _ = boys^

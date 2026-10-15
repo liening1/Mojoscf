@@ -623,6 +623,70 @@ def mm_grad_terms(mol, dm, coords, weights, zetas=None):
     return atoms, forces
 
 
+def int1e_grids_sum_sets(mol, coords, weights, zetas=None, deriv=False):
+    """:func:`int1e_grids_sum` for every row of ``weights`` (nset, ncharge): (nset, nao, nao) from one pass.
+
+    With ``deriv`` the (nset, 3, nao, nao) matrices of :func:`int1e_grids_ip_sum`.  Sets that vanish on a
+    block of charges (charges of other atoms) cost nothing there.
+    """
+    coords = np.ascontiguousarray(coords, dtype=np.float64).reshape(-1, 3)
+    weights = np.ascontiguousarray(weights, dtype=np.float64).reshape(-1, coords.shape[0])
+    coords, _, zetas, point = _mm_args(mol, coords, np.ones(coords.shape[0]), zetas)
+    nao = mol.nao_nr()
+    out = np.empty((weights.shape[0], 3, nao, nao) if deriv else (weights.shape[0], nao, nao))
+    if weights.shape[0]:
+        get_extension().mm_potential_sets(basis_tables(mol), _boys_table(), coords, zetas, point, weights,
+                                          bool(deriv), out)
+    return out
+
+
+def int1e_grids_ip_dm_atoms(mol, dm, coords, zetas=None):
+    """``g[A, x, k] = 2 sum_{i on A, j} D_ij (nabla_x i j|k)`` (natm, 3, ncharge) for a symmetric ``dm``.
+
+    The derivative of the density's potential at charge k with respect to atom A
+    through A's basis functions is ``-g[A, :, k]``; with respect to the charge's own
+    position it is ``g.sum(axis=0)[:, k]`` (pyscf's ``int3c2e_ip1`` contracted with
+    ``dm + dm.T`` and summed over the functions of each atom, and ``int3c2e_ip2``).
+    """
+    coords, _, zetas, point = _mm_args(mol, coords, np.ones(len(np.reshape(coords, (-1, 3)))), zetas)
+    dm = np.ascontiguousarray(dm, dtype=np.float64)
+    nao = mol.nao_nr()
+    if dm.shape != (nao, nao):
+        raise ValueError(f"dm must be ({nao}, {nao})")
+    out = np.empty((mol.natm, 3, coords.shape[0]))
+    get_extension().mm_esp_grad(basis_tables(mol), _boys_table(), coords, zetas, point, dm, out)
+    return out
+
+
+def mm_hess_terms(mol, dm, coords, weights, charge_atoms, zetas=None):
+    """Second derivatives (natm, natm, 3, 3) of ``sum_k w_k sum_ij D_ij (ij|k)`` (symmetric ``dm``) with the
+    basis functions moving with their atoms and charge k with atom ``charge_atoms[k]``.
+
+    pyscf's PCM Hessian assembles this from ``int3c2e_ipip1``, ``int3c2e_ipvip1``,
+    ``int3c2e_ip1ip2`` and ``int3c2e_ipip2`` (``analytical_hess_qv``); here one pass
+    with the 21-component second-derivative pair table, which needs shell pairs up
+    to Hermite degree 9 (f-f pairs and lower: :func:`mm_hess_supported`).
+    """
+    if not mm_hess_supported(mol):
+        raise NotImplementedError("the charge Hessian kernel needs shells up to l = 3")
+    coords, weights, zetas, point = _mm_args(mol, coords, weights, zetas)
+    catom = np.ascontiguousarray(charge_atoms, dtype=np.int64).reshape(-1)
+    if catom.shape[0] != coords.shape[0] or (catom.size and (catom.min() < 0 or catom.max() >= mol.natm)):
+        raise ValueError("one atom index per charge expected")
+    dm = np.ascontiguousarray(dm, dtype=np.float64)
+    nao = mol.nao_nr()
+    if dm.shape != (nao, nao):
+        raise ValueError(f"dm must be ({nao}, {nao})")
+    out = np.empty((mol.natm, mol.natm, 3, 3))
+    get_extension().mm_hess(basis_tables(mol), _boys_table(), coords, weights, zetas, point, catom, dm, out)
+    return out
+
+
+def mm_hess_supported(mol) -> bool:
+    """True if :func:`mm_hess_terms` handles ``mol`` (:func:`mm_supported` and shells up to f)."""
+    return mm_supported(mol) and (mol.nbas == 0 or int(mol._bas[:, gto.ANG_OF].max()) <= MM_LMAX - 1)
+
+
 def get_jk_ip1(mol, dm, with_j=True, with_k=True, tol=1e-14, omega=0.0):
     """Gradient J/K exactly as ``pyscf.grad.rhf.get_jk``: ``(-sum (nabla i j|kl) D_lk, -sum (nabla i j|kl) D_jk)``.
 
