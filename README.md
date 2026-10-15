@@ -981,6 +981,15 @@ the TDDFT table:
 | ferrocene / def2-SVP PBE                    | 221 |  709.0 | 121.1 | 5.9x |  50.7 | 16.8 | 5.8e-07 | 0.00 |
 | ferrocene / def2-SVP CAM-B3LYP              | 221 | 1552.8 | 225.0 | 6.9x |  90.8 | 40.2 | 1.5e-06 | 0.04 |
 | [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  118.6 |  27.8 | 4.3x |  16.6 |  4.4 | 2.3e-08 | 0.00 |
+| ethylene / def2-SVP ωB97M-V                 |  48 | 1537.4 | 138.4 | 11.1x |  78.7 | 11.4 | 2.8e-09 | 0.00 |
+| [ZnCl4]2- / def2-SVP ωB97M-V                | 103 | 3293.3 | 409.2 | 8.0x | 190.2 | 26.2 | 1.0e-07 | 0.00 |
+
+In the ωB97M-V rows (VV10 on pyscf's default level-3 NLC grid, 67k points
+for ethylene) most of mojoscf's time is the kernel sums over trial densities
+(`f_t`, 8 n_trial flops per ordered pair of grid points, as GEMMs: in every
+CPHF iteration and for the displacement terms), then pyscf's NumPy code of
+the NLC Fock derivatives; pyscf spends most of its time in the scalar C
+pair loops.
 
 With exact integrals (pyscf's default), on the 2.1 GHz machine of the SCF
 tables:
