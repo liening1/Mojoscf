@@ -144,9 +144,11 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
     are J/K of the (symmetric) first-order densities of all vectors from one
     call of the Mojo kernels (:func:`mojoscf.dft.exact_jk`, long-range ones
     included), projected to C^T V C_o.  VV10 functionals (RKS) add the response
-    of :class:`mojoscf.nlchess.Response` (pyscf's ``get_vnlc_resp``).  None
-    (pyscf's operator runs) without an in-core DF tensor or exact integrals
-    with pyscf's ``get_jk``, for solvent models, UKS with NLC, short-range-only
+    of :class:`mojoscf.nlchess.Response` (pyscf's ``get_vnlc_resp``), solvent
+    models (PCM, SMD) with equilibrium solvation the solvent's response to the
+    total first-order density (``_B_dot_x``, as pyscf's ``vind_with_solvent``).
+    None (pyscf's operator runs) without an in-core DF tensor or exact
+    integrals with pyscf's ``get_jk``, for UKS with NLC, short-range-only
     hybrids, fractional occupations and MO tensors that do not fit in
     ``max_memory``.
     """
@@ -164,13 +166,7 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
     unrestricted = isinstance(mf, uhf.UHF)
     if isinstance(mf, rohf.ROHF) or not (unrestricted or isinstance(mf, hf.RHF)):
         return None
-    try:
-        from pyscf.solvent._attach_solvent import _Solvation
-
-        if isinstance(mf, _Solvation):
-            return None
-    except ImportError:  # pragma: no cover
-        pass
+    solvent = _solvent(mf)
     ks = isinstance(mf, hf.KohnShamDFT)
     if ks and mf.do_nlc() and unrestricted:
         return None                          # pyscf has no UKS NLC Hessian
@@ -312,6 +308,15 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
             ch = chans[0]
             d = ch.c @ xs[0] @ ch.co.T
             vs[0] += ch.c.T @ nlc(2.0 * (d + d.transpose(0, 2, 1))) @ ch.co
+        if solvent is not None and solvent.equilibrium_solvation:
+            # the solvent's response to the total first-order density (pyscf's vind_with_solvent)
+            dtot = 0.0
+            for ch, x in zip(chans, xs):
+                d = ch.c @ x @ ch.co.T
+                dtot = dtot + (d + d.transpose(0, 2, 1)) * (1.0 if unrestricted else 2.0)
+            v = np.asarray(solvent._B_dot_x(np.ascontiguousarray(dtot)))
+            for s, ch in enumerate(chans):
+                vs[s] += ch.c.T @ v @ ch.co
         out = np.empty_like(flat)
         off = 0
         for ch, v, n in zip(chans, vs, sizes):
@@ -384,13 +389,6 @@ def _df_jk_reason(hessobj, mo_coeff, mo_occ):
         return "auxbasis_response below 2"
     if isinstance(mf, rohf.ROHF) or not isinstance(mf, (hf.RHF, uhf.UHF)):
         return "only RHF/RKS and UHF/UKS references"
-    try:
-        from pyscf.solvent._attach_solvent import _Solvation
-
-        if isinstance(mf, _Solvation):
-            return "solvent models"
-    except ImportError:  # pragma: no cover
-        pass
     if isinstance(mf, hf.KohnShamDFT) and mf.do_nlc() and isinstance(mf, uhf.UHF):
         return "UKS with NLC (pyscf has no UKS NLC Hessian)"
     if _hess_exchange_terms(mf) is None:
@@ -412,7 +410,7 @@ def _df_jk_reason(hessobj, mo_coeff, mo_occ):
 
 def _exact_jk_reason(hessobj, mo_coeff, mo_occ):
     """Why :func:`exact_jk_partial` cannot handle ``hessobj`` (None if it can): exact integrals with pyscf's
-    ``get_jk``, closed or high-spin open shells, no solvent model, no UKS with NLC."""
+    ``get_jk``, closed or high-spin open shells, no UKS with NLC."""
     from pyscf.scf import hf, rohf, uhf
 
     from . import dft
@@ -424,13 +422,6 @@ def _exact_jk_reason(hessobj, mo_coeff, mo_occ):
         return "not exact integrals with pyscf's get_jk"
     if isinstance(mf, rohf.ROHF) or not isinstance(mf, (hf.RHF, uhf.UHF)):
         return "only RHF/RKS and UHF/UKS references"
-    try:
-        from pyscf.solvent._attach_solvent import _Solvation
-
-        if isinstance(mf, _Solvation):
-            return "solvent models"
-    except ImportError:  # pragma: no cover
-        pass
     if isinstance(mf, hf.KohnShamDFT) and mf.do_nlc() and isinstance(mf, uhf.UHF):
         return "UKS with NLC (pyscf has no UKS NLC Hessian)"
     if _hess_exchange_terms(mf) is None:
@@ -1058,6 +1049,37 @@ def _is_ks(mf):
     return isinstance(mf, hf.KohnShamDFT)
 
 
+def _solvent(mf):
+    """The solvent model of a solvent-attached SCF object (pyscf's ``_Solvation``), or None."""
+    try:
+        from pyscf.solvent._attach_solvent import _Solvation
+    except ImportError:  # pragma: no cover
+        return None
+    return mf.with_solvent if isinstance(mf, _Solvation) else None
+
+
+def _solvent_h1mo(hessobj, mo_coeff, mo_occ):
+    """The solvent term pyscf's solvent Hessian (``WithSolventHess.make_h1``, PCM and SMD) adds to the
+    first-order Fock matrices, ``analytical_grad_vmat`` of the total density, projected as :func:`xc_h1mo`
+    returns them; None for other Hessian objects."""
+    try:
+        from pyscf.solvent.hessian.pcm import WithSolventHess, analytical_grad_vmat
+    except ImportError:  # pragma: no cover
+        return None
+    mf = hessobj.base
+    solvent = _solvent(mf)
+    if solvent is None or not isinstance(hessobj, WithSolventHess):
+        return None
+    dm = np.asarray(mf.make_rdm1(ao_repr=True))
+    if dm.ndim == 3:
+        dm = dm[0] + dm[1]
+    dv = np.asarray(analytical_grad_vmat(solvent, dm, atmlst=range(hessobj.mol.natm), verbose=hessobj.verbose))
+    unrestricted = np.asarray(mo_coeff).ndim == 3
+    cs = [np.asarray(c) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff)]
+    occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
+    return [np.einsum("pi,axpq,qj->axij", c, dv, c[:, o > 0], optimize=True) for c, o in zip(cs, occs)]
+
+
 def _nlc_partial(hessobj, mo_coeff, mo_occ):
     """pyscf's VV10 term of the partial Hessian (``_get_enlc_deriv2``, RKS; its pair sums from
     :mod:`mojoscf.nlchess`), or 0 without NLC."""
@@ -1176,7 +1198,7 @@ class _MojoHessMixin:
         cs = [np.asarray(c) for c in mo_coeff] if unrestricted else [np.asarray(mo_coeff)]
         occs = [np.asarray(o) for o in mo_occ] if unrestricted else [np.asarray(mo_occ)]
         es = [np.asarray(e) for e in mo_energy] if unrestricted else [np.asarray(mo_energy)]
-        nlch1 = None
+        nlch1 = solh1 = None
         if jk is not None:
             de2 = (_hess_e1(self, mo_energy, mo_coeff, mo_occ) + jk[0] + self._xc_partial(mo_coeff, mo_occ)
                    + _nlc_partial(self, mo_coeff, mo_occ))
@@ -1184,6 +1206,7 @@ class _MojoHessMixin:
             if xch1 is None:
                 xch1 = _pyscf_xc_h1mo(self, mo_coeff, mo_occ)
             nlch1 = _nlc_h1mo(self, mo_coeff, mo_occ)
+            solh1 = _solvent_h1mo(self, mo_coeff, mo_occ)
             hcore_deriv = mf.nuc_grad_method().hcore_generator(mol)
             hmo = jk[1]
             for ia in atmlst:
@@ -1195,12 +1218,13 @@ class _MojoHessMixin:
             hmo = exact_h1mo(self, mo_coeff, mo_occ)
             if hmo is not None:
                 nlch1 = _nlc_h1mo(self, mo_coeff, mo_occ)
+                solh1 = _solvent_h1mo(self, mo_coeff, mo_occ)
                 hcore_deriv = mf.nuc_grad_method().hcore_generator(mol)
                 for ia in atmlst:
                     h1 = hcore_deriv(ia)
                     for c, o, hm in zip(cs, occs, hmo):
                         hm[ia] += c.T @ h1 @ c[:, o > 0]
-            else:                           # pyscf's make_h1 (its VV10 term included)
+            else:                           # pyscf's make_h1 (its VV10 and solvent terms included)
                 with _ZeroXC1(mol, unrestricted):
                     h1ao = self.make_h1(mo_coeff, mo_occ, None, atmlst, log)
                 h1s = list(h1ao) if unrestricted else [h1ao]
@@ -1225,7 +1249,10 @@ class _MojoHessMixin:
                 s1ao[:, :, p0:p1] += s1a[:, p0:p1].transpose(0, 2, 1)
                 sm[ia] = c.T @ s1ao @ co
             smo.append(sm)
-        for hm, xh in zip(hmo, xch1 if nlch1 is None else [x + y for x, y in zip(xch1, nlch1)]):
+        for extra in (nlch1, solh1):
+            if extra is not None:
+                xch1 = [x + y for x, y in zip(xch1, extra)]
+        for hm, xh in zip(hmo, xch1):
             hm[atmlst] += xh[atmlst]
         mo1s, e1s = self._solve_mo1_mo(mo_energy, mo_coeff, mo_occ, hmo, smo, atmlst, max_memory, log)
         t1 = log.timer_debug1("solving MO1", *t1)

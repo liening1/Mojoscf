@@ -102,3 +102,67 @@ def test_unattached_solvent_keeps_pyscf():
     g = mf.nuc_grad_method().kernel()
     assert np.isfinite(g).all()
     assert solvent.attach(scf.RHF(mol)) is not None             # no solvent: unchanged
+
+
+def _make_hess(mol, model, spin, df, accel, xc="pbe"):
+    mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc)
+    mf.grids.level = 1
+    if df:
+        mf = mf.density_fit()
+    if model == "SMD":
+        mf = mf.SMD()
+        mf.with_solvent.solvent = "water"
+    else:
+        mf = mf.PCM()
+        mf.with_solvent.method = model
+    mf.conv_tol = 1e-11
+    return mojoscf.dft.accelerate(mf) if accel else mf
+
+
+@pytest.mark.parametrize("spin, df", [(0, True), (1, True), (0, False)])
+def test_cphf_operator_with_solvent(spin, df):
+    """The MO-basis coupled-perturbed operator of a solvent-attached SCF (equilibrium solvation: the
+    solvent's response to the first-order density added) against pyscf's gen_vind."""
+    from pyscf.hessian import rhf as rhf_hess
+    from pyscf.hessian import uhf as uhf_hess
+    from pyscf import lib
+
+    from mojoscf import hessian as mhess
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = _make_hess(mol, "C-PCM", spin, df, True).run()
+    fx = mhess.cphf_operator(mf)
+    assert fx is not None
+    ref = (uhf_hess if spin else rhf_hess).gen_vind(mf, mf.mo_coeff, mf.mo_occ)
+    cs = mf.mo_coeff if spin else [mf.mo_coeff]
+    os_ = mf.mo_occ if spin else [mf.mo_occ]
+    n = sum(c.shape[1] * int((o > 0).sum()) for c, o in zip(cs, os_))
+    x = np.random.default_rng(6).normal(size=(4, n))
+    for equilibrium in (True, False):
+        with lib.temporary_env(mf.with_solvent, equilibrium_solvation=equilibrium):
+            a, b = fx(x), np.asarray(ref(x)).reshape(fx(x).shape)
+        assert abs(a - b).max() < 1e-11 * abs(b).max()
+
+
+@pytest.mark.parametrize("model, spin, df", [("C-PCM", 0, True), ("IEF-PCM", 1, True), ("C-PCM", 0, False),
+                                             ("SMD", 0, True)])
+def test_solvent_hessian_matches_pyscf(model, spin, df):
+    """Solvent Hessians on the native J/K, XC and MO-basis CPHF paths (pyscf's solvent terms added: the
+    first-order Fock term of make_h1, the CPHF response and the solvent Hessian) equal pyscf's for the same
+    SCF solution."""
+    from mojoscf import hessian as mhess
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = _make_hess(mol, model, spin, df, True)
+    mf.kernel()
+    ref = _make_hess(mol, model, spin, df, False)
+    for k in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(ref, k, getattr(mf, k))
+    ref.with_solvent.build()
+    h = mf.Hessian()
+    assert isinstance(h, mhess._MojoHessMixin)
+    assert (mhess._df_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None) == df
+    assert (mhess._exact_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None) == (not df)
+    a = h.kernel()
+    b = ref.Hessian().kernel()
+    assert abs(a - b).max() < 1e-8, abs(a - b).max()
