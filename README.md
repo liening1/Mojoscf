@@ -1750,12 +1750,16 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   ECPs or finite nuclei use it for everything but the ECP / finite-nucleus
   terms.  `unsupported_reason(mol, two_electron=..., allow_ecp=..., allow_omega=...)` says why
   a molecule is rejected for a given use.
-* Nuclear gradients are native for RHF and UHF, and for RKS/UKS objects
+* Nuclear gradients are native for RHF and UHF, for RKS/UKS objects
   accelerated with `mojoscf.dft.accelerate` (LDA, GGA, meta-GGA, global and
-  range-separated hybrids), with exact or density-fitted
-  (pyscf's `df.DF`, auxiliary-basis response included; the gradient
-  recomputes its integrals, so the tensor may be on disk) two-electron
-  integrals.
+  range-separated hybrids), and for ROHF/ROKS (`mojoscf.accelerate`,
+  `mojoscf.dft.accelerate`: pyscf's ROHF/ROKS gradients are the UHF/UKS
+  ones with the ROHF energy-weighted density, and so are mojoscf's; a
+  [Ni(H2O)6]2+ triplet ROKS B3LYP gradient takes 2.8 s instead of pyscf's
+  8.1 s), with exact or density-fitted (pyscf's `df.DF`, auxiliary-basis
+  response included; the gradient recomputes its integrals, so the tensor
+  may be on disk) two-electron integrals.  With ECPs the core-potential
+  derivative integrals are pyscf's, evaluated once per ECP centre.
 * Analytical Hessians: `mf.Hessian()` of accelerated RKS/UKS objects and of
   the mojoscf RHF/UHF classes keeps pyscf's driver; the XC terms are native
   for LDA, GGA and meta-GGA, the Coulomb/exchange terms and the CPHF

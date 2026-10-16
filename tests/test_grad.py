@@ -371,3 +371,31 @@ def test_gradients_hooks_of_all_classes():
     for mf in objs:
         for g in (mf.Gradients(), mf.nuc_grad_method()):
             assert type(g).__module__ == mgrad.__name__, type(mf).__name__
+
+
+@pytest.mark.parametrize("kind, df", [("rohf", False), ("rohf", True), ("b3lyp", True), ("pbe", False),
+                                      ("camb3lyp", True)])
+def test_restricted_open_shell_gradients_match_pyscf(kind, df):
+    """ROHF/ROKS gradients: pyscf's UHF/UKS gradients with the ROHF energy-weighted density and spin-tagged
+    orbitals, on the Mojo classes (routed from nuc_grad_method of accelerated objects)."""
+    from pyscf import dft
+
+    mol = gto.M(atom="O 0 0 0; H 0 0.757 0.587; H 0 -0.757 0.587", basis="def2-svp", charge=1, spin=1, verbose=0)
+
+    def make():
+        mf = scf.ROHF(mol) if kind == "rohf" else dft.ROKS(mol, xc=kind)
+        if kind != "rohf":
+            mf.grids.level = 1
+        return mf.density_fit() if df else mf
+
+    mf = mojoscf.accelerate(make()) if kind == "rohf" else mojoscf.dft.accelerate(make())
+    mf.conv_tol = 1e-11
+    mf.kernel()
+    ref = make()
+    for k in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(ref, k, getattr(mf, k))
+    g = mf.nuc_grad_method()
+    assert type(g).__name__ == ("DF" if df else "") + ("ROGradients" if kind == "rohf" else "ROKSGradients")
+    # the long-range DF metric of CAM-B3LYP is less well conditioned (as for RKS)
+    tol = 1e-8 if kind == "camb3lyp" else 1e-10
+    assert abs(g.kernel() - ref.nuc_grad_method().kernel()).max() < tol

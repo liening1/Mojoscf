@@ -6,7 +6,10 @@ the integral work done by ``mojoscf.integrals``; ``DFGradients`` and
 ``KSGradients``, ``UKSGradients``, ``DFKSGradients`` and ``DFUKSGradients``
 do the same for Kohn-Sham objects (``mojoscf.dft.accelerate``), adding the
 exact exchange scaled by the functional's fraction and the XC term at fixed
-grids (``mojoscf.dft.grad_xc``) to ``grad_2e``:
+grids (``mojoscf.dft.grad_xc``) to ``grad_2e``.  ``ROGradients``,
+``ROKSGradients`` (and their ``DF`` forms) are the UHF/UKS ones with pyscf's
+ROHF energy-weighted density and spin-tagged orbitals, as pyscf's ROHF/ROKS
+gradients are:
 
 * ``grad_elec``: the two-electron part is the derivative of the two-electron
   energy evaluated directly from derivative integrals, contracted with the
@@ -42,11 +45,15 @@ from __future__ import annotations
 import numpy as np
 from pyscf import lib
 from pyscf.df.grad import rhf as df_rhf_grad
+from pyscf.df.grad import rohf as df_rohf_grad
 from pyscf.df.grad import rks as df_rks_grad
+from pyscf.df.grad import roks as df_roks_grad
 from pyscf.df.grad import uhf as df_uhf_grad
 from pyscf.df.grad import uks as df_uks_grad
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import rks as rks_grad
+from pyscf.grad import rohf as rohf_grad
+from pyscf.grad import roks as roks_grad
 from pyscf.grad import uhf as uhf_grad
 from pyscf.grad import uks as uks_grad
 from pyscf.lib import logger
@@ -55,7 +62,8 @@ from . import integrals
 
 __all__ = [
     "Gradients", "UGradients", "DFGradients", "DFUGradients",
-    "KSGradients", "UKSGradients", "DFKSGradients", "DFUKSGradients", "grad_tol",
+    "KSGradients", "UKSGradients", "DFKSGradients", "DFUKSGradients",
+    "ROGradients", "DFROGradients", "ROKSGradients", "DFROKSGradients", "grad_tol",
 ]
 
 #: Screening threshold of the derivative integrals (``grad2e``, ``grad2e_df`` and the derivative J/K matrices).
@@ -209,7 +217,7 @@ class _MojoGrad1eMixin:
         if not fast_h1:
             hcore_deriv = self.hcore_generator(mol)
         s1 = self.get_ovlp(mol)
-        dm0 = lib.tag_array(np.asarray(mf.make_rdm1(mo_coeff, mo_occ)), mo_coeff=mo_coeff, mo_occ=mo_occ)
+        dm0 = self._tag_rdm1(np.asarray(mf.make_rdm1(mo_coeff, mo_occ)), mo_coeff, mo_occ)
         dme0 = np.asarray(self.make_rdm1e(mo_energy, mo_coeff, mo_occ))
         if self._unrestricted:
             dm0_sf = dm0[0] + dm0[1]
@@ -529,16 +537,53 @@ class DFUKSGradients(_MojoKSGradMixin, _MojoDFGradMixin, df_uks_grad.Gradients):
     _pyscf_grad = df_uks_grad.Gradients
 
 
+class _ROMixin:
+    """pyscf's ROHF/ROKS gradients are those of UHF/UKS with the energy-weighted density of the ROHF Fock
+    matrices and the orbitals tagged per spin (alpha: occupied, beta: doubly occupied); the same two
+    functions on the Mojo UHF/UKS classes."""
+
+    make_rdm1e = rohf_grad.make_rdm1e
+    _tag_rdm1 = rohf_grad._tag_rdm1
+
+
+class ROGradients(_ROMixin, UGradients):
+    """ROHF nuclear gradients with Mojo derivative integrals (see the module docstring)."""
+
+    _pyscf_grad = rohf_grad.Gradients
+
+
+class DFROGradients(_ROMixin, DFUGradients):
+    """Density-fitted ROHF nuclear gradients with Mojo derivative integrals."""
+
+    _pyscf_grad = df_rohf_grad.Gradients
+
+
+class ROKSGradients(_ROMixin, UKSGradients):
+    """ROKS nuclear gradients with Mojo derivative integrals and XC kernels."""
+
+    _pyscf_grad = roks_grad.Gradients
+
+
+class DFROKSGradients(_ROMixin, DFUKSGradients):
+    """Density-fitted ROKS nuclear gradients with Mojo derivative integrals and XC kernels."""
+
+    _pyscf_grad = df_roks_grad.Gradients
+
+
 _KS_GRADIENTS = {
     rks_grad.Gradients: KSGradients,
     uks_grad.Gradients: UKSGradients,
     df_rks_grad.Gradients: DFKSGradients,
     df_uks_grad.Gradients: DFUKSGradients,
+    rohf_grad.Gradients: ROGradients,
+    df_rohf_grad.Gradients: DFROGradients,
+    roks_grad.Gradients: ROKSGradients,
+    df_roks_grad.Gradients: DFROKSGradients,
 }
 
 
 def ks_gradients(g):
-    """The Mojo counterpart of a pyscf Kohn-Sham gradient object ``g`` of exactly one of pyscf's RKS/UKS
-    classes (plain or density-fitted), else ``g`` itself."""
+    """The Mojo counterpart of a pyscf gradient object ``g`` of exactly one of pyscf's RKS/UKS, ROKS or
+    ROHF classes (plain or density-fitted), else ``g`` itself."""
     cls = _KS_GRADIENTS.get(type(g))
     return g if cls is None else cls(g.base)
