@@ -3,17 +3,20 @@
 pyscf's co-iterative augmented-Hessian solver applies the orbital Hessian to
 one vector at a time, several times per macro iteration: every product
 builds an AO first-order density and runs it through ``gen_response`` (J/K
-and the XC kernel in the AO basis) before projecting back.  For RHF/RKS and
-UHF/UKS objects accelerated by mojoscf, ``gen_g_hop`` (installed on pyscf's
-``_SecondOrderRHF``/``_SecondOrderUHF``) returns the same gradient, Hessian
-product and diagonal with the product from the operators of
-:mod:`mojoscf.stability`, set up once per macro iteration for its orbitals
-and Fock matrix: Coulomb and exchange from the MO-basis DF tensors (or
-MO-basis ERIs, or one call of the integral-direct kernel), the XC kernel
-response from the factors of the first-order density (:mod:`mojoscf.tdscf`).
-Symmetry-adapted, solvent, dual-basis, ROHF/GHF objects and the cases
-:mod:`mojoscf.tdscf` leaves to pyscf keep pyscf's ``gen_g_hop``; the solver,
-its step control and the orbital update are pyscf's.
+and the XC kernel in the AO basis) before projecting back.  For RHF/RKS,
+UHF/UKS and ROHF/ROKS objects accelerated by mojoscf, ``gen_g_hop``
+(installed on pyscf's ``_SecondOrderRHF``/``_SecondOrderUHF``/``_SecondOrderROHF``)
+returns the same gradient, Hessian product and diagonal with the product
+from the operators of :mod:`mojoscf.stability`, set up once per macro
+iteration for its orbitals and Fock matrix: Coulomb and exchange from the
+MO-basis DF tensors (or MO-basis ERIs, or one call of the integral-direct
+kernel), the XC kernel response from the factors of the first-order density
+(:mod:`mojoscf.tdscf`).  ROHF objects take pyscf's route through the UHF
+Hessian of the alpha (occupied: occupation > 0) and beta (occupation 2)
+orbitals, folded onto the ROHF rotations.  Symmetry-adapted, solvent,
+dual-basis and GHF objects and the cases :mod:`mojoscf.tdscf` leaves to
+pyscf keep pyscf's ``gen_g_hop``; the solver, its step control and the
+orbital update are pyscf's.
 """
 from __future__ import annotations
 
@@ -27,15 +30,23 @@ from . import integrals
 __all__ = ["gen_g_hop", "install"]
 
 
+def _kind(mf):
+    from pyscf.scf import rohf, uhf
+
+    if isinstance(mf, uhf.UHF):
+        return "uhf"
+    return "rohf" if isinstance(mf, rohf.ROHF) else "rhf"
+
+
 def _applies(mf, mo_coeff, with_symmetry):
-    from pyscf.scf import hf, rohf, uhf
+    from pyscf.scf import hf, uhf
 
     from .dft import _MojoKSHook
     from .scf import _MojoGlueMixin, _MojoHFHook
 
     if integrals.engine() != "mojo" or not isinstance(mf, (_MojoKSHook, _MojoHFHook, _MojoGlueMixin)):
         return False
-    if isinstance(mf, rohf.ROHF) or not isinstance(mf, (hf.RHF, uhf.UHF)):
+    if not isinstance(mf, (hf.RHF, uhf.UHF)):
         return False
     if not np.isrealobj(mo_coeff) or (with_symmetry and mf.mol.symmetry):
         return False
@@ -56,47 +67,53 @@ def _applies(mf, mo_coeff, with_symmetry):
     return True
 
 
-def gen_g_hop(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None, with_symmetry=True):
-    """``(g, h_op, h_diag)`` of pyscf's ``gen_g_hop_rhf``/``gen_g_hop_uhf`` with the occupied-virtual Hessian
-    product, or None where pyscf's has to run."""
-    from pyscf.scf import uhf
-
+def _vo_parts(mf, cs, idx, focks, unrestricted, xc_coeff, xc_occ):
+    """``(g, h_diag, aop)`` of pyscf's ``gen_g_hop_uhf`` (``unrestricted``, one channel per spin) or
+    ``gen_g_hop_rhf`` for the orbitals ``cs`` with the occupied and virtual columns ``idx`` ((occ, vir) per
+    channel) and the AO Fock matrices ``focks``, the XC kernel that of ``xc_coeff``, ``xc_occ``; or None."""
     from . import stability, tdscf
 
-    if not _applies(mf, mo_coeff, with_symmetry):
-        return None
-    unrestricted = isinstance(mf, uhf.UHF)
-    if unrestricted:
-        idx = [(np.where(mo_occ[s] > 0)[0], np.where(mo_occ[s] == 0)[0]) for s in range(2)]
-        cs = [np.asarray(mo_coeff[s]) for s in range(2)]
-    else:
-        idx = [(np.where(mo_occ == 2)[0], np.where(mo_occ == 0)[0])]
-        cs = [np.asarray(mo_coeff)]
     chans = [tdscf._Channel(c[:, o], c[:, v], np.zeros((len(o), len(v)))) for c, (o, v) in zip(cs, idx)]
     if any(ch.nocc == 0 or ch.nvir == 0 for ch in chans):
         return None
     parts = tdscf._response_parts(mf, chans, True, True, mf.max_memory, logger.new_logger(mf),
-                                  mo_coeff=mo_coeff, mo_occ=mo_occ)
+                                  mo_coeff=xc_coeff, mo_occ=xc_occ, unrestricted=unrestricted)
     if parts is None:
         return None
     two, xc = parts
+    fock = [(reduce(np.dot, (ch.orbv.T, f, ch.orbv)), reduce(np.dot, (ch.orbo.T, f, ch.orbo)),
+             reduce(np.dot, (ch.orbv.T, f, ch.orbo))) for ch, f in zip(chans, focks)]
+    g = np.hstack([f[2].ravel() for f in fock])
+    h_diag = np.hstack([(f[0].diagonal()[:, None] - f[1].diagonal()).ravel() for f in fock])
+    if unrestricted:
+        # pyscf's h_op: dm1_s = d_s + d_s^T with d_s = C_v x_s C_o^T
+        return g, h_diag, stability._vo_op(chans, fock, two, xc, 1.0, 1.0, 2.0, 1.0)
+    # pyscf's h_op: dm1 = 2 (d + d^T), and it returns twice the product
+    return g * 2, h_diag * 2, stability._vo_op(chans, fock, two, xc, 1.0, 2.0, 4.0, 2.0)
+
+
+def gen_g_hop(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None, with_symmetry=True):
+    """``(g, h_op, h_diag)`` of pyscf's ``gen_g_hop_rhf``/``gen_g_hop_uhf``/``gen_g_hop_rohf`` with the
+    occupied-virtual Hessian product, or None where pyscf's has to run."""
+    if not _applies(mf, mo_coeff, with_symmetry):
+        return None
+    kind = _kind(mf)
+    if kind == "rohf":
+        return _gen_g_hop_rohf(mf, np.asarray(mo_coeff), np.asarray(mo_occ), fock_ao, h1e)
     if fock_ao is None:
         dm0 = mf.make_rdm1(mo_coeff, mo_occ)
         fock_ao = mf.get_fock(h1e, dm=dm0)
-    focks = [np.asarray(fock_ao[s]) for s in range(2)] if unrestricted else [np.asarray(fock_ao)]
-    fock = [(reduce(np.dot, (ch.orbv.T, f, ch.orbv)), reduce(np.dot, (ch.orbo.T, f, ch.orbo)),
-             reduce(np.dot, (ch.orbv.T, f, ch.orbo))) for ch, f in zip(chans, focks)]
-    if unrestricted:
-        g = np.hstack([f[2].ravel() for f in fock])
-        h_diag = np.hstack([(f[0].diagonal()[:, None] - f[1].diagonal()).ravel() for f in fock])
-        # pyscf's h_op: dm1_s = d_s + d_s^T with d_s = C_v x_s C_o^T
-        aop = stability._vo_op(chans, fock, two, xc, 1.0, 1.0, 2.0, 1.0)
+    if kind == "uhf":
+        cs = [np.asarray(mo_coeff[s]) for s in range(2)]
+        idx = [(np.where(np.asarray(mo_occ[s]) > 0)[0], np.where(np.asarray(mo_occ[s]) == 0)[0]) for s in range(2)]
+        focks = [np.asarray(fock_ao[s]) for s in range(2)]
     else:
-        fvv, foo, gvo = fock[0]
-        g = gvo.ravel() * 2
-        h_diag = (fvv.diagonal()[:, None] - foo.diagonal()).ravel() * 2
-        # pyscf's h_op: dm1 = 2 (d + d^T), and it returns twice the product
-        aop = stability._vo_op(chans, fock, two, xc, 1.0, 2.0, 4.0, 2.0)
+        occ = np.asarray(mo_occ)
+        cs, idx, focks = [np.asarray(mo_coeff)], [(np.where(occ == 2)[0], np.where(occ == 0)[0])], [np.asarray(fock_ao)]
+    parts = _vo_parts(mf, cs, idx, focks, kind == "uhf", mo_coeff, mo_occ)
+    if parts is None:
+        return None
+    g, h_diag, aop = parts
 
     def h_op(x):
         return aop([np.asarray(x).ravel()])[0]
@@ -104,20 +121,53 @@ def gen_g_hop(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None, with_symmetry=True):
     return g, h_op, h_diag
 
 
+def _gen_g_hop_rohf(mf, mo_coeff, mo_occ, fock_ao, h1e):
+    """pyscf's ``gen_g_hop_rohf``: the UHF Hessian of the alpha (occupation > 0) and beta (occupation 2)
+    orbitals of the same coefficients, folded onto the unique ROHF rotations."""
+    if getattr(fock_ao, "focka", None) is None:
+        dm0 = mf.make_rdm1(mo_coeff, mo_occ)
+        fock_ao = mf.get_fock(h1e, dm=dm0)
+    occa, occb = mo_occ > 0, mo_occ == 2
+    idx = [(np.where(occa)[0], np.where(~occa)[0]), (np.where(occb)[0], np.where(~occb)[0])]
+    parts = _vo_parts(mf, [mo_coeff, mo_coeff], idx, [np.asarray(fock_ao.focka), np.asarray(fock_ao.fockb)],
+                      True, (mo_coeff, mo_coeff), (occa.astype(np.float64), occb.astype(np.float64)))
+    if parts is None:
+        return None
+    ug, uh_diag, aop = parts
+    uniq_a = ~occa[:, None] & occa
+    uniq_b = ~occb[:, None] & occb
+    uniq = uniq_a | uniq_b
+    nmo = mo_coeff.shape[-1]
+    nova = np.count_nonzero(uniq_a)
+
+    def sum_ab(x):
+        x1 = np.zeros((nmo, nmo), dtype=x.dtype)
+        x1[uniq_a] = x[:nova]
+        x1[uniq_b] += x[nova:]
+        return x1[uniq]
+
+    def h_op(x):
+        x1 = np.zeros((nmo, nmo), dtype=np.result_type(x, np.float64))
+        x1[uniq] = x
+        return sum_ab(aop([np.hstack((x1[uniq_a], x1[uniq_b]))])[0])
+
+    return sum_ab(ug), h_op, sum_ab(uh_diag)
+
+
 def install():
-    """Put the dispatching ``gen_g_hop`` on pyscf's second-order SCF classes of RHF/RKS and UHF/UKS objects."""
-    from pyscf.scf import uhf
+    """Put the dispatching ``gen_g_hop`` on pyscf's second-order SCF classes of RHF/RKS, UHF/UKS and ROHF/ROKS
+    objects."""
     from pyscf.soscf import newton_ah
 
-    for cls, unrestricted in ((newton_ah._SecondOrderRHF, False), (newton_ah._SecondOrderUHF, True)):
+    for cls, kind in ((newton_ah._SecondOrderRHF, "rhf"), (newton_ah._SecondOrderUHF, "uhf"),
+                      (newton_ah._SecondOrderROHF, "rohf")):
         orig = cls.__dict__.get("gen_g_hop")
         if orig is None or getattr(orig, "_mojoscf_orig", None) is not None:
             continue
 
-        def dispatch(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None, with_symmetry=True, _orig=orig,
-                     _unrestricted=unrestricted):
+        def dispatch(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None, with_symmetry=True, _orig=orig, _kind_of=kind):
             out = None
-            if isinstance(mf, uhf.UHF) == _unrestricted:
+            if _kind(mf) == _kind_of:
                 out = gen_g_hop(mf, mo_coeff, mo_occ, fock_ao, h1e, with_symmetry)
             return _orig(mf, mo_coeff, mo_occ, fock_ao, h1e, with_symmetry) if out is None else out
 

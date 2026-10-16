@@ -1436,7 +1436,9 @@ def xc_fxc_core(
     B_c^T) with U = sum_c w_c B_c and B_c = R_sub^T d_c phi shared by all
     sets: two GEMMs of nrow x rank instead of one of nrow x nrow, and the
     per-thread sums are nao x rank.  The linear-response operators need no
-    more (C_v^T V C_o).
+    more (C_v^T V C_o).  For GGA with fewer than three sets (the one vector
+    per call of second-order SCF) U = R_sub^T Z is formed per set instead,
+    one GEMM in place of the three of B_1..B_3.
     """
     var nderiv = 0 if kind == 0 else 1
     var nvar = _nrho(kind)
@@ -1450,14 +1452,16 @@ def xc_fxc_core(
     var nblk = grid.nblk
     var nworkers = max(1, min(parallelism_level(), nblk))
     var total = nspin * nset * (nao * rank if project else n2)
-    var nbc = (1 if kind == 0 else 4) if project else nb     # components of B computed per spin
+    # GGA with fewer than three sets: U = R^T Z per set (one GEMM) instead of B_1..B_3 shared by the sets
+    var zproj = project and kind == 1 and nset < 3
+    var nbc = (1 if kind == 0 or zproj else 4) if project else nb     # components of B computed per spin
     var accl = List[Float64](length=nworkers * total + 1, fill=0.0)
     var pacc = list_ptr(accl)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
     var rk = max(rank, 1)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nvar, imm nv2, imm nb, imm kind, imm nspin, imm nset, imm fxc, imm weights, imm dms, imm rank, imm rk, imm lfac, imm rfac, imm pacc, imm total, imm ngrid, imm project, imm nbc, imm nworkers}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nvar, imm nv2, imm nb, imm kind, imm nspin, imm nset, imm fxc, imm weights, imm dms, imm rank, imm rk, imm lfac, imm rfac, imm pacc, imm total, imm ngrid, imm project, imm nbc, imm zproj, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * total)
         var n_rsub = nspin * nao * rk
@@ -1598,7 +1602,7 @@ def xc_fxc_core(
                 for b in range(nspin):
                     var wb = wvb.unsafe_offset(b * nvar * BLK)
                     var z = ws.y()
-                    if project:
+                    if project and not zproj:
                         var bb = bbuf.unsafe_offset(b * 4 * rk * BLK)
                         # U = sum_c w_c B_c (rank x BLK)
                         for k in range(rank):
@@ -1630,6 +1634,8 @@ def xc_fxc_core(
                         # (V + V^T)_sub R_sub = phi U^T + Z B_0^T (+ 2 sum_c (w_tau d_c phi) B_c^T)
                         var bb = bbuf.unsafe_offset(b * 4 * rk * BLK)
                         try:
+                            if zproj:
+                                blas.gemm(True, False, rank, BLK, nrow, 1.0, rsub.unsafe_offset(b * nao * rk), z, 0.0, ubuf)
                             blas.gemm(False, True, nrow, rank, BLK, 1.0, ws.ao(), ubuf, 0.0, wblk)
                             blas.gemm(False, True, nrow, rank, BLK, 1.0, z, bb, 1.0, wblk)
                         except:

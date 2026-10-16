@@ -139,6 +139,18 @@ def test_fxc_matrices_factors_and_projection(water, kind):
         assert abs(dense - low).max() < 1e-10 * abs(dense).max()
         proj = mdft.fxc_matrices(water, grids, kind, fxc, factors=[(lf, rf)], project=True)
         assert abs(proj - dense @ rf).max() < 1e-10 * abs(proj).max()
+        for n in (1, 2):                       # GGA: U = R^T Z per set
+            proj = mdft.fxc_matrices(water, grids, kind, fxc, factors=[(lf[:n], rf)], project=True)
+            assert abs(proj - dense[:, :n] @ rf).max() < 1e-10 * abs(proj).max()
+    fx2 = rng.normal(size=(2 * nvar, 2 * nvar, grids.weights.size))
+    fx2 = fx2 + fx2.transpose(1, 0, 2)
+    factors = [(rng.normal(size=(1, nao, r)), rng.normal(size=(nao, r))) for r in (5, 3)]
+    dense = mdft.fxc_matrices(water, grids, kind, fx2, dms=np.array([lf @ rf.T for lf, rf in factors]))
+    proj = mdft.fxc_matrices(water, grids, kind, fx2, factors=factors, project=True)
+    for a, (_, rf) in enumerate(factors):
+        ref = dense[a] @ rf
+        assert abs(proj[a, :, :, : rf.shape[1]] - ref).max() < 1e-10 * abs(ref).max()
+        assert not proj[a, :, :, rf.shape[1]:].any()
 
 
 CASES = [

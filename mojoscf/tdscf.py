@@ -244,10 +244,11 @@ def _operator(td):
     return _rks_operator(kind, chans[0], singlet, xc, two)
 
 
-def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, mo_occ=None):
+def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, mo_occ=None, unrestricted=None):
     """``(two, xc)`` of the occupied-virtual response of ``mf`` (RHF/UHF/RKS/UKS) for the channels ``chans``,
     or None when pyscf's AO operator has to run.  The XC kernel is that of the density of ``mo_coeff``,
-    ``mo_occ`` (default ``mf``'s).
+    ``mo_occ`` (default ``mf``'s); ``unrestricted`` (default: whether ``mf`` is UHF) selects the
+    spin-resolved response of two channels (pyscf's UHF response, which ROHF objects also use).
 
     ``two(xs, ys, jscale)`` gives the Coulomb and exact-exchange parts (see
     :func:`_rks_operator`): from the MO-basis DF tensors, from MO-basis exact
@@ -261,7 +262,8 @@ def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, 
     from . import dft
 
     ks = isinstance(mf, hf.KohnShamDFT)
-    unrestricted = isinstance(mf, uhf.UHF)
+    if unrestricted is None:
+        unrestricted = isinstance(mf, uhf.UHF)
     kterms = _exchange_terms(mf)
     if kterms is None:
         return None
