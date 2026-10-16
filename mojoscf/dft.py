@@ -281,7 +281,6 @@ def _xc_eff2(ni, xc_code, rho, xctype, spin):
         return out[0], vxc, fxc
 
     ga, gb = rho[0, 1:4], rho[1, 1:4]
-    gs = (ga, gb)
     # D_s(sigma) for sigma = aa, ab, bb (variables 2, 3, 4): [(factor, gradient)] or None
     dsig = [[(2.0, ga), (1.0, gb), None], [None, (1.0, ga), (2.0, gb)]]
     vxc = np.empty((2, nvar, ngrid))
