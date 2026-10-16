@@ -244,9 +244,10 @@ def _operator(td):
     return _rks_operator(kind, chans[0], singlet, xc, two)
 
 
-def _response_parts(mf, chans, singlet, need_b, max_memory, log):
+def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, mo_occ=None):
     """``(two, xc)`` of the occupied-virtual response of ``mf`` (RHF/UHF/RKS/UKS) for the channels ``chans``,
-    or None when pyscf's AO operator has to run.
+    or None when pyscf's AO operator has to run.  The XC kernel is that of the density of ``mo_coeff``,
+    ``mo_occ`` (default ``mf``'s).
 
     ``two(xs, ys, jscale)`` gives the Coulomb and exact-exchange parts (see
     :func:`_rks_operator`): from the MO-basis DF tensors, from MO-basis exact
@@ -276,7 +277,7 @@ def _response_parts(mf, chans, singlet, need_b, max_memory, log):
         two = None
     if two is None:
         return None
-    return two, _xc_response(mf, ks, unrestricted, singlet, chans)
+    return two, _xc_response(mf, ks, unrestricted, singlet, chans, mo_coeff, mo_occ)
 
 
 def _df_two_electron(mf, chans, kterms, cderi, need_j, need_b, max_memory, log):
@@ -497,7 +498,7 @@ def _exact_two_electron(mf, chans, kterms):
     return two
 
 
-def _xc_response(mf, ks, unrestricted, singlet, chans):
+def _xc_response(mf, ks, unrestricted, singlet, chans, mo_coeff=None, mo_occ=None):
     """``f(factors) -> [(n, nocc, nvir) per channel]``: the XC kernel response to transition densities.
 
     ``factors`` holds one ``(L (n, nao, nocc), R = C_o)`` pair per spin
@@ -519,7 +520,9 @@ def _xc_response(mf, ks, unrestricted, singlet, chans):
     mol = mf.mol
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, mf.max_memory * 0.8 - mem_now)
-    rho0, vxc, fxc = ni.cache_xc_kernel(mol, mf.grids, mf.xc, mf.mo_coeff, mf.mo_occ, 1)
+    mo_coeff = mf.mo_coeff if mo_coeff is None else mo_coeff
+    mo_occ = mf.mo_occ if mo_occ is None else mo_occ
+    rho0, vxc, fxc = ni.cache_xc_kernel(mol, mf.grids, mf.xc, mo_coeff, mo_occ, 1)
     fast = isinstance(ni, dft.NumInt) and dft._fxc_ok(ni, mol, mf.xc)
     kind = dft._kind(ni, mf.xc) if fast else None
     if not unrestricted:
