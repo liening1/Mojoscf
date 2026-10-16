@@ -28,7 +28,7 @@ from _mojo.fcirdm import fci_dm123_core, fci_f3_core
 from _mojo.nlc import vv10_core, vv10_sym_core, vv10_uwabce_core, vv10_fxc_core, vv10_euw_w1_core, vv10_euw_gr_core
 from _mojo.dfmo import (
     df_mo_core, df_sandwich_core, cphf_k_core, casscf_ah_core, casscf_mo_core, packed_gather_core,
-    packed_scatter_core,
+    packed_scatter_core, hess_dfk_rk_core, hess_dfk_contract_core, hess_df_ip1_j_core, hess_df_ip1_k_core,
 )
 from _mojo.erijk import jk_s8_core
 from _mojo.driver import scf_kernel, f64ptr
@@ -82,6 +82,10 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_vv10_euw_gr]("vv10_euw_gr", docstring="vv10_euw_gr(xyz, w, rho, omega, kappa, seg, out): pyscf's VXC_vv10nlc_hessian_eval_EUW_grid_response for points sorted by atom (seg int64 (natm + 1)); out (3, natm, 3, npad).")
         m.def_function[py_casscf_ah]("casscf_ah", docstring="casscf_ah(b, ncore, ncas, rmat, sa, v3, v34, seq_path, seq_prefix): v3 (ncas, nmo), v34 (ncore, nmo - ncore) += the MO-basis (2J - K) rows of a CASSCF orbital-Hessian step for the DF tensor b (nq, nmo, nmo), the core-noncore rotation rmat and sa = casdm1 r[active].")
         m.def_function[py_cphf_k]("cphf_k", docstring="cphf_k(lfull, lmo, loo, xs, xts, alpha, r, seq_path, seq_prefix): r (nmo, nset, nocc) += alpha sum_Q L_Q (x (oo|Q) + E_o x^T (po|Q)) with xs (nmo, nset, nocc), the MO-basis exchange of the orbital-Hessian response.")
+        m.def_function[py_hess_df_ip1_j]("hess_df_ip1_j", docstring="hess_df_ip1_j(n3, p0, dm, ndm, want_nt, coef, nt, auxloc): ndm[x, P, mu] = sum_nu n3[x, P, mu, nu] D[mu, nu] and nt[A, x] += sum_{P on A} c_P n3[x, P] for a block of (nabla mu nu|P), P from p0.")
+        m.def_function[py_hess_df_ip1_k]("hess_df_ip1_k", docstring="hess_df_ip1_k(n3, p0, co, g, want_h, ck, hb, hd, aoloc, auxloc, seq_path, seq_prefix): g[x, :, P] = n3[x, P] C_o and the hb/hd Fock-derivative pieces of the DF Hessian exchange.")
+        m.def_function[py_hess_dfk_rk]("hess_dfk_rk", docstring="hess_dfk_rk(co, g, ck, v1, v1ck, aoloc, auxloc, i0, nb, rk, seq_path, seq_prefix): the DF Hessian exchange response vectors of occupied rows i0 <= i < i0 + nb, rk (naux, natm, 3, nb, nocc).")
+        m.def_function[py_hess_dfk_contract]("hess_dfk_contract", docstring="hess_dfk_contract(rt, lt, i0, nb, gram, hr, want_h, seq_path, seq_prefix): gram += sum_P rt_P rt_P^T, hr[a] += sum_P lt[:, P, i0:i0+nb] rt[P, a] for whitened rt (nw, 3 natm, nb, nocc).")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k, nanti): J/K from 8-fold packed ERIs (the last nanti densities antisymmetric: K only).")
         m.def_function[py_factorize_density]("factorize_density", docstring="factorize_density(dm, orb_out, sign_out, rel_tol, path, prefix) -> m.")
         m.def_function[scf_kernel]("scf_kernel", docstring="Native RHF/UHF SCF driver; see mojoscf.scf.kernel.")
@@ -568,6 +572,60 @@ def py_casscf_ah(
     casscf_ah_core(
         blas_seq, Int(py=b.shape[0]), Int(py=b.shape[1]), Int(py=ncore), Int(py=ncas), f64ptr(b), f64ptr(rmat),
         f64ptr(sa), f64ptr(v3), f64ptr(v34),
+    )
+    return PythonObject(None)
+
+
+def py_hess_df_ip1_j(
+    n3: PythonObject, p0: PythonObject, dm: PythonObject, ndm: PythonObject, want_nt: PythonObject,
+    coef: PythonObject, nt: PythonObject, auxloc: PythonObject,
+) raises -> PythonObject:
+    hess_df_ip1_j_core(
+        Int(py=dm.shape[0]), Int(py=n3.shape[1]), Int(py=p0), Int(py=ndm.shape[1]), f64ptr(n3), f64ptr(dm),
+        f64ptr(ndm), Bool(py=want_nt), f64ptr(coef), f64ptr(nt), Int(py=auxloc.shape[0]) - 1, i64ptr(auxloc),
+    )
+    return PythonObject(None)
+
+
+def py_hess_df_ip1_k(
+    n3: PythonObject, p0: PythonObject, co: PythonObject, g: PythonObject, want_h: PythonObject, ck: PythonObject,
+    hb: PythonObject, hd: PythonObject, aoloc: PythonObject, auxloc: PythonObject, seq_path: PythonObject,
+    seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    hess_df_ip1_k_core(
+        blas_seq, Int(py=co.shape[0]), Int(py=n3.shape[1]), Int(py=p0), Int(py=g.shape[2]), Int(py=co.shape[1]),
+        f64ptr(n3), f64ptr(co), f64ptr(g), Bool(py=want_h), f64ptr(ck), f64ptr(hb), f64ptr(hd),
+        Int(py=aoloc.shape[0]) - 1, i64ptr(aoloc), i64ptr(auxloc),
+    )
+    return PythonObject(None)
+
+
+def py_hess_dfk_rk(
+    co: PythonObject, g: PythonObject, ck: PythonObject, v1: PythonObject, v1ck: PythonObject, aoloc: PythonObject,
+    auxloc: PythonObject, i0: PythonObject, nb: PythonObject, rk: PythonObject, seq_path: PythonObject,
+    seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    hess_dfk_rk_core(
+        blas_seq, Int(py=co.shape[0]), Int(py=v1.shape[1]), Int(py=co.shape[1]), Int(py=aoloc.shape[0]) - 1,
+        Int(py=i0), Int(py=nb), f64ptr(co), f64ptr(g), f64ptr(ck), f64ptr(v1), f64ptr(v1ck), i64ptr(aoloc),
+        i64ptr(auxloc), f64ptr(rk),
+    )
+    return PythonObject(None)
+
+
+def py_hess_dfk_contract(
+    rt: PythonObject, lt: PythonObject, i0: PythonObject, nb: PythonObject, gram: PythonObject, hr: PythonObject,
+    want_h: PythonObject, seq_path: PythonObject, seq_prefix: PythonObject,
+) raises -> PythonObject:
+    var blas_seq = _blas(seq_path, seq_prefix)
+    var nat3 = Int(py=gram.shape[0])
+    var nbv = Int(py=nb)
+    var wh = Bool(py=want_h)
+    hess_dfk_contract_core(
+        blas_seq, Int(py=rt.shape[0]), nat3, nbv, Int(py=rt.shape[1]) // (nat3 * nbv),
+        Int(py=hr.shape[1]) if wh else 0, Int(py=i0), f64ptr(rt), f64ptr(lt), wh, f64ptr(gram), f64ptr(hr),
     )
     return PythonObject(None)
 

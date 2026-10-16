@@ -565,12 +565,15 @@ def df_jk_terms(hessobj, mo_coeff=None, mo_occ=None, with_h1=True, tol=1e-14, ve
     N_P = (nabla mu nu|P) come from the Mojo kernel ``int3c2e_ip1`` in blocks
     of auxiliary functions; from each block the J pieces (B-derivatives
     contracted with D and with c), the half-transformed N_P C_o and the
-    exchange pieces of the Fock derivatives are formed with BLAS, the
-    derivatives of the auxiliary centres following from translational
-    invariance.  The exchange vectors rK are then built from N C_o in blocks
-    of occupied orbitals, whitened with the Cholesky factor of V and
-    contracted (the Hessian term) and contracted with V^-1 C^T B C_o (the
-    Fock derivative), never as nao x nao matrices per atom.  The long-range
+    exchange pieces of the Fock derivatives are formed by the Mojo kernels
+    ``hess_df_ip1_j``/``hess_df_ip1_k`` (each output block with one owner
+    thread, sequential BLAS per thread), the derivatives of the auxiliary
+    centres following from translational invariance.  The exchange vectors
+    rK are then built from N C_o in blocks of occupied orbitals
+    (``hess_dfk_rk``, auxiliary functions in parallel), whitened with the
+    Cholesky factor of V and contracted (the Hessian term) and contracted
+    with V^-1 C^T B C_o (the Fock derivative; ``hess_dfk_contract``), never
+    as nao x nao matrices per atom.  The long-range
     exchange of range-separated hybrids is a second pass of the same with
     every integral (three-centre, metric and their derivatives) of
     erf(omega r) / r, as pyscf's ``with_df.range_coulomb(omega)``.
@@ -651,6 +654,11 @@ def _df_jk_pass(hessobj, auxmol, cs, occs, with_j, kcoef, omega, with_h1, tol, l
     seq_path, seq_prefix = worker_blas()
     aoslices = [tuple(int(v) for v in s[2:]) for s in mol.aoslice_by_atom()]
     auxslices = [tuple(int(v) for v in s[2:]) for s in auxmol.aoslice_by_atom()]
+    aoloc = np.array([a0 for a0, _ in aoslices] + [nao], dtype=np.int64)
+    auxloc = np.array([q0 for q0, _ in auxslices] + [naux], dtype=np.int64)
+    if any(a1 != aoloc[i + 1] for i, (_, a1) in enumerate(aoslices)) or \
+            any(q1 != auxloc[i + 1] for i, (_, q1) in enumerate(auxslices)):
+        return None                       # the kernels take the functions of each atom as one range
 
     # fitted densities and the three-centre integrals in the MO basis
     j3c = integrals.int3c2e(mol, auxmol, omega)
@@ -710,8 +718,10 @@ def _df_jk_pass(hessobj, auxmol, cs, occs, with_j, kcoef, omega, with_h1, tol, l
 
     # first-derivative integrals, block by block of auxiliary shells
     with auxmol.with_range_coulomb(omega):
-        v1 = auxmol.intor("int2c2e_ip1", comp=3)                 # (nabla P|Q)
+        v1 = np.ascontiguousarray(auxmol.intor("int2c2e_ip1", comp=3))       # (nabla P|Q)
     ndm = np.empty((3, naux, nao)) if with_j else None           # sum_nu N_P,mu nu D_mu nu
+    dm = np.ascontiguousarray(dm)
+    dummy = np.zeros(1)
     nt = np.zeros((natm, 3, nao, nao)) if with_h1 and with_j else None   # sum_{P on A} c_P N_P
     for ch in kchans:
         ch.g = np.empty((3, nao, naux, ch.nocc))
@@ -733,25 +743,12 @@ def _df_jk_pass(hessobj, auxmol, cs, occs, with_j, kcoef, omega, with_h1, tol, l
         n3 = n3buf[: 3 * npf * nao * nao].reshape(3, npf, nao, nao)
         n3[:] = 0.0
         ext.int3c2e_ip1(tables, aux_tables, boys, sh0, sh1, float(tol), n3, float(omega))
+        # ndm, nt (Coulomb) and per spin g = N C_o, hb, hd (exchange): Mojo kernels, outputs in parallel
         if with_j:
-            ndm[:, p0:p1] = np.einsum("xpmn,mn->xpm", n3, dm)
-        segs = [(ia, max(q0, p0) - p0, min(q1, p1) - p0) for ia, (q0, q1) in enumerate(auxslices)
-                if max(q0, p0) < min(q1, p1)]
-        if with_h1 and with_j:
-            for ia, s0, s1 in segs:
-                nt[ia] += np.einsum("p,xpmn->xmn", coef[p0 + s0: p0 + s1], n3[:, s0:s1])
+            ext.hess_df_ip1_j(n3, p0, dm, ndm, bool(with_h1), coef, nt if with_h1 else dummy, auxloc)
         for ch in kchans:
-            nocc = ch.nocc
-            ch.g[:, :, p0:p1] = (n3.reshape(-1, nao) @ ch.co).reshape(3, npf, nao, nocc).transpose(0, 2, 1, 3)
-            if with_h1:
-                mk = np.matmul(ch.co, ch.ck[p0:p1])              # (npf, nao, nocc): C_o ck_P
-                for x in range(3):
-                    nx = n3[x]
-                    for ia, (a0, a1) in enumerate(aoslices):
-                        if a1 > a0:
-                            ch.hb[ia, x] += nx[:, a0:a1].reshape(-1, nao).T @ mk[:, a0:a1].reshape(-1, nocc)
-                    for ia, s0, s1 in segs:
-                        ch.hd[ia, x] += nx[s0:s1].reshape(-1, nao).T @ mk[s0:s1].reshape(-1, nocc)
+            ext.hess_df_ip1_k(n3, p0, ch.co, ch.g, bool(with_h1), ch.ck, ch.hb if with_h1 else dummy,
+                              ch.hd if with_h1 else dummy, aoloc, auxloc, seq_path, seq_prefix)
         n3 = None
         sh0 = sh1
     n3buf = None
@@ -813,72 +810,26 @@ def _df_jk_pass(hessobj, auxmol, cs, occs, with_j, kcoef, omega, with_h1, tol, l
             gam = gtot = None
             ch.hb = ch.hd = None
             t1 = log.timer_debug1("DF Hessian: exchange Fock derivatives (integral part)", *t1)
-        # rK_a,P[i, j] for a = (A, x), in blocks of rows i, each a contiguous (P, i, j) slab:
-        # -(Z_A,P + Z_A,P^T) + delta(P on A) (Z_P + Z_P^T) - (V_a ck)_P with Z_A,P = C_o[A]^T g_P[A]
-        # and -(V_a ck)_P = delta(P on A) (V1 ck)_P + sum_{Q on A} V1_QP ck_Q
-        # blocks of rows: the response vectors of a block (and their whitened copy) within 1/4 of the
-        # budget and 256 MB each
-        rowb = max(1, min(nocc, int(min(budget / 4, 32e6) / (naux * nocc * (3 * natm + 4)))))
+        # rK_a,P[i, j] for a = (A, x), in blocks of rows i (the Mojo kernel hess_dfk_rk, auxiliary
+        # functions in parallel): -(Z_A,P + Z_A,P^T) + delta(P on A) (Z_P + Z_P^T + (V1 ck)_P)
+        # + sum_{Q on A} V1_QP ck_Q with Z_A,P = C_o[A]^T g_P[A]; whitened with L^-1 (one triangular
+        # solve, the auxiliary index outermost), then the Gram matrix and the Fock-derivative term
+        # sum_P lmo_P (V^-1 r)_P = sum_Q (L^-1 lmo)_Q (L^-1 r)_Q (hess_dfk_contract).  Blocks of rows: the
+        # response vectors of a block within 1/2 of the budget and 256 MB
+        rowb = max(1, min(nocc, int(min(budget / 2, 32e6) / (naux * nocc * 3 * natm))))
         gram = np.zeros((3 * natm, 3 * natm))
-        hr = np.zeros((3 * natm, nmo, nocc)) if with_h1 else None
-        # L^-1 C^T B C_o (nmo, naux', nocc): sum_P lmo_P (V^-1 r)_P = sum_Q (L^-1 lmo)_Q (L^-1 r)_Q
-        lt = np.ascontiguousarray(metric.whiten(ch.lmo.copy()).transpose(1, 0, 2)) if with_h1 else None
+        hr = np.zeros((3 * natm, nmo, nocc)) if with_h1 else np.zeros((1, 1, 1))
+        lt = (np.ascontiguousarray(metric.whiten(ch.lmo.copy()).transpose(1, 0, 2)) if with_h1
+              else np.zeros((1, 1, 1)))
         rkbuf = np.empty(3 * natm * naux * rowb * nocc)
-        rtbuf = np.empty(3 * natm * naux * rowb * nocc)
-        tmpbuf = np.empty(naux * rowb * nocc)
-        zbuf = np.empty(3 * naux * rowb * nocc)
         for i0 in range(0, nocc, rowb):
-            i1 = min(nocc, i0 + rowb)
-            nb = i1 - i0
-            # rk[P, A, x, i, j]: the auxiliary index outermost, so that L^-1 is one triangular solve
-            rk = rkbuf[: 3 * natm * naux * nb * nocc].reshape(naux, natm, 3, nb, nocc)
-            tmp = tmpbuf[: naux * nb * nocc].reshape(naux * nb, nocc)
-            # Z_P + Z_P^T (all atoms) for the delta(P on A) term
-            zall = zbuf[: 3 * naux * nb * nocc].reshape(3, naux, nb, nocc)
-            cot = np.ascontiguousarray(ch.co[:, i0:i1].T)
-            for x in range(3):
-                z1 = (cot @ g[x].reshape(nao, -1)).reshape(nb, naux, nocc)
-                np.matmul(np.ascontiguousarray(g[x][:, :, i0:i1]).reshape(nao, -1).T, ch.co, out=tmp)
-                np.add(z1.transpose(1, 0, 2), tmp.reshape(naux, nb, nocc), out=zall[x])
-            for ia, (a0, a1) in enumerate(aoslices):
-                if a1 == a0:
-                    rk[:, ia] = 0.0
-                    continue
-                ca = -ch.co[a0:a1]
-                cat = np.ascontiguousarray(ca[:, i0:i1].T)
-                for x in range(3):
-                    ga = g[x, a0:a1]                                                     # (nA, naux, nocc)
-                    z1 = (cat @ ga.reshape(a1 - a0, -1)).reshape(nb, naux, nocc)         # -Z_A,P[i, j] at (i, P)
-                    gb = ga if nb == nocc else np.ascontiguousarray(ga[:, :, i0:i1])
-                    np.matmul(gb.reshape(a1 - a0, -1).T, ca, out=tmp)                    # -Z_A,P[j, i] at (P, i)
-                    np.add(z1.transpose(1, 0, 2), tmp.reshape(naux, nb, nocc), out=rk[:, ia, x])
-            z1 = None
-            for ia, (q0, q1) in enumerate(auxslices):
-                if q1 == q0:
-                    continue
-                cq = ch.ck[q0:q1, i0:i1].reshape(q1 - q0, -1)
-                for x in range(3):
-                    r = rk[:, ia, x]
-                    r[q0:q1] += zall[x, q0:q1]
-                    r[q0:q1] += v1ck[x, q0:q1, i0:i1]
-                    r += (v1[x, q0:q1].T @ cq).reshape(naux, nb, nocc)
-            tmp = cot = zall = None
-            rt = metric.whiten(rk.reshape(naux, -1)).reshape(-1, 3 * natm, nb * nocc)
-            rk = None
-            nw = rt.shape[0]
-            rtt = rtbuf[: 3 * natm * nw * nb * nocc].reshape(3 * natm, nw, nb * nocc)
-            rtt[:] = rt.transpose(1, 0, 2)
+            nb = min(nocc, i0 + rowb) - i0
+            rk = rkbuf[: 3 * natm * naux * nb * nocc].reshape(naux, -1)
+            ext.hess_dfk_rk(ch.co, g, ch.ck, v1, v1ck, aoloc, auxloc, i0, nb, rk, seq_path, seq_prefix)
+            rt = np.ascontiguousarray(metric.whiten(rk))
+            ext.hess_dfk_contract(rt, lt, i0, nb, gram, hr, bool(with_h1), seq_path, seq_prefix)
             rt = None
-            r2 = rtt.reshape(3 * natm, -1)
-            gram += r2 @ r2.T
-            if with_h1:
-                ltb = lt[:, :, i0:i1].reshape(nmo, -1)
-                for a in range(3 * natm):
-                    hr[a] += ltb @ rtt[a].reshape(-1, nocc)
-                ltb = None
-            rtt = r2 = None
-        rtbuf = None
-        rkbuf = tmpbuf = zbuf = lt = None
+        rkbuf = lt = None
         de2 -= kappa * gram.reshape(natm, 3, natm, 3).transpose(0, 2, 1, 3)
         t1 = log.timer_debug1("DF Hessian: exchange response", *t1)
         if with_h1:

@@ -19,7 +19,8 @@ a sequential BLAS and private accumulators that are summed at the end.
 """
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
-from _mojo.linalg import F64Ptr, Blas, list_ptr, vaxpy, vscale, vdot_serial, symmetrize_upper
+from std.memory import Pointer
+from _mojo.linalg import F64Ptr, Blas, list_ptr, vaxpy, vfill, vscale, vdot_serial, symmetrize_upper
 from _mojo.dfjk import unpack_row
 
 
@@ -393,3 +394,263 @@ def packed_scatter_core(nq: Int, npk: Int, dst: F64Ptr, nidx: Int, idx: I64Ptr, 
             d[unsafe_offset=Int(idx[unsafe_offset=k])] += wts[unsafe_offset=k] * s[unsafe_offset=k]
 
     parallelize(row, nq)
+
+
+def hess_dfk_rk_core(
+    blas_seq: Blas, nao: Int, naux: Int, nocc: Int, natm: Int, i0: Int, nb: Int, co: F64Ptr, g: F64Ptr,
+    ck: F64Ptr, v1: F64Ptr, v1ck: F64Ptr, aoloc: I64Ptr, auxloc: I64Ptr, rk: F64Ptr,
+) raises:
+    """The exchange response vectors of the DF Hessian (``mojoscf.hessian._df_jk_pass``) for the occupied
+    rows i0 <= i < i0 + nb:
+
+        rk[P, A, x, i, j] = -(Z_AxP[i, j] + Z_AxP[j, i]) + sum_{Q on A} V1_x[Q, P] ck_Q[i, j]
+                            + [P on A] (Z_xP[i, j] + Z_xP[j, i] + (V1_x ck)_P[i, j])
+
+    with Z_AxP = C_o[A]^T g_xP[A] (the rows of the functions of atom A), Z_xP = sum_A Z_AxP,
+    g (3, nao, naux, nocc) = (nabla_x mu nu|P) C_o, V1 (3, naux, naux) = (nabla_x P|Q), ck (naux, nocc, nocc),
+    v1ck (3, naux, nocc, nocc) = V1 ck; atom A owns the functions aoloc[A] <= mu < aoloc[A + 1] and the
+    auxiliary functions auxloc[A] <= P < auxloc[A + 1].  rk (naux, natm, 3, nb, nocc) is overwritten.
+    Tiles of auxiliary functions run in parallel with one BLAS thread each: the V1 term is one GEMM per
+    (tile, A, x), the Z terms two small GEMMs per (P, A, x).
+    """
+    comptime PT = 32
+    if naux == 0 or nb == 0 or nocc == 0:
+        return
+    var nbo = nb * nocc
+    var ldr = natm * 3 * nbo
+    var ntile = (naux + PT - 1) // PT
+    var nwork = max(1, min(parallelism_level(), ntile))
+    var pat = List[Int](length=naux, fill=0)
+    for a in range(natm):
+        for p in range(Int(auxloc[unsafe_offset=a]), Int(auxloc[unsafe_offset=a + 1])):
+            pat[p] = a
+    var buf = List[Float64](length=nwork * 2 * nbo + 1, fill=0.0)
+    var pb = list_ptr(buf)
+    var ppat = Pointer(to=pat)
+
+    def work(w: Int) {imm blas_seq, imm nao, imm naux, imm nocc, imm natm, imm i0, imm nb, imm co, imm g, imm ck, imm v1, imm v1ck, imm aoloc, imm auxloc, imm rk, imm nbo, imm ldr, imm ntile, imm nwork, imm pb, imm ppat}:
+        var za = pb.unsafe_offset(w * 2 * nbo)
+        var zs = za.unsafe_offset(nbo)
+        var t = w
+        while t < ntile:
+            var p0 = t * PT
+            var np_ = min(PT, naux - p0)
+            try:
+                for a in range(natm):
+                    var q0 = Int(auxloc[unsafe_offset=a])
+                    var q1 = Int(auxloc[unsafe_offset=a + 1])
+                    for x in range(3):
+                        # sum_{Q on A} V1_x[Q, P] ck_Q[i, j] for the tile (initialises its rows)
+                        blas_seq.gemm_ld(
+                            True, False, np_, nbo, q1 - q0, 1.0, v1.unsafe_offset(x * naux * naux + q0 * naux + p0),
+                            naux, ck.unsafe_offset(q0 * nocc * nocc + i0 * nocc), nocc * nocc, 0.0,
+                            rk.unsafe_offset(p0 * ldr + (a * 3 + x) * nbo), ldr,
+                        )
+                for p in range(p0, p0 + np_):
+                    var ap = ppat[][p]
+                    for x in range(3):
+                        vfill(zs, nbo, 0.0)
+                        var gp = g.unsafe_offset((x * nao * naux + p) * nocc)        # row mu at mu naux nocc
+                        for a in range(natm):
+                            var m0 = Int(aoloc[unsafe_offset=a])
+                            var m1 = Int(aoloc[unsafe_offset=a + 1])
+                            if m1 == m0:
+                                continue
+                            var ga = gp.unsafe_offset(m0 * naux * nocc)
+                            var ca = co.unsafe_offset(m0 * nocc)
+                            # Z_A[i, j] = sum_{mu on A} C_o[mu, i] g[mu, j], then + Z_A[j, i] = sum_mu g[mu, i] C_o[mu, j]
+                            blas_seq.gemm_ld(True, False, nb, nocc, m1 - m0, 1.0, ca.unsafe_offset(i0), nocc, ga,
+                                             naux * nocc, 0.0, za, nocc)
+                            blas_seq.gemm_ld(True, False, nb, nocc, m1 - m0, 1.0, ga.unsafe_offset(i0), naux * nocc,
+                                             ca, nocc, 1.0, za, nocc)
+                            vaxpy(rk.unsafe_offset(p * ldr + (a * 3 + x) * nbo), nbo, -1.0, za)
+                            vaxpy(zs, nbo, 1.0, za)
+                        var dst = rk.unsafe_offset(p * ldr + (ap * 3 + x) * nbo)
+                        vaxpy(dst, nbo, 1.0, zs)
+                        vaxpy(dst, nbo, 1.0, v1ck.unsafe_offset(((x * naux + p) * nocc + i0) * nocc))
+            except:
+                pass
+            t += nwork
+
+    var nthr = blas_seq.serial_begin()
+    parallelize(work, nwork)
+    blas_seq.serial_end(nthr)
+    _ = buf^
+    _ = pat^
+
+
+def hess_dfk_contract_core(
+    blas_seq: Blas, nw: Int, nat3: Int, nb: Int, nocc: Int, nmo: Int, i0: Int, rt: F64Ptr, lt: F64Ptr,
+    want_h: Bool, gram: F64Ptr, hr: F64Ptr,
+) raises:
+    """gram (nat3 x nat3) += sum_P rt_P rt_P^T and, with ``want_h``, hr[a] (nmo x nocc) += sum_P
+    lt[:, P, i0:i0 + nb] rt[P, a] for the whitened exchange response vectors rt (nw, nat3, nb, nocc) of
+    :func:`hess_dfk_rk_core` and lt (nmo, nw, nocc) (the whitened C^T B C_o); hr is (nat3, nmo, nocc).
+    The Gram matrix over tiles of P (one accumulator per thread), hr over the perturbations a: no
+    transposed copy of rt.
+    """
+    if nw == 0 or nb == 0 or nocc == 0 or nat3 == 0:
+        return
+    var nbo = nb * nocc
+    var nwork = max(1, min(parallelism_level(), nw))
+    var g2 = nat3 * nat3
+    var buf = List[Float64](length=nwork * g2 + 1, fill=0.0)
+    var pb = list_ptr(buf)
+
+    def work_gram(w: Int) {imm blas_seq, imm nw, imm nat3, imm nbo, imm rt, imm pb, imm g2, imm nwork}:
+        var acc = pb.unsafe_offset(w * g2)
+        var p = w
+        while p < nw:
+            try:
+                var r = rt.unsafe_offset(p * nat3 * nbo)
+                blas_seq.gemm(False, True, nat3, nat3, nbo, 1.0, r, r, 1.0, acc)
+            except:
+                pass
+            p += nwork
+
+    var nthr = blas_seq.serial_begin()
+    parallelize(work_gram, nwork)
+    if want_h:
+        var nwa = max(1, min(parallelism_level(), nat3))
+
+        def work_h(w: Int) {imm blas_seq, imm nw, imm nat3, imm nb, imm nocc, imm nmo, imm i0, imm rt, imm lt, imm hr, imm nbo, imm nwa}:
+            var a = w
+            while a < nat3:
+                try:
+                    var h = hr.unsafe_offset(a * nmo * nocc)
+                    for p in range(nw):
+                        blas_seq.gemm_ld(False, False, nmo, nocc, nb, 1.0, lt.unsafe_offset(p * nocc + i0), nw * nocc,
+                                         rt.unsafe_offset((p * nat3 + a) * nbo), nocc, 1.0, h, nocc)
+                except:
+                    pass
+                a += nwa
+
+        parallelize(work_h, nwa)
+    blas_seq.serial_end(nthr)
+    for w in range(nwork):
+        vaxpy(gram, g2, 1.0, pb.unsafe_offset(w * g2))
+    _ = buf^
+
+
+def hess_df_ip1_j_core(
+    nao: Int, npf: Int, p0: Int, naux: Int, n3: F64Ptr, dm: F64Ptr, ndm: F64Ptr, want_nt: Bool, coef: F64Ptr,
+    nt: F64Ptr, natm: Int, auxloc: I64Ptr,
+):
+    """Coulomb contractions of a block of first-derivative integrals n3 (3, npf, nao, nao) = (nabla mu nu|P)
+    for p0 <= P < p0 + npf: ndm[x, P, mu] = sum_nu n3[x, P, mu, nu] D[mu, nu] (ndm (3, naux, nao), the
+    block's rows written) and, with ``want_nt``, nt[A, x] (natm, 3, nao, nao) += sum_{P on A} c_P n3[x, P].
+    Tasks are (x, block of rows mu), so every output row has one owner."""
+    comptime RB = 16
+    var nrb = (nao + RB - 1) // RB
+    var ntask = 3 * nrb
+    var pat = List[Int](length=max(npf, 1), fill=0)
+    for a in range(natm):
+        for p in range(max(Int(auxloc[unsafe_offset=a]), p0), min(Int(auxloc[unsafe_offset=a + 1]), p0 + npf)):
+            pat[p - p0] = a
+    var ppat = Pointer(to=pat)
+
+    def work(t: Int) {imm nao, imm npf, imm p0, imm naux, imm n3, imm dm, imm ndm, imm want_nt, imm coef, imm nt, imm nrb, imm ppat}:
+        var x = t // nrb
+        var m0 = (t % nrb) * RB
+        var m1 = min(nao, m0 + RB)
+        for p in range(npf):
+            var blk = n3.unsafe_offset((x * npf + p) * nao * nao)
+            var drow = ndm.unsafe_offset((x * naux + p0 + p) * nao)
+            for m in range(m0, m1):
+                drow[unsafe_offset=m] = vdot_serial(blk.unsafe_offset(m * nao), dm.unsafe_offset(m * nao), nao)
+            if want_nt:
+                var c = coef[unsafe_offset=p0 + p]
+                var ntp = nt.unsafe_offset((ppat[][p] * 3 + x) * nao * nao)
+                for m in range(m0, m1):
+                    vaxpy(ntp.unsafe_offset(m * nao), nao, c, blk.unsafe_offset(m * nao))
+
+    parallelize(work, ntask)
+    _ = pat^
+
+
+def hess_df_ip1_k_core(
+    blas_seq: Blas, nao: Int, npf: Int, p0: Int, naux: Int, nocc: Int, n3: F64Ptr, co: F64Ptr, g: F64Ptr,
+    want_h: Bool, ck: F64Ptr, hb: F64Ptr, hd: F64Ptr, natm: Int, aoloc: I64Ptr, auxloc: I64Ptr,
+) raises:
+    """Exchange contractions of a block of first-derivative integrals n3 (3, npf, nao, nao) for one spin:
+    g[x, :, P, :] = n3[x, P] C_o (g (3, nao, naux, nocc), the block's columns written) and, with ``want_h``,
+    with mk_P = C_o ck_P (ck (naux, nocc, nocc)):
+        hb[A, x] (natm, 3, nao, nocc) += sum_P n3[x, P][A rows]^T mk_P[A rows]
+        hd[A, x] += sum_{P on A} n3[x, P]^T mk_P
+    Each output block has one owner: g over (x, P), hb over (A, x, rows), hd over (A, x, rows); one BLAS
+    thread per worker."""
+    comptime RB = 32
+    if npf == 0 or nocc == 0:
+        return
+    var nn = nao * nao
+    var nthr = blas_seq.serial_begin()
+
+    def work_g(t: Int) {imm blas_seq, imm nao, imm npf, imm p0, imm naux, imm nocc, imm n3, imm co, imm g, imm nn}:
+        var x = t // npf
+        var p = t % npf
+        try:
+            blas_seq.gemm_ld(False, False, nao, nocc, nao, 1.0, n3.unsafe_offset((x * npf + p) * nn), nao, co, nocc,
+                             0.0, g.unsafe_offset((x * nao * naux + p0 + p) * nocc), naux * nocc)
+        except:
+            pass
+
+    parallelize(work_g, 3 * npf)
+    if want_h:
+        var mkl = List[Float64](length=npf * nao * nocc + 1, fill=0.0)
+        var mk = list_ptr(mkl)
+
+        def work_mk(p: Int) {imm blas_seq, imm nao, imm p0, imm nocc, imm co, imm ck, imm mk}:
+            try:
+                blas_seq.gemm(False, False, nao, nocc, nocc, 1.0, co, ck.unsafe_offset((p0 + p) * nocc * nocc), 0.0,
+                              mk.unsafe_offset(p * nao * nocc))
+            except:
+                pass
+
+        parallelize(work_mk, npf)
+        var nrb = (nao + RB - 1) // RB
+
+        def work_hb(t: Int) {imm blas_seq, imm nao, imm npf, imm nocc, imm n3, imm mk, imm hb, imm nn, imm nrb, imm aoloc}:
+            var a = t // (3 * nrb)
+            var x = (t // nrb) % 3
+            var r0 = (t % nrb) * RB
+            var nr = min(RB, nao - r0)
+            var m0 = Int(aoloc[unsafe_offset=a])
+            var m1 = Int(aoloc[unsafe_offset=a + 1])
+            if m1 == m0:
+                return
+            try:
+                var dst = hb.unsafe_offset(((a * 3 + x) * nao + r0) * nocc)
+                for p in range(npf):
+                    blas_seq.gemm_ld(True, False, nr, nocc, m1 - m0, 1.0,
+                                     n3.unsafe_offset((x * npf + p) * nn + m0 * nao + r0), nao,
+                                     mk.unsafe_offset((p * nao + m0) * nocc), nocc, 1.0, dst, nocc)
+            except:
+                pass
+
+        parallelize(work_hb, natm * 3 * nrb)
+        var aq = List[Int]()
+        for a in range(natm):
+            if max(Int(auxloc[unsafe_offset=a]), p0) < min(Int(auxloc[unsafe_offset=a + 1]), p0 + npf):
+                aq.append(a)
+        var naq = len(aq)
+        var paq = Pointer(to=aq)
+
+        def work_hd(t: Int) {imm blas_seq, imm nao, imm npf, imm p0, imm nocc, imm n3, imm mk, imm hd, imm nn, imm nrb, imm auxloc, imm paq}:
+            var a = paq[][t // (3 * nrb)]
+            var x = (t // nrb) % 3
+            var r0 = (t % nrb) * RB
+            var nr = min(RB, nao - r0)
+            var s0 = max(Int(auxloc[unsafe_offset=a]), p0) - p0
+            var s1 = min(Int(auxloc[unsafe_offset=a + 1]), p0 + npf) - p0
+            try:
+                var dst = hd.unsafe_offset(((a * 3 + x) * nao + r0) * nocc)
+                for p in range(s0, s1):
+                    blas_seq.gemm_ld(True, False, nr, nocc, nao, 1.0, n3.unsafe_offset((x * npf + p) * nn + r0), nao,
+                                     mk.unsafe_offset(p * nao * nocc), nocc, 1.0, dst, nocc)
+            except:
+                pass
+
+        parallelize(work_hd, naq * 3 * nrb)
+        _ = aq^
+        _ = mkl^
+    blas_seq.serial_end(nthr)
