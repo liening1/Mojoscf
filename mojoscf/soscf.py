@@ -9,14 +9,16 @@ UHF/UKS and ROHF/ROKS objects accelerated by mojoscf, ``gen_g_hop``
 returns the same gradient, Hessian product and diagonal with the product
 from the operators of :mod:`mojoscf.stability`, set up once per macro
 iteration for its orbitals and Fock matrix: Coulomb and exchange from the
-MO-basis DF tensors (or MO-basis ERIs, or one call of the integral-direct
-kernel), the XC kernel response from the factors of the first-order density
-(:mod:`mojoscf.tdscf`).  ROHF objects take pyscf's route through the UHF
-Hessian of the alpha (occupied: occupation > 0) and beta (occupation 2)
-orbitals, folded onto the ROHF rotations.  Symmetry-adapted, solvent,
-dual-basis and GHF objects and the cases :mod:`mojoscf.tdscf` leaves to
-pyscf keep pyscf's ``gen_g_hop``; the solver, its step control and the
-orbital update are pyscf's.
+MO-basis DF tensors, or with exact integrals from the J/K of the first-order
+AO density (Mojo kernels, in-core ERIs or integral-direct: with a handful of
+products per macro iteration this beats transforming the ERIs to the MO
+basis each time), the XC kernel response from the factors of the
+first-order density (:mod:`mojoscf.tdscf`).  ROHF objects take pyscf's
+route through the UHF Hessian of the alpha (occupied: occupation > 0) and
+beta (occupation 2) orbitals, folded onto the ROHF rotations.
+Symmetry-adapted, solvent, dual-basis and GHF objects and the cases
+:mod:`mojoscf.tdscf` leaves to pyscf keep pyscf's ``gen_g_hop``; the solver,
+its step control and the orbital update are pyscf's.
 """
 from __future__ import annotations
 
@@ -77,7 +79,7 @@ def _vo_parts(mf, cs, idx, focks, unrestricted, xc_coeff, xc_occ):
     if any(ch.nocc == 0 or ch.nvir == 0 for ch in chans):
         return None
     parts = tdscf._response_parts(mf, chans, True, True, mf.max_memory, logger.new_logger(mf),
-                                  mo_coeff=xc_coeff, mo_occ=xc_occ, unrestricted=unrestricted)
+                                  mo_coeff=xc_coeff, mo_occ=xc_occ, unrestricted=unrestricted, exact_mo=False)
     if parts is None:
         return None
     two, xc = parts

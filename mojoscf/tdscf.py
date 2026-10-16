@@ -244,11 +244,14 @@ def _operator(td):
     return _rks_operator(kind, chans[0], singlet, xc, two)
 
 
-def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, mo_occ=None, unrestricted=None):
+def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, mo_occ=None, unrestricted=None,
+                    exact_mo=True):
     """``(two, xc)`` of the occupied-virtual response of ``mf`` (RHF/UHF/RKS/UKS) for the channels ``chans``,
     or None when pyscf's AO operator has to run.  The XC kernel is that of the density of ``mo_coeff``,
     ``mo_occ`` (default ``mf``'s); ``unrestricted`` (default: whether ``mf`` is UHF) selects the
     spin-resolved response of two channels (pyscf's UHF response, which ROHF objects also use).
+    Without ``exact_mo`` exact integrals give J/K of the AO densities for every product even when the
+    MO-basis ERIs would fit (few products per set-up).
 
     ``two(xs, ys, jscale)`` gives the Coulomb and exact-exchange parts (see
     :func:`_rks_operator`): from the MO-basis DF tensors, from MO-basis exact
@@ -272,7 +275,7 @@ def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, 
     if cderi is not None:
         two = _df_two_electron(mf, chans, kterms, cderi, need_j, need_b, max_memory, log)
     elif dft.exact_jk_applies(mf):
-        two = _exact_mo_two_electron(mf, chans, kterms, need_j, need_b, max_memory, log)
+        two = _exact_mo_two_electron(mf, chans, kterms, need_j, need_b, max_memory, log) if exact_mo else None
         if two is None:
             two = _exact_two_electron(mf, chans, kterms)
     else:

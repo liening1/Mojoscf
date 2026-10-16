@@ -87,6 +87,26 @@ def test_potential_weights_match_eval_xc_eff(water_grid, xc):
         del ni.eval_xc_eff
 
 
+@pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "b3lyp", "wb97x", "tpss", "r2scan", "m06l"])
+def test_second_order_kernel_matches_eval_xc_eff(water_grid, xc):
+    """vxc and fxc of the written-out chain rule (_eval_xc_eff2) equal pyscf's eval_xc_eff(deriv=2)."""
+    mol, grids = water_grid
+    ni = mdft.NumInt()
+    kind, xctype = mdft._kind(ni, xc), ni._xc_type(xc)
+    dm = scf.hf.init_guess_by_minao(mol)
+    coords, _ = mdft._grid(grids)
+    rho = mdft._rho(mol, coords, kind, np.array([0.55 * dm, 0.45 * dm]))
+    # where the density vanishes the kernel terms (v2sigma2 up to 1e44) cancel to rounding noise
+    keep = rho[:, 0].min(axis=0) > 1e-8
+    for spin, r in ((0, rho[0]), (1, rho)):
+        r = r[..., 0, :] if kind == 0 else r
+        ref = ni.eval_xc_eff(xc, r, deriv=2, xctype=xctype, spin=spin)[1:3]
+        for a, b in zip(mdft._eval_xc_eff2(ni, xc, r, spin), ref):
+            assert np.shape(a) == np.shape(b)
+            a, b = np.asarray(a)[..., keep], np.asarray(b)[..., keep]
+            assert abs(a - b).max() < 1e-12 * abs(b).max()
+
+
 @pytest.mark.parametrize("xc", ["lda,vwn", "pbe", "b3lyp", "tpss", "r2scan"])
 def test_xc_gradient_matches_pyscf(water_grid, xc):
     from pyscf.grad import rks as rks_grad

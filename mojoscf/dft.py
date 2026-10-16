@@ -222,6 +222,129 @@ def _potential_weights(ni, xc_code, xctype, kind, rho, weights, spin):
     return out[0], wv
 
 
+def _xc_eff2(ni, xc_code, rho, xctype, spin):
+    """``(exc, vxc, fxc)`` of pyscf's ``eval_xc_eff(deriv=2)`` for GGA and meta-GGA functionals.
+
+    pyscf's ``transform_xc`` turns libxc's derivatives with respect to
+    (rho, sigma, tau) into those with respect to (rho, grad rho, tau) by a
+    general tensor routine (``_unfold_gga``, three single-threaded passes over
+    (2, nvar, 2, nvar, ngrid) arrays per call, about 0.2 s each for 2e5 grid
+    points); here the chain rule is written out: with D_s(sigma) = d sigma /
+    d grad rho_s (2 grad rho_a for sigma_aa, grad rho_b for sigma_ab, ...),
+
+        f[s, 0, t, j]  = sum_sigma v2rhosigma[s, sigma] D_t(sigma)_j
+        f[s, i, t, j]  = sum_sigma,sigma' v2sigma2[sigma, sigma'] D_s(sigma)_i D_t(sigma')_j
+                         + delta_ij d^2 sigma / d grad rho_s d grad rho_t . vsigma
+        f[s, i, t, 4]  = sum_sigma v2sigmatau[sigma, t] D_s(sigma)_i  (and rho/tau blocks as they are)
+
+    ``rho`` as for ``eval_xc_eff`` ((nvar, ngrid), or (2, nvar, ngrid) for ``spin`` 1).
+    """
+    from pyscf.dft import xc_deriv
+
+    rho = np.asarray(rho, order="C", dtype=np.float64)
+    if xctype == "MGGA" and rho.shape[-2] == 6:
+        rho = np.asarray(rho[..., [0, 1, 2, 3, 5], :], order="C")
+    out = ni.eval_xc1(xc_code, rho, spin, 2, ni.omega)
+    nvar, xlen = xc_deriv._XC_NVAR[xctype, spin]
+    ngrid = out.shape[-1]
+    idx = xc_deriv._product_uniq_indices(xlen, 2)
+    v1 = out[1:1 + xlen]
+    d2 = out[1 + xlen:]
+
+    def f2(x, y):
+        return d2[idx[x, y]]
+
+    mgga = xctype == "MGGA"
+    if spin == 0:
+        g = rho[1:4]
+        vxc = np.empty((nvar, ngrid))
+        vxc[0] = v1[0]
+        np.multiply(g, 2.0 * v1[1], out=vxc[1:4])
+        fxc = np.empty((nvar, nvar, ngrid))
+        fxc[0, 0] = f2(0, 0)
+        np.multiply(g, 2.0 * f2(0, 1), out=fxc[0, 1:4])
+        fxc[1:4, 0] = fxc[0, 1:4]
+        s4 = 4.0 * f2(1, 1)
+        for i in range(3):
+            gi = g[i] * s4
+            for j in range(i, 3):
+                np.multiply(gi, g[j], out=fxc[1 + i, 1 + j])
+                if j != i:
+                    fxc[1 + j, 1 + i] = fxc[1 + i, 1 + j]
+            fxc[1 + i, 1 + i] += 2.0 * v1[1]
+        if mgga:
+            vxc[4] = v1[2]
+            fxc[0, 4] = fxc[4, 0] = f2(0, 2)
+            np.multiply(g, 2.0 * f2(1, 2), out=fxc[1:4, 4])
+            fxc[4, 1:4] = fxc[1:4, 4]
+            fxc[4, 4] = f2(2, 2)
+        return out[0], vxc, fxc
+
+    ga, gb = rho[0, 1:4], rho[1, 1:4]
+    gs = (ga, gb)
+    # D_s(sigma) for sigma = aa, ab, bb (variables 2, 3, 4): [(factor, gradient)] or None
+    dsig = [[(2.0, ga), (1.0, gb), None], [None, (1.0, ga), (2.0, gb)]]
+    vxc = np.empty((2, nvar, ngrid))
+    vxc[0, 0], vxc[1, 0] = v1[0], v1[1]
+    np.multiply(ga, 2.0 * v1[2], out=vxc[0, 1:4])
+    vxc[0, 1:4] += gb * v1[3]
+    np.multiply(gb, 2.0 * v1[4], out=vxc[1, 1:4])
+    vxc[1, 1:4] += ga * v1[3]
+    if mgga:
+        vxc[0, 4], vxc[1, 4] = v1[5], v1[6]
+
+    def dvec(s, coef):
+        """sum_sigma coef[sigma] D_s(sigma), (3, ngrid); coef[sigma] (ngrid,)."""
+        acc = None
+        for k in range(3):
+            if dsig[s][k] is None:
+                continue
+            fac, g = dsig[s][k]
+            term = g * (fac * coef[k])
+            acc = term if acc is None else acc + term
+        return acc
+
+    fxc = np.empty((2, nvar, 2, nvar, ngrid))
+    # E_t[sigma] = sum_sigma' v2sigma2[sigma, sigma'] D_t(sigma')
+    e = [[dvec(t, [f2(2 + k, 2 + m) for m in range(3)]) for k in range(3)] for t in range(2)]
+    csig = [[2.0 * v1[2], v1[3]], [v1[3], 2.0 * v1[4]]]
+    for s in range(2):
+        for t in range(2):
+            fxc[s, 0, t, 0] = f2(s, t)
+            fxc[s, 0, t, 1:4] = dvec(t, [f2(s, 2 + m) for m in range(3)])
+            fxc[t, 1:4, s, 0] = fxc[s, 0, t, 1:4]
+        for t in range(s, 2):
+            blk = fxc[s, 1:4, t, 1:4]
+            blk[...] = 0.0
+            for k in range(3):
+                if dsig[s][k] is None:
+                    continue
+                fac, g = dsig[s][k]
+                et = e[t][k]
+                for i in range(3):
+                    blk[i] += (fac * g[i]) * et
+            for i in range(3):
+                blk[i, i] += csig[s][t]
+            if t != s:
+                fxc[t, 1:4, s, 1:4] = blk.transpose(1, 0, 2)
+        if mgga:
+            for t in range(2):
+                fxc[s, 0, t, 4] = fxc[t, 4, s, 0] = f2(s, 5 + t)
+                fxc[s, 4, t, 4] = f2(5 + s, 5 + t)
+                fxc[s, 1:4, t, 4] = dvec(s, [f2(2 + k, 5 + t) for k in range(3)])
+                fxc[t, 4, s, 1:4] = fxc[s, 1:4, t, 4]
+    return out[0], vxc, fxc
+
+
+def _eval_xc_eff2(ni, xc_code, rho, spin):
+    """``(vxc, fxc)`` of ``ni.eval_xc_eff(xc_code, rho, deriv=2, spin=spin)``: :func:`_xc_eff2` for GGA and
+    meta-GGA functionals when ``ni``'s ``eval_xc_eff`` is pyscf's own, otherwise ``ni.eval_xc_eff``."""
+    xctype = ni._xc_type(xc_code)
+    if xctype in ("GGA", "MGGA") and _stock_eval_xc_eff(ni):
+        return _xc_eff2(ni, xc_code, rho, xctype, spin)[1:]
+    return tuple(ni.eval_xc_eff(xc_code, rho, deriv=2, xctype=xctype, spin=spin)[1:3])
+
+
 def _grid(grids):
     if grids.coords is None:
         grids.build()
@@ -392,7 +515,7 @@ class NumInt(pyscf_numint.NumInt):
             assert spin == 1
             rho = _rho_orbitals(mol, coords, kind, list(mo_coeff), [np.asarray(o) for o in mo_occ])
             rho = (rho[0, 0], rho[1, 0]) if kind == 0 else (rho[0], rho[1])
-        vxc, fxc = self.eval_xc_eff(xc_code, rho, deriv=2, xctype=self._xc_type(xc_code), spin=spin)[1:3]
+        vxc, fxc = _eval_xc_eff2(self, xc_code, rho, spin)
         return rho, vxc, fxc
 
     def cache_xc_kernel1(self, mol, grids, xc_code, dm, spin=0, max_memory=2000):
@@ -414,7 +537,7 @@ class NumInt(pyscf_numint.NumInt):
             d = 0.5 * (d + d.transpose(0, 2, 1))
             r = _rho(mol, coords, kind, np.ascontiguousarray(d))
             rho = (r[0, 0], r[1, 0]) if kind == 0 else (r[0], r[1])
-        vxc, fxc = self.eval_xc_eff(xc_code, rho, deriv=2, xctype=self._xc_type(xc_code), spin=spin)[1:3]
+        vxc, fxc = _eval_xc_eff2(self, xc_code, rho, spin)
         return rho, vxc, fxc
 
     def nr_rks_fxc(self, mol, grids, xc_code, dm0=None, dms=None, relativity=0, hermi=0, rho0=None, vxc=None,

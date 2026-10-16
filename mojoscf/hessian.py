@@ -53,14 +53,14 @@ def _xc_inputs(ni, mol, grids, xc_code, mo_coeff, mo_occ, kind):
     if mo_coeff.ndim == 2:
         occ = np.asarray(mo_occ)
         rho = dft._rho_orbitals(mol, coords, kind, [mo_coeff], [occ])[0]
-        vxc, fxc = ni.eval_xc_eff(xc_code, rho[0] if kind == 0 else rho, deriv=2, xctype=ni._xc_type(xc_code))[1:3]
+        vxc, fxc = dft._eval_xc_eff2(ni, xc_code, rho[0] if kind == 0 else rho, 0)
         c = mo_coeff[:, occ > 0]
         dms = ((c * occ[occ > 0]) @ c.T)[None]
     else:
         occs = [np.asarray(o) for o in mo_occ]
         rho = dft._rho_orbitals(mol, coords, kind, list(mo_coeff), occs)
         r = (rho[0, 0], rho[1, 0]) if kind == 0 else (rho[0], rho[1])
-        vxc, fxc = ni.eval_xc_eff(xc_code, r, deriv=2, xctype=ni._xc_type(xc_code), spin=1)[1:3]
+        vxc, fxc = dft._eval_xc_eff2(ni, xc_code, r, 1)
         dms = np.array([(c[:, o > 0] * o[o > 0]) @ c[:, o > 0].T for c, o in zip(mo_coeff, occs)])
     nspin = dms.shape[0]
     nvar = (1, 4, 5)[kind]
