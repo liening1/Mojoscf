@@ -165,7 +165,7 @@ def test_solvent_hessian_matches_pyscf(model, spin, df):
     assert (mhess._exact_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None) == (not df)
     a = h.kernel()
     b = ref.Hessian().kernel()
-    assert abs(a - b).max() < 1e-8, abs(a - b).max()
+    assert abs(a - b).max() < 1e-9, abs(a - b).max()      # 2e-12 (exact) to 2e-11 (DF)
 
 
 @pytest.mark.parametrize("cart", [False, True])

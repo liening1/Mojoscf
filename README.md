@@ -998,8 +998,9 @@ keeps pyscf's driver, nuclear term and CPHF solver and replaces the rest:
   evaluated on the fly (`_mojo/pcm.mojo`; the switching function per block
   of points over the atoms it depends on) and the cached LU of K, so their
   memory grows as n natm instead of n^2 (n surface points: 9 n^2 words for
-  each of d2S and d2D in pyscf).  Same-SCF Hessians agree with pyscf to
-  1e-8 (C-PCM, IEF-PCM, SMD), the individual terms to 1e-11.
+  each of d2S and d2D in pyscf).  Same-SCF Hessians of water agree with
+  pyscf to 2e-12 (exact integrals) and 2e-11 (density fitting; C-PCM,
+  IEF-PCM, SMD, RKS and UKS), the individual terms to 1e-11 or better.
 
 `benchmarks/bench_hessian.py`: pyscf versus `mojoscf.dft.accelerate`, each in
 its own process, density fitting (auxiliary-basis response included, pyscf's
