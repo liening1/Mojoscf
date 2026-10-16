@@ -219,9 +219,14 @@ def test_qmmm_terms_for_other_methods(kind):
     assert abs(mf.e_tot - ref.e_tot) < 1e-10
     g = mf.nuc_grad_method()
     assert isinstance(g, mojo_qmmm._MojoQMMMGrad)
-    # the QM part stays the method's own gradients (mojoscf's are Hartree-Fock only)
-    assert not isinstance(g, (mojoscf.grad.Gradients, mojoscf.grad.UGradients,
-                              mojoscf.grad.DFGradients, mojoscf.grad.DFUGradients))
+    # the QM part: the method's own gradients for Kohn-Sham (mojoscf's HF classes do not apply), mojoscf's
+    # restricted open-shell ones for ROHF
+    hf_grads = (mojoscf.grad.Gradients, mojoscf.grad.UGradients, mojoscf.grad.DFGradients,
+                mojoscf.grad.DFUGradients)
+    if kind == "rohf":
+        assert isinstance(g, mojoscf.grad.ROGradients)
+    else:
+        assert not isinstance(g, hf_grads)
     assert abs(g.kernel() - de_ref).max() < 1e-9
     f = g.grad_hcore_mm(mf.make_rdm1()) + g.grad_nuc_mm()
     assert abs(f - f_ref).max() < 1e-9

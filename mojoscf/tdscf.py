@@ -258,7 +258,8 @@ def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, 
     ERIs (in-core ERIs) or from J/K of the AO transition densities
     (integral-direct); ``xc(factors)`` the XC kernel part (:func:`_xc_response`,
     None for Hartree-Fock).  ``singlet`` selects the RKS kernel (ignored for
-    UHF/UKS); ``need_b`` builds the B-type exchange (x and y vectors).
+    UHF/UKS; None: the orbital Hessian's, see :func:`_xc_response`);
+    ``need_b`` builds the B-type exchange (x and y vectors).
     """
     from pyscf.scf import hf, uhf
 
@@ -270,7 +271,7 @@ def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, 
     kterms = _exchange_terms(mf)
     if kterms is None:
         return None
-    need_j = singlet or unrestricted
+    need_j = singlet is None or singlet or unrestricted
     cderi = dft._df_tensor(mf)
     if cderi is not None:
         two = _df_two_electron(mf, chans, kterms, cderi, need_j, need_b, max_memory, log)
@@ -510,7 +511,10 @@ def _xc_response(mf, ks, unrestricted, singlet, chans, mo_coeff=None, mo_occ=Non
     channel (only the symmetric part of ``L R^T`` enters); the result is
     ``C_o^T V C_v`` of pyscf's response matrix V (``nr_rks_fxc_st`` with the
     halved spin kernel for RKS, ``nr_uks_fxc`` for UKS), the same in the top
-    and bottom blocks since V is symmetric.  With
+    and bottom blocks since V is symmetric.  ``singlet`` None (RKS) is
+    pyscf's orbital-Hessian response (``gen_response(singlet=None)``): the
+    kernel of the spin-unpolarised functional (``nr_rks_fxc``), the same
+    singlet kernel at half the cost of the spin-resolved one.  With
     :class:`mojoscf.dft.NumInt` one fused Mojo pass per batch forms ``V C_o``
     straight from the factors (:func:`mojoscf.dft.fxc_matrices` with
     ``project``); otherwise pyscf's NumInt builds V.
@@ -527,10 +531,13 @@ def _xc_response(mf, ks, unrestricted, singlet, chans, mo_coeff=None, mo_occ=Non
     max_memory = max(2000, mf.max_memory * 0.8 - mem_now)
     mo_coeff = mf.mo_coeff if mo_coeff is None else mo_coeff
     mo_occ = mf.mo_occ if mo_occ is None else mo_occ
-    rho0, vxc, fxc = ni.cache_xc_kernel(mol, mf.grids, mf.xc, mo_coeff, mo_occ, 1)
+    spin0 = not unrestricted and singlet is None
+    rho0, vxc, fxc = ni.cache_xc_kernel(mol, mf.grids, mf.xc, mo_coeff, mo_occ, 0 if spin0 else 1)
     fast = isinstance(ni, dft.NumInt) and dft._fxc_ok(ni, mol, mf.xc)
     kind = dft._kind(ni, mf.xc) if fast else None
-    if not unrestricted:
+    if spin0:
+        fxc = np.asarray(fxc)
+    elif not unrestricted:
         fxc *= 0.5
         if fast:
             fxc = fxc[0, :, 0] + fxc[0, :, 1] if singlet else fxc[0, :, 0] - fxc[0, :, 1]
@@ -544,6 +551,10 @@ def _xc_response(mf, ks, unrestricted, singlet, chans, mo_coeff=None, mo_occ=Non
         if unrestricted:
             dms = np.asarray([lf @ rf.T for lf, rf in factors])
             v1ao = ni.nr_uks_fxc(mol, mf.grids, mf.xc, None, dms, 0, 0, rho0, vxc, fxc, max_memory=max_memory)
+        elif spin0:
+            lf, rf = factors[0]
+            v1ao = [ni.nr_rks_fxc(mol, mf.grids, mf.xc, None, lf @ rf.T, 0, 0, rho0, vxc, fxc,
+                                  max_memory=max_memory)]
         else:
             lf, rf = factors[0]
             v1ao = [ni.nr_rks_fxc_st(mol, mf.grids, mf.xc, None, lf @ rf.T, 0, singlet, rho0, vxc, fxc,

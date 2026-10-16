@@ -88,8 +88,30 @@ def test_newton_scf_matches_pyscf(spin, xc, ro, monkeypatch):
     assert abs(mf.e_tot - ref.e_tot) < 1e-8
 
 
+@pytest.mark.parametrize("spin,xc", [(0, "b3lyp"), (1, "pbe0"), (1, None)])
+def test_solvated_gen_g_hop_matches_pyscf(spin, xc):
+    """PCM objects: the gas-phase products, plus the solvent's _B_dot_x with equilibrium solvation."""
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = (mojoscf.accelerate if xc is None else mojoscf.dft.accelerate)(_make(mol, xc, True).PCM())
+    mf.run()
+    rng = np.random.default_rng(4)
+    c, occ = _rotated(mf, rng), mf.mo_occ
+    ref = _make(mol, xc, True).PCM()
+    pyscf_g_hop = newton_ah.gen_g_hop_uhf if spin else newton_ah.gen_g_hop_rhf
+    for eq in (False, True):
+        mf.with_solvent.equilibrium_solvation = ref.with_solvent.equilibrium_solvation = eq
+        g0, hop0, hdiag0 = pyscf_g_hop(ref, c, occ)
+        g, hop, hdiag = soscf.gen_g_hop(mf.newton(), c, occ)
+        x = rng.normal(size=g0.size)
+        assert _close(g, g0, 1e-9) and _close(hdiag, hdiag0, 1e-9)
+        assert _close(hop(x), hop0(x), 1e-9)
+    e = mf.newton().kernel()
+    assert abs(e - ref.newton().kernel()) < 1e-8
+
+
 def test_pyscf_paths_kept():
-    """Symmetry-adapted, solvent and plain pyscf objects keep pyscf's gen_g_hop."""
+    """Symmetry-adapted, ROHF objects with equilibrium solvation and plain pyscf objects keep pyscf's
+    gen_g_hop."""
     assert newton_ah._SecondOrderRHF.gen_g_hop._mojoscf_orig is newton_ah.gen_g_hop_rhf
     assert newton_ah._SecondOrderUHF.gen_g_hop._mojoscf_orig is newton_ah.gen_g_hop_uhf
     assert newton_ah._SecondOrderROHF.gen_g_hop._mojoscf_orig is newton_ah.gen_g_hop_rohf
@@ -99,6 +121,9 @@ def test_pyscf_paths_kept():
     assert soscf.gen_g_hop(mf.newton(), mf.mo_coeff, mf.mo_occ, with_symmetry=False) is not None
     plain = scf.RHF(mol).run()
     assert soscf.gen_g_hop(plain.newton(), plain.mo_coeff, plain.mo_occ) is None
-    mol = gto.M(atom=WATER, basis="def2-svp", verbose=0)
-    pcm = mojoscf.dft.accelerate(dft.RKS(mol, xc="pbe").density_fit()).PCM().run()
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=1, spin=1, verbose=0)
+    pcm = mojoscf.dft.accelerate(dft.ROKS(mol, xc="pbe").density_fit().PCM())
+    pcm.run()
+    assert soscf.gen_g_hop(pcm.newton(), pcm.mo_coeff, pcm.mo_occ) is not None
+    pcm.with_solvent.equilibrium_solvation = True
     assert soscf.gen_g_hop(pcm.newton(), pcm.mo_coeff, pcm.mo_occ) is None

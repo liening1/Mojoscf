@@ -57,8 +57,10 @@ iteration then runs without touching Python or pyscf's C code at all.
   space (Coulomb and exchange through MO-basis DF tensors or exact
   integrals, the XC kernel in one fused pass): 3.3 to 8.6x faster than
   pyscf's operators for benzene, ferrocene and Cu(II) complexes, with the
-  same excitation energies; excited-state gradients 3.9 to 4.5x faster, and
-  the SCF stability analysis on the same operators 8 to 24x.
+  same excitation energies; excited-state gradients 3.9 to 4.5x faster,
+  the SCF stability analysis on the same operators 8 to 24x, and
+  second-order SCF (`mf.newton()`, also ROKS and with solvent models)
+  2.6 to 4.5x.
 * **Analytical Hessians** (`mojoscf.hessian`): `mf.Hessian()` of
   accelerated Kohn-Sham objects (LDA, GGA, meta-GGA) and of the mojoscf
   Hartree-Fock classes keeps pyscf's driver and computes the XC terms, the
@@ -897,6 +899,77 @@ The eigenvalues agree to the solver's tolerance (1e-4 on the eigenvalue),
 except for [Fe(H2O)6]2+, where pyscf's single starting vector converged to
 the second root, as described above.
 
+### Second-order SCF
+
+`mf.newton()` (`pyscf.soscf.newton_ah`) minimises the energy with pyscf's
+co-iterative augmented-Hessian solver, which applies the orbital Hessian to
+one vector per micro iteration (`h_op` of `gen_g_hop`), forming each product
+as the stability analysis does: an AO first-order density through
+`gen_response` (J/K and the XC kernel in the AO basis) and a projection
+back.  The Hessian is the one of the internal stability analysis at the
+current orbitals, so `mojoscf.soscf` (installed on pyscf's
+`_SecondOrderRHF`, `_SecondOrderUHF` and `_SecondOrderROHF` at import) sets
+up the operators of `mojoscf.stability` once per macro iteration for its
+orbitals, Fock matrix and density and returns pyscf's gradient, Hessian
+products and diagonal: Coulomb and exchange from the MO-basis DF tensors, or
+with exact integrals from the J/K of the first-order AO density (with a
+handful of products per macro iteration, cheaper than transforming the ERIs
+to the MO basis each time), and the XC response from the factors of the
+first-order density.  ROHF/ROKS objects take pyscf's route through the UHF
+Hessian of the alpha (occupation > 0) and beta (occupation 2) orbitals,
+folded onto the ROHF rotations.  Solvated objects (`mf.PCM()`, SMD, ...)
+get the products of pyscf's solvated `gen_response`: the gas-phase ones,
+plus with `with_solvent.equilibrium_solvation` the solvent's `_B_dot_x` of
+the first-order densities (the Mojo PCM kernels when the solvent has them).
+The solver, its step control and keyframes and the orbital update stay
+pyscf's; the products agree with pyscf's to about 1e-13 (relative) on
+orbitals away from convergence for RHF/RKS,
+UHF/UKS and ROHF/ROKS with global and range-separated hybrids and
+meta-GGAs, DF or exact (`tests/test_soscf.py`).  Each product still needs a
+grid pass of the XC kernel for its single vector, which cannot share the
+basis-function values with other vectors as a Davidson iteration does; for
+one GGA vector the kernel forms the projection with one GEMM instead of the
+three that a batch of vectors shares (0.49 -> 0.38 s per product for
+[Ni(H2O)6]2+, 223k grid points).  The kernel set-up of every macro
+iteration (and of TDDFT, the stability analysis and CPHF) takes the second
+derivatives of the functional by the chain rule written out instead of
+pyscf's general tensor transform (`eval_xc_eff`: 0.89 -> 0.32 s for a
+spin-polarised B3LYP kernel on 223k points, libxc included).  For
+restricted objects it uses the kernel of the spin-unpolarised functional,
+as pyscf's orbital Hessian does (`gen_response(singlet=None)`), rather than
+TDDFT's spin-resolved one.
+
+`benchmarks/bench_soscf.py`: `mf.newton().kernel()` to conv_tol 1e-9 with
+pyscf's default grids, 4 cores of a 2.8 GHz Xeon.  Benzene and the Cu(II)
+complex start from pyscf's initial guess (minao).  Ferrocene and
+[Ni(H2O)6]2+ start as in a geometry optimisation step, from the density of
+the converged SCF at a nearby geometry (pyscf's DIIS; the same density for
+both codes).
+
+| system | ints | nao | pyscf [s] | mojoscf [s] | x | macro iterations | Hessian products | J/K builds | E [Eh] (difference between the codes) |
+|---------------------------------------------------------------|-------|----:|------:|-----:|-----:|---:|---:|---:|----------------------------|
+| benzene / def2-SVP B3LYP (RKS)                                 | exact | 114 |  11.9 |  4.5 | 2.7x |  3 | 11 |  21 | -232.0842901184 (3e-13)    |
+| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP (UKS)                    | DF    | 147 | 102.6 | 22.8 | 4.5x |  5 | 34 |  52 | -1865.9003816618 (2e-12)   |
+| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP (ROKS)                   | DF    | 147 |  86.3 | 22.6 | 3.8x |  5 | 33 |  50 | -1865.8992676570 (7e-12)   |
+| ferrocene / def2-SVP PBE0 (RKS), Fe-Cp 1.56 -> 1.66 Å          | DF    | 221 |  50.7 | 19.6 | 2.6x |  3 | 13 |  23 | -1649.6998717659 (5e-13)   |
+| [Ni(H2O)6]2+ triplet / def2-SVP B3LYP (UKS), Ni-O 1.95 -> 2.05 Å | DF  | 175 |  40.9 | 12.7 | 3.2x |  2 |  9 |  16 | -1965.9219335802 (2e-12)   |
+
+The macro iterations, Hessian products and J/K builds (pyscf's count:
+products and Fock builds) are the same in both codes.  From the minao
+guess, the solver takes ferrocene and [Ni(H2O)6]2+ through regions of
+negative orbital-Hessian curvature.  There, products that differ only in
+the last bits can send it to a different SCF solution:
+
+* ferrocene: pyscf ended at -1649.49418 Eh and mojoscf at the ground state,
+  -1649.69987 Eh;
+* [Ni(H2O)6]2+: two mojoscf builds whose products agree to 3.5e-16
+  (relative) ended at -1965.92193 Eh (pyscf's solution) and at
+  -1965.87805 Eh; a start from 8 DIIS cycles ended at -1965.89002 Eh, the
+  solution DIIS itself converges to.
+
+For a like-for-like comparison, the table restarts these two from a nearby
+geometry, where the solver stays in the ground state's basin.
+
 ### Analytical Hessians
 
 pyscf's Kohn-Sham Hessian (`pyscf.hessian.rks`/`uks`, with density fitting
@@ -1481,6 +1554,9 @@ de = td.nuc_grad_method().kernel(state=1)        # excited-state gradient (mojos
 # SCF stability analysis (pyscf.scf.stability) with the same response operators
 mo_i, mo_e, stable_i, stable_e = mf.stability(external=True, return_status=True)
 
+# Second-order SCF (pyscf.soscf.newton_ah): the orbital Hessian from the same operators (also ROKS, HF)
+mf = mojoscf.dft.accelerate(dft.UKS(mol, xc="b3lyp").density_fit()).newton().run()
+
 # Analytical Hessians (pyscf.hessian): XC, Coulomb/exchange (DF or exact) and CPHF terms from the Mojo kernels
 hess = mf.Hessian().kernel()                    # (natm, natm, 3, 3), pyscf's driver and conventions
 hess = mojoscf.RHF(mol).run().Hessian().kernel()   # Hartree-Fock too (mf.TDA(), mf.TDHF() likewise)
@@ -1583,6 +1659,7 @@ but slow for more than a few dozen orbitals.
 | TDA/TDDFT/TDHF response, exact integrals | AO transition densities through `get_jk` with `hermi=0` (`_vhf.incore` or libcint + `libcvhf` direct) and the XC kernel | in-core ERIs transformed once to (ov) x (ov) matrices (GEMMs per iteration), or J/K of all transition densities in one integral-direct pass (antisymmetric parts K only); long-range exchange from erf-attenuated Mojo integrals |
 | excited-state gradients (`pyscf.grad.tdrks`/`tduks`/`tdrhf`), exact integrals | derivative J/K of four densities (libcint `int2e_ip1`, `libcvhf`), `_contract_xc_kernel` (Python loops, AO second/third derivatives), Z-vector through `gen_response` | Mojo: the two-electron term as one 8-fold pass over the derivative integrals contracted with density pairs (`grad2e_pairs_core`, also long-range), the XC-kernel contractions in grid passes, Z-vector through the Mojo J/K and XC kernels; pyscf's driver |
 | SCF stability analysis (`mf.stability()`) | orbital Hessian one vector per Davidson call, AO densities through `gen_response` | the TDDFT operators above for all vectors of an iteration (`lib.davidson1`); pyscf's Fock blocks, preconditioner and rotation |
+| Second-order SCF (`mf.newton()`): orbital Hessian products (`gen_g_hop`) | one AO first-order density per product through `gen_response` (J/K and the XC kernel in the AO basis) | the operators of the stability analysis, set up once per macro iteration for its orbitals and density (MO-basis DF tensors, or with exact integrals the Mojo J/K of the first-order AO density; the XC response from the density factors; with a solvent model its `_B_dot_x`); pyscf's solver, step control and orbital update |
 | DF-CASSCF integrals and orbital Hessian (`mcscf.df._ERIS`, `update_jk_in_ah`) | per macro iteration (Q|pq) for all MO pairs written to a temporary HDF5 file and read back for `ppaa`/`papa`; two AO J/K builds per orbital-Hessian step (rank 2 ncore densities, `df_jk.get_jk`) | Mojo transform with the core terms in the same pass (`casscf_mo`: `j_pc`, `k_pc`, the core potential with a rank-ncore SYRK per auxiliary function), (Q|pq) kept in memory for the macro iteration (its memory reused by the next one within a `kernel`) for `ppaa`, `papa`; the orbital-Hessian J/K only for the rows pyscf uses, in the MO basis in one pass (`casscf_ah`: the core-noncore structure of the rotation, the exchange rows from one GEMM per four auxiliary functions); pyscf's driver, FCI solver and orbital optimiser |
 | DF-NEVPT2 integrals (`mrpt.dfnevpt2._ERIS`) and its Sijrs, Srsi, Srs subspaces | four `with_df.ao2mo` transforms (the full (Q|pq) for `ppaa`), (cv|cv) as an (ncore nvir)^2 matrix in memory or on disk; three-index `einsum` contractions | two partial Mojo transforms ((Q|up), (Q|cv)); (pq|uv) from the AO matrices sum_Q E_Q (Q|uv), one per active pair; Sijrs from the DF factors one core orbital at a time (no (cv|cv) matrix; pairs j <= i only); the Srsi and Srs contractions as GEMMs |
 | FCI 3-particle density matrix (`fci.rdm.make_dm123`) and NEVPT2's 4-particle contractions (`mrpt.nevpt2._contract4pdm`) | C kernels over the FCI strings for p >= r >= t (4-particle: one free index of (pq|rs) contracted with a 4-particle matrix) | Mojo: the vectors E_tu|ket>, E_qp|bra> over all determinants, one GEMM per single excitation of each string for the p >= r >= t part (pyscf's `_complete_dm3_` completes it); the 4-particle contractions as the same matrices with the third vector sum_x E_ex W_fx|ci> (W_fx = sum_yz (fx|yz) E_yz) |
@@ -1630,11 +1707,12 @@ mojoscf/
   tdscf.py             TDA/TDDFT/TDHF (pyscf.tdscf) with the response in the occupied-virtual space
   tdgrad.py            excited-state gradients (pyscf.grad.tdrhf/tdrks/tduks) with the Mojo kernels
   stability.py         SCF stability analysis (pyscf.scf.stability) with the occupied-virtual response
+  soscf.py             second-order SCF (pyscf.soscf.newton_ah) with the occupied-virtual orbital Hessian
   hessian.py           analytical Hessians (pyscf.hessian): XC terms, DF and exact Coulomb/exchange terms, MO-basis CPHF
   qmmm.py              QM/MM (pyscf.qmmm) hooks: MM-charge Hamiltonian and gradient terms from the engine
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
-benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py, bench_dft.py, bench_solvent.py, bench_tddft.py, bench_hessian.py, bench_stability.py, bench_casscf.py, bench_nevpt2.py
+benchmarks/            bench_scf.py, bench_kernels.py, bench_large.py, bench_bs.py, bench_integrals.py, bench_grad.py, bench_metals.py, bench_qmmm.py, bench_dft.py, bench_solvent.py, bench_tddft.py, bench_hessian.py, bench_stability.py, bench_soscf.py, bench_casscf.py, bench_nevpt2.py
 tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quartet, batched kets) in _mojo/integrals.mojo
 ```
 
@@ -1675,6 +1753,12 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   internal (RHF/RKS, UHF/UKS) and external RHF/RKS analyses with the
   occupied-virtual operators; ROHF, GHF, the UHF -> GHF analysis,
   point-group symmetry labels and solvent models use pyscf's.
+* **Second-order SCF**: `newton()` objects of RHF/RKS, UHF/UKS and ROHF/ROKS
+  objects accelerated by mojoscf take the orbital Hessian from
+  `mojoscf.soscf`, also with a solvent model.  These keep pyscf's
+  `gen_g_hop`: point-group symmetry (whose forbidden rotations pyscf
+  masks), ROHF/ROKS with equilibrium solvation, the dual-basis Newton
+  solver, GHF, and the cases `mojoscf.tdscf` leaves to pyscf.
 * **DF-CASSCF**: pyscf's `mcscf.CASSCF` (and `mc.state_average_`,
   `mc2step`) of a reference whose `with_df` is a `mojoscf.dft.MojoDF` with
   the tensor in memory or memory-mapped gets its integrals from

@@ -15,8 +15,13 @@ products per macro iteration this beats transforming the ERIs to the MO
 basis each time), the XC kernel response from the factors of the
 first-order density (:mod:`mojoscf.tdscf`).  ROHF objects take pyscf's
 route through the UHF Hessian of the alpha (occupied: occupation > 0) and
-beta (occupation 2) orbitals, folded onto the ROHF rotations.
-Symmetry-adapted, solvent, dual-basis and GHF objects and the cases
+beta (occupation 2) orbitals, folded onto the ROHF rotations.  With a
+solvent model (``mf.PCM()``, SMD, ...) the products are those of pyscf's
+solvated ``gen_response``: the gas-phase response, plus with
+``with_solvent.equilibrium_solvation`` the solvent's ``_B_dot_x`` of the
+first-order density for all vectors at once (the Mojo PCM kernels when the
+solvent has them, :mod:`mojoscf.solvent`).  Symmetry-adapted, dual-basis and
+GHF objects, ROHF with equilibrium solvation and the cases
 :mod:`mojoscf.tdscf` leaves to pyscf keep pyscf's ``gen_g_hop``; the solver,
 its step control and the orbital update are pyscf's.
 """
@@ -54,19 +59,53 @@ def _applies(mf, mo_coeff, with_symmetry):
         return False
     if getattr(mf, "_scf", None) is not None and mf._scf.mol is not mf.mol:
         return False
-    try:
-        from pyscf.solvent._attach_solvent import _Solvation
-
-        if isinstance(mf, _Solvation):
-            return False
-    except ImportError:  # pragma: no cover - older pyscf
-        pass
+    solvent = _solvent(mf)
+    if solvent is not None and (_kind(mf) == "rohf" or not hasattr(solvent, "_B_dot_x")):
+        # pyscf's ROHF route adds the solvent response of each spin's density to that spin only
+        return False
     if isinstance(mf, hf.KohnShamDFT):
         try:
             mf._numint.libxc.test_deriv_order(mf.xc, 2, raise_error=True)
         except NotImplementedError:
             return False
     return True
+
+
+def _solvent(mf):
+    """The solvent object whose response pyscf's ``gen_response`` of ``mf`` adds (equilibrium solvation),
+    or None."""
+    try:
+        from pyscf.solvent._attach_solvent import _Solvation
+    except ImportError:  # pragma: no cover - older pyscf
+        return None
+    if not isinstance(mf, _Solvation) or not mf.with_solvent.equilibrium_solvation:
+        return None
+    return mf.with_solvent
+
+
+def _with_solvent(aop, chans, solvent, dm_scale, scale):
+    """``aop`` plus pyscf's equilibrium solvent response: ``solvent._B_dot_x`` of the first-order density
+    ``dm_scale sum_s (d_s + d_s^T)``, d_s = C_v x_s C_o^T, projected on every channel and scaled by
+    ``scale`` like the rest of the product."""
+    sizes = [ch.nvir * ch.nocc for ch in chans]
+
+    def op(xs):
+        xs = np.asarray(xs).reshape(len(xs), -1)
+        out = np.array(aop(xs))
+        dm1 = 0.0
+        p0 = 0
+        for ch, k in zip(chans, sizes):
+            d = ch.orbv @ xs[:, p0:p0 + k].reshape(-1, ch.nvir, ch.nocc) @ ch.orbo.T
+            dm1 = dm1 + d + d.transpose(0, 2, 1)
+            p0 += k
+        v = solvent._B_dot_x(dm_scale * dm1)
+        p0 = 0
+        for ch, k in zip(chans, sizes):
+            out[:, p0:p0 + k] += scale * (ch.orbv.T @ v @ ch.orbo).reshape(len(xs), k)
+            p0 += k
+        return list(out)
+
+    return op
 
 
 def _vo_parts(mf, cs, idx, focks, unrestricted, xc_coeff, xc_occ):
@@ -78,7 +117,7 @@ def _vo_parts(mf, cs, idx, focks, unrestricted, xc_coeff, xc_occ):
     chans = [tdscf._Channel(c[:, o], c[:, v], np.zeros((len(o), len(v)))) for c, (o, v) in zip(cs, idx)]
     if any(ch.nocc == 0 or ch.nvir == 0 for ch in chans):
         return None
-    parts = tdscf._response_parts(mf, chans, True, True, mf.max_memory, logger.new_logger(mf),
+    parts = tdscf._response_parts(mf, chans, None, True, mf.max_memory, logger.new_logger(mf),
                                   mo_coeff=xc_coeff, mo_occ=xc_occ, unrestricted=unrestricted, exact_mo=False)
     if parts is None:
         return None
@@ -87,11 +126,14 @@ def _vo_parts(mf, cs, idx, focks, unrestricted, xc_coeff, xc_occ):
              reduce(np.dot, (ch.orbv.T, f, ch.orbo))) for ch, f in zip(chans, focks)]
     g = np.hstack([f[2].ravel() for f in fock])
     h_diag = np.hstack([(f[0].diagonal()[:, None] - f[1].diagonal()).ravel() for f in fock])
+    solvent = _solvent(mf)
     if unrestricted:
         # pyscf's h_op: dm1_s = d_s + d_s^T with d_s = C_v x_s C_o^T
-        return g, h_diag, stability._vo_op(chans, fock, two, xc, 1.0, 1.0, 2.0, 1.0)
+        aop = stability._vo_op(chans, fock, two, xc, 1.0, 1.0, 2.0, 1.0)
+        return g, h_diag, aop if solvent is None else _with_solvent(aop, chans, solvent, 1.0, 1.0)
     # pyscf's h_op: dm1 = 2 (d + d^T), and it returns twice the product
-    return g * 2, h_diag * 2, stability._vo_op(chans, fock, two, xc, 1.0, 2.0, 4.0, 2.0)
+    aop = stability._vo_op(chans, fock, two, xc, 1.0, 2.0, 4.0, 2.0)
+    return g * 2, h_diag * 2, aop if solvent is None else _with_solvent(aop, chans, solvent, 2.0, 2.0)
 
 
 def gen_g_hop(mf, mo_coeff, mo_occ, fock_ao=None, h1e=None, with_symmetry=True):

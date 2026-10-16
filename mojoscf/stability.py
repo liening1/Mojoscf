@@ -192,7 +192,7 @@ def internal_hessian(mf):
     if not _supported(mf):
         return None
     chans = _channels(mf)
-    parts = _parts(mf, chans, True)
+    parts = _parts(mf, chans, None)           # pyscf's orbital-Hessian response (gen_response(singlet=None))
     if parts is None:
         return None
     two, xc = parts
