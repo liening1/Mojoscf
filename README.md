@@ -1015,6 +1015,13 @@ the TDDFT table:
 | [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  118.6 |  27.8 | 4.3x |  16.6 |  4.4 | 2.3e-08 | 0.00 |
 | ethylene / def2-SVP ωB97M-V                 |  48 | 1537.4 | 138.4 | 11.1x |  78.7 | 11.4 | 2.8e-09 | 0.00 |
 | [ZnCl4]2- / def2-SVP ωB97M-V                | 103 | 3293.3 | 409.2 | 8.0x | 190.2 | 26.2 | 1.0e-07 | 0.00 |
+| Ni(CO)4 / def2-SVP B3LYP, C-PCM (water)     | 143 |  485.0 |  46.0 | 10.5x |  54.7 | 10.2 | 1.9e-07 | 0.00 |
+| [CuCl4]2- doublet / def2-SVP B3LYP, SMD (water, UKS) | 103 | 278.4 | 41.1 | 6.8x | 32.8 | 5.7 | 2.3e-08 | 0.00 |
+
+In the solvent rows the solvent terms take about 5 s of mojoscf's Ni(CO)4
+Hessian (1460 surface points: the solvent response in the CPHF iterations
+2.4 s, the solvent Fock derivatives 1.5 s, the solvent's second derivatives
+under 1 s); the rest is the Kohn-Sham Hessian of the solute.
 
 In the ωB97M-V rows (VV10 on pyscf's default level-3 NLC grid, 67k points
 for ethylene) most of mojoscf's time is the kernel sums over trial densities
