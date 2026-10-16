@@ -923,6 +923,15 @@ keeps pyscf's driver, nuclear term and CPHF solver and replaces the rest:
   enters the CPHF and the Hessian; the XC kernel part is projected inside the
   grid pass (`xc_h1_core`) and the Coulomb/exchange part comes from the
   density-fitting pass below, so the 3N nao x nao matrices are never formed.
+* **One-electron second derivatives**: the nuclear attraction for all pairs
+  of atoms (basis-function and nuclear centres) from one pass of the charge
+  kernel of the QM/MM section with the nuclei as point charges, and the
+  core potentials (ECP) from one pair of integrals per ECP centre, the
+  derivatives with respect to the centre by translational invariance.
+  pyscf's `hcore_generator` evaluates integrals with the origin at a
+  nucleus for every pair of atoms and the summed core-potential integrals
+  once more (cisplatin with the def2 Pt ECP: 3.3 s -> 1.3 s, 278 -> 12
+  libcint calls; a 32-atom alkane: 4.5 s -> 0.5 s).
 * **Coupled-perturbed equations in the MO basis** with pyscf's solver: the
   operator uses the DF tensor transformed once to the MO basis (Coulomb
   through `(pi|Q)`, exchange as one `nmo x nmo x (nset nocc)` GEMM per

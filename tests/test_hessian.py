@@ -158,7 +158,10 @@ def _check_df_jk(mf, tol=1e-9):
         ref = ref - (alpha - hyb) * ek_lr
     de2, h1 = mhess.df_jk_terms(h)
     assert abs(de2 - ref).max() < tol * abs(ref).max()
-    assert abs(mhess._hess_e1(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ) - e1).max() < 1e-10
+    # the nuclear attraction comes from the Mojo charge kernel: around a metal nucleus its integrals reach
+    # 1e5-1e6 and cancel to O(10) in the contraction, so the two summation orders agree to ~1e-11 relative
+    # (libcint's own two routes, int1e_ipipnuc and the per-nucleus int1e_ipiprinv, to 5e-16 per element)
+    assert abs(mhess._hess_e1(h, mf.mo_energy, mf.mo_coeff, mf.mo_occ) - e1).max() < 1e-9 * max(1.0, abs(e1).max())
     cs = list(mf.mo_coeff) if unrestricted else [mf.mo_coeff]
     os = list(mf.mo_occ) if unrestricted else [mf.mo_occ]
     fs = {}
@@ -372,3 +375,31 @@ def test_hartree_fock_hessian_matches_pyscf(spin, df):
         assert mhess._exact_jk_reason(h, mf.mo_coeff, mf.mo_occ) is None
     assert mhess.cphf_operator(mf) is not None
     assert abs(h.kernel() - ref.Hessian().kernel()).max() < 1e-9
+
+
+@pytest.mark.parametrize("case", ["water-cart", "pd-ecp"])
+def test_one_electron_hessian_terms_match_pyscf(case):
+    """The core-Hamiltonian part of the partial Hessian (kinetic energy, nuclear attraction from the charge
+    kernel with the nuclei as point charges, core potentials once per ECP centre) against pyscf's
+    hcore_generator, contracted with the same density."""
+    from pyscf.hessian import rhf as rhf_hess
+
+    if case == "pd-ecp":
+        mol = gto.M(atom="Pd 0 0 0; Cl 2.31 0 0; Cl -2.1 0.7 0.2", basis="def2-svp", ecp={"Pd": "def2-svp"},
+                    charge=-1, spin=1, verbose=0)
+    else:
+        mol = gto.M(atom=WATER, basis="def2-svp", cart=True, verbose=0)
+    mf = mojoscf.dft.accelerate((dft.UKS if mol.spin else dft.RKS)(mol, xc="pbe").density_fit())
+    mf.grids.level = 0
+    mf.run()
+    h = mf.Hessian()
+    assert mhess._hess_e1_native(h)
+    dm = np.asarray(mf.make_rdm1())
+    dm = dm.sum(axis=0) if dm.ndim == 3 else dm
+    gen = rhf_hess.Hessian.hcore_generator(h, mol)
+    ref = np.zeros((mol.natm, mol.natm, 3, 3))
+    for ia in range(mol.natm):
+        for ja in range(mol.natm):
+            ref[ia, ja] = np.einsum("xypq,pq->xy", gen(ia, ja), dm)
+    got = mhess._hcore_hess(mol, dm)
+    assert abs(got - ref).max() < 1e-10 * abs(ref).max(), abs(got - ref).max() / abs(ref).max()

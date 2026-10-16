@@ -841,7 +841,13 @@ def _df_jk_pass(hessobj, auxmol, cs, occs, with_j, kcoef, omega, with_h1, tol, l
 
 def _hess_e1(hessobj, mo_energy, mo_coeff, mo_occ):
     """The one-electron (core Hamiltonian and overlap) part of the partial Hessian, (natm, natm, 3, 3),
-    as pyscf's ``_partial_hess_ejk`` forms it."""
+    as pyscf's ``_partial_hess_ejk`` forms it.
+
+    With point nuclei and shells up to f (:func:`_hess_e1_native`) the nuclear attraction comes from one
+    pass of the charge kernel (:func:`mojoscf.integrals.mm_hess_terms`, the nuclei as point charges) and the
+    core potentials from one pair of integrals per ECP centre, instead of pyscf's ``hcore_generator``
+    (integrals with the origin at a nucleus for every pair of atoms); otherwise pyscf's.
+    """
     from pyscf.hessian import rhf as rhf_hess
 
     mol = hessobj.mol
@@ -857,6 +863,8 @@ def _hess_e1(hessobj, mo_energy, mo_coeff, mo_occ):
         dm0 = dm0 + (co * o[o > 0]) @ co.T
         dme0 = dme0 + (co * (o * e)[o > 0]) @ co.T
     s1aa, s1ab, _ = rhf_hess.get_ovlp(mol)
+    if _hess_e1_native(hessobj):
+        return -_pair_blocks(mol, s1aa, s1ab, dme0) + _hcore_hess(mol, dm0)
     hcore_deriv = hessobj.hcore_generator(mol)
     aoslices = mol.aoslice_by_atom()
     natm = mol.natm
@@ -871,6 +879,75 @@ def _hess_e1(hessobj, mo_energy, mo_coeff, mo_occ):
         for ja in range(ia):
             e1[ja, ia] = e1[ia, ja].T
     return e1
+
+
+def _hess_e1_native(hessobj):
+    """True if :func:`_hcore_hess` replaces pyscf's ``hcore_generator`` for this Hessian object: pyscf's own
+    generator (no X2C, no subclass override), point nuclei, no pseudopotentials, shells up to f."""
+    from pyscf import gto
+    from pyscf.hessian import rhf as rhf_hess
+
+    mol = hessobj.mol
+    if getattr(hessobj.base, "with_x2c", None) or mol._pseudo:
+        return False
+    if type(hessobj).hcore_generator is not rhf_hess.HessianBase.hcore_generator:
+        return False
+    if np.any(mol._env[mol._atm[:, gto.PTR_ZETA]] != 0):      # finite nuclear charge distributions
+        return False
+    return integrals.mm_hess_supported(mol)
+
+
+def _atom_onehot(mol):
+    onehot = np.zeros((mol.nao_nr(), mol.natm))
+    for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:, 2:]):
+        onehot[p0:p1, ia] = 1.0
+    return onehot
+
+
+def _pair_blocks(mol, aa, ab, dm):
+    """2 (delta_AB sum_{i on A, j} D_ij aa[:, :, i, j] + sum_{i on A, j on B} D_ij ab[:, :, i, j]) (natm, natm, 3, 3):
+    the second derivatives of sum_ij D_ij O_ij for a one-electron operator O without a centre of its own,
+    from aa = (nabla nabla i|O|j) and ab = (nabla i|O|nabla j) (3, 3, nao, nao), D symmetric."""
+    onehot = _atom_onehot(mol)
+    natm = mol.natm
+    rows = np.einsum("xyij,ij->ixy", aa, dm)                          # sum_j D_ij aa[i, j]
+    out = 2.0 * np.einsum("ixy,iA->Axy", rows, onehot)[:, None] * np.eye(natm)[:, :, None, None]
+    out += 2.0 * np.einsum("xyij,ij,iA,jB->ABxy", ab, dm, onehot, onehot, optimize=True)
+    return out
+
+
+def _hcore_hess(mol, dm):
+    """sum_ij D_ij d^2 h_ij / dA dB (natm, natm, 3, 3) for the symmetric density D: kinetic energy
+    (``int1e_ipipkin``, ``int1e_ipkinip``), nuclear attraction (all basis-function and nuclear centres,
+    one pass of :func:`mojoscf.integrals.mm_hess_terms` with point charges -Z at the nuclei) and, per
+    ECP centre C, the core potential from P = (nabla nabla i|U_C|j) and Q = (nabla i|U_C|nabla j)
+    (``ECPscalar_ipiprinv``, ``ECPscalar_iprinvip`` at C; the derivatives with respect to C by
+    translational invariance).  pyscf's ``hcore_generator`` evaluates the integrals with the origin at a
+    nucleus for every pair of atoms and the summed core potentials once more."""
+    from pyscf import gto
+
+    nao = mol.nao_nr()
+    natm = mol.natm
+    dm = np.asarray(dm, dtype=np.float64)
+    dm = 0.5 * (dm + dm.T)
+    kaa = mol.intor("int1e_ipipkin", comp=9).reshape(3, 3, nao, nao)
+    kab = mol.intor("int1e_ipkinip", comp=9).reshape(3, 3, nao, nao)
+    out = _pair_blocks(mol, kaa, kab, dm)
+    charges = np.asarray(mol.atom_charges(), dtype=np.float64)
+    out += integrals.mm_hess_terms(mol, dm, mol.atom_coords(), -charges, np.arange(natm))
+    if mol.has_ecp():
+        onehot = _atom_onehot(mol)
+        for c in sorted(set(int(a) for a in mol._ecpbas[:, gto.ATOM_OF])):
+            with mol.with_rinv_at_nucleus(c):
+                paa = mol.intor("ECPscalar_ipiprinv", comp=9).reshape(3, 3, nao, nao)
+                pab = mol.intor("ECPscalar_iprinvip", comp=9).reshape(3, 3, nao, nao)
+            out += _pair_blocks(mol, paa, pab, dm)
+            # with respect to C: -(d_A + d_B) on every matrix element (2 x the row sums of P + Q per atom)
+            ac = 2.0 * np.einsum("xyij,ij,iA->Axy", paa + pab, dm, onehot, optimize=True)
+            out[:, c] -= ac
+            out[c, :] -= ac.transpose(0, 2, 1)
+            out[c, c] += ac.sum(axis=0)
+    return out
 
 
 def _pyscf_xc_partial(hessobj, mo_coeff, mo_occ):
