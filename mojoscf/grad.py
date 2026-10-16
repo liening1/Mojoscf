@@ -26,7 +26,9 @@ grids (``mojoscf.dft.grad_xc``) to ``grad_2e``:
 
 Results agree with ``pyscf.grad`` / ``pyscf.df.grad`` to the precision of the
 integrals.  With effective core potentials only the ECP derivative integrals
-come from pyscf; with X2C or finite nuclei all one-electron pieces do, the
+come from pyscf (``ECPscalar_iprinv`` once per ECP centre; their sum stands for
+``ECPscalar_ipnuc``, which pyscf evaluates in addition); with X2C or finite
+nuclei all one-electron pieces do, the
 two-electron part still from the engine.  Range-separated operators and
 functionals, non-local correlation, ``grid_response``, ``only_dfj``,
 ``auxbasis_response = False`` and subclasses that override ``get_veff`` or
@@ -80,8 +82,8 @@ class _MojoGrad1eMixin:
     def _mojo_ok(self, mol=None, omega=None):
         """The one-electron pieces can come from the Mojo engine (no X2C or finite nuclei).
 
-        With effective core potentials the ECP derivative integrals
-        (``ECPscalar_ipnuc``, ``ECPscalar_iprinv``) are added from pyscf.
+        With effective core potentials the ECP derivative integrals (``ECPscalar_iprinv``
+        per ECP centre, :meth:`_ecp_ip`) are added from pyscf.
         """
         mol = self.mol if mol is None else mol
         return (
@@ -123,6 +125,29 @@ class _MojoGrad1eMixin:
             self._mojo_ip_cache = cache
         return cache[4]
 
+    _mojo_ecp_cache = None
+
+    def _ecp_ip(self, mol):
+        """({C: (nabla i|U_C|j)}, their sum) for the ECP centres C, (3, nao, nao) each, once per molecule and
+        geometry (keyed as ``_ip_ints``).  The sum is pyscf's ``ECPscalar_ipnuc``; pyscf evaluates it and then
+        every centre again (``ECPscalar_iprinv``), the costliest one-electron integrals of a gradient."""
+        cache = self._mojo_ecp_cache
+        if (
+            cache is None
+            or cache[0] is not mol
+            or not np.array_equal(cache[1], mol._env)
+            or not np.array_equal(cache[2], mol._bas)
+            or not np.array_equal(cache[3], mol._atm)
+        ):
+            env, bas, atm = mol._env.copy(), mol._bas.copy(), mol._atm.copy()
+            per = {}
+            for c in sorted(_ecp_atoms(mol)):
+                with mol.with_rinv_at_nucleus(c):
+                    per[c] = mol.intor("ECPscalar_iprinv", comp=3)
+            cache = (mol, env, bas, atm, per, sum(per.values()))
+            self._mojo_ecp_cache = cache
+        return cache[4], cache[5]
+
     def get_hcore(self, mol=None):
         mol = self.mol if mol is None else mol
         if not self._mojo_ok(mol):
@@ -130,7 +155,7 @@ class _MojoGrad1eMixin:
         _, t, v = self._ip_ints(mol)
         h = t + v
         if mol.has_ecp():
-            h = h + mol.intor("ECPscalar_ipnuc", comp=3)
+            h = h + self._ecp_ip(mol)[1]
         return -h
 
     def get_ovlp(self, mol=None):
@@ -146,14 +171,13 @@ class _MojoGrad1eMixin:
         charges = -mol.atom_charges().astype(np.float64)
         aoslices = mol.aoslice_by_atom()
         h1 = self.get_hcore(mol)
-        ecp_atoms = _ecp_atoms(mol)
+        ecp_ip = self._ecp_ip(mol)[0] if mol.has_ecp() else {}
 
         def hcore_deriv(atm_id):
             p0, p1 = aoslices[atm_id, 2:]
             vrinv = integrals.int1e_iprinv(mol, atm_id) * charges[atm_id]
-            if atm_id in ecp_atoms:
-                with mol.with_rinv_at_nucleus(atm_id):
-                    vrinv += mol.intor("ECPscalar_iprinv", comp=3)
+            if atm_id in ecp_ip:
+                vrinv += ecp_ip[atm_id]
             vrinv[:, p0:p1] += h1[:, p0:p1]
             return vrinv + vrinv.transpose(0, 2, 1)
 
@@ -197,7 +221,7 @@ class _MojoGrad1eMixin:
             h1 = self.get_hcore(mol)
             rinv = integrals.int1e_iprinv_dm(mol, dm0_sf)
             charges = mol.atom_charges()
-            ecp_atoms = _ecp_atoms(mol)
+            ecp_ip = self._ecp_ip(mol)[0] if mol.has_ecp() else {}
 
         t0 = (logger.process_clock(), logger.perf_counter())
         log.debug("Computing Gradients of the Coulomb repulsion (Mojo)")
@@ -212,9 +236,8 @@ class _MojoGrad1eMixin:
             p0, p1 = aoslices[ia, 2:]
             if fast_h1:
                 de[k] += 2 * (np.einsum("xij,ij->x", h1[:, p0:p1], dm0_sf[p0:p1]) - charges[ia] * rinv[ia])
-                if ia in ecp_atoms:
-                    with mol.with_rinv_at_nucleus(ia):
-                        de[k] += 2 * np.einsum("xij,ij->x", mol.intor("ECPscalar_iprinv", comp=3), dm0_sf)
+                if ia in ecp_ip:
+                    de[k] += 2 * np.einsum("xij,ij->x", ecp_ip[ia], dm0_sf)
             else:
                 de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm0_sf)
             de[k] += de2[ia]

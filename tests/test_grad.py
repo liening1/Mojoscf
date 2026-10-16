@@ -257,6 +257,22 @@ def test_gradient_scanner_follows_geometry():
         assert abs(g - g0).max() < 1e-8
 
 
+def test_ecp_gradient_scanner_follows_geometry():
+    """The ECP derivative integrals are kept per geometry: a scanner moving the atoms recomputes them."""
+    def geom(d):
+        return gto.M(atom=f"Ag 0 0 0; H 0 0 {d}; H 0 {d} 0", basis="def2-svp", ecp={"Ag": "def2-svp"}, charge=1,
+                     spin=0, verbose=0)
+
+    mol = geom(1.62)
+    scanner = mojoscf.grad.DFGradients(scf.RHF(mol).density_fit()).as_scanner()
+    ref_scanner = scf.RHF(mol).density_fit().nuc_grad_method().as_scanner()
+    for d in (1.62, 1.75, 1.62):
+        e, g = scanner(geom(d))
+        e0, g0 = ref_scanner(geom(d))
+        assert abs(e - e0) < 1e-9
+        assert abs(g - g0).max() < 1e-7
+
+
 def _pyscf_df_grad2e(g, mol, dm, unrestricted):
     vhf = g.get_veff(mol, dm)
     de = np.zeros((mol.natm, 3))
