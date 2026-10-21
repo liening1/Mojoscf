@@ -337,7 +337,10 @@ gradients.
   "direct" rows of the table (measured before this change) on that machine:
   34.5 -> 23.7 s (pyscf 73.0 s), 25.8 -> 18.1 s (60.1 s) and 3.4 -> 2.6 s
   (12.9 s), i.e. 3.1x, 3.3x and 5.0x pyscf's speed (2.1-3.8x before), with
-  the same energies; the gradients are unchanged.
+  the same energies.  Their gradients, after the derivative integrals were
+  moved to the ket side and batched as well (*Gradient two-electron term*
+  below): 12.2 -> 9.3 s (pyscf 41.9 s), 3.8 -> 2.7 s (17.5 s) and
+  1.6 -> 1.2 s (7.3 s), i.e. 4.5x, 6.5x and 6.1x.
 
 ### DF-CASSCF of metal complexes
 
@@ -1342,12 +1345,25 @@ The implementation is built around a few decisions, each measured:
   elements of each lane gathered before and its sums added to the matrices
   after (`lanes_digest1`; half the cost per ket of transforming and
   digesting the kets one at a time).  The other quartets are digested by
-  `digest_cd`, unrolled over the ket's functions at compile time.  `lanes_preferred` keeps a quartet on the
-  single-quartet path where per-class timings showed that to be faster
-  (kets with five or more primitive pairs against a less contracted bra,
-  contracted kets against bras of Hermite degree above 2).  The four-centre
-  derivative integrals of the gradient keep the single-quartet path: there
-  the bra carries six derivative components and batching measured no gain.
+  `digest_cd`, unrolled over the ket's functions at compile time.
+  `lanes_preferred` keeps a quartet on the single-quartet path where
+  per-class timings showed that to be faster (kets with five or more
+  primitive pairs against a less contracted bra, contracted kets against
+  bras of Hermite degree above 2).
+* **Gradient two-electron term** (`grad2e_core`).  Each unique quartet needs
+  the derivatives at three centres (the fourth from translational
+  invariance).  They are taken on the ket side, the less contracted pair:
+  (ab|nabla c d) and (ab|c nabla d) from a six-component ket table, nabla a
+  from a three-component bra table, and the bra pass is dropped when a and b
+  sit on the same atom (only their sum is needed).  Quartets whose ket is
+  the higher pair use the mirror split (nabla a, nabla b on the bra, nabla c
+  unless c and d share an atom).  Kets up to degree 3 are batched as SIMD
+  lanes like the direct J/K's; for the six-component ket pass the integrals
+  are never formed: `V[h] = sum_ij U[ij][h] G[ij]` is contracted with the
+  ket's Hermite matrices directly, a sixth of the products of transforming
+  first.  This replaced one six-component bra pass and one three-component
+  ket pass per quartet on the single-quartet path, where single-primitive
+  quartets ran in scalar code.
 * Higher degrees use a generic kernel with run-time loops and
   register-tiled SIMD products.  Primitive pairs with `mu |AB|^2 > 60` are
   dropped (libcint's `EXPCUTOFF`), shell quartets are Schwarz-screened
