@@ -23,8 +23,8 @@ iteration then runs without touching Python or pyscf's C code at all.
 * **Whole loop in Mojo**: one native call runs all iterations.  The
   Coulomb/exchange matrices are built by Mojo kernels too: from the DF tensor
   or in-core ERIs (`mojoscf.kernels.df_jk`, `jk_s8`), or integral-direct for
-  direct SCF (`mojoscf.integrals.get_jk`, 2.6x faster than pyscf's direct
-  SCF), so a cycle makes no Python call.
+  direct SCF (`mojoscf.integrals.get_jk`, 3-5x faster than pyscf's direct
+  J/K for transition-metal complexes), so a cycle makes no Python call.
 * **Mojo integral engine** (`mojoscf.integrals`): a McMurchie-Davidson
   implementation of the one-electron, electron-repulsion and density-fitting
   integrals over contracted Gaussians, agreeing with libcint to about 1e-13
@@ -320,6 +320,24 @@ gradients.
   16.4 s (pyscf 36.6 s), and for [Fe(H2O)6]2+ / def2-SVP from 0.78 s to
   0.57 s.  The f shells of def2-TZVP give pairs beyond the lane kernels'
   Hermite degree, which keep the single-quartet path.
+* **Integral-direct J/K, second pass.**  A profile of one direct J/K build of
+  ferrocene / def2-SVP (9.4 s of thread time on 4 cores) split it into the
+  lane kernel (3.2 s, two thirds of it the Boys-table gathers: see *SIMD over
+  primitive quartets* below), the J/K digestion (2.9 s, mostly per-quartet
+  overhead: clearing scratch, short loops of varying length), the per-ket
+  transform (1.8 s) and the rest.  The table rows are now loaded whole and
+  transposed in registers, the digestion is unrolled over the ket's
+  functions and adds straight into the matrices, kets with one primitive
+  pair stay one per SIMD lane through the J/K contractions, and the bras with
+  the most primitive pairs (the most kets) are taken first.  One J/K build
+  from the minao density, 4 cores of a 2.8 GHz Xeon, before -> after (pyscf):
+  ferrocene / def2-SVP 2.14 -> 1.54 s (4.65 s), [Fe(H2O)6]2+ / def2-SVP
+  0.76 -> 0.54 s (1.64 s), cisplatin / def2-SVP 0.23 -> 0.16 s (0.75 s),
+  C8H18 / cc-pVDZ 1.13 -> 0.75 s (2.67 s).  The direct SCF of the three
+  "direct" rows of the table (measured before this change) on that machine:
+  34.5 -> 23.7 s (pyscf 73.0 s), 25.8 -> 18.1 s (60.1 s) and 3.4 -> 2.6 s
+  (12.9 s), i.e. 3.1x, 3.3x and 5.0x pyscf's speed (2.1-3.8x before), with
+  the same energies; the gradients are unchanged.
 
 ### DF-CASSCF of metal complexes
 
