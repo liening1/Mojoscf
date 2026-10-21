@@ -1,7 +1,7 @@
 """SCF stability analysis (mojoscf.stability) against pyscf.scf.stability."""
 import numpy as np
 import pytest
-from pyscf import dft, gto, scf
+from pyscf import dft, gto, lib, scf
 from pyscf.scf import stability as pstab
 from pyscf.soscf import newton_ah
 
@@ -132,3 +132,43 @@ def test_davidson_follows_every_start_vector():
     e, _ = mstab._davidson(lambda vs: [a @ v for v in vs], xs, precond, 1e-8, lib.logger.new_logger(verbose=0), 3)
     assert abs(np.asarray(e) - np.linalg.eigvalsh(a)[:3]).max() < 1e-6
     assert abs(e[0] - 0.18) < 1e-3
+
+
+@pytest.mark.parametrize("spin, xc, df", [(0, "b3lyp", True), (1, "pbe0", True), (0, None, False)])
+def test_solvated_stability_matches_pyscf(spin, xc, df, monkeypatch):
+    """mf.PCM() objects: as in pyscf's _Solvation.stability the solvent responds (its _B_dot_x of the first-order
+    densities enters the MO-space products, also the triplet one of the RHF -> UHF analysis)."""
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+
+    def make():
+        if xc is None:
+            mf = (scf.UHF if spin else scf.RHF)(mol)
+        else:
+            mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc)
+        mf = (mf.density_fit() if df else mf).PCM()
+        mf.conv_tol = 1e-10
+        return mf
+
+    mf = (mojoscf.accelerate if xc is None else mojoscf.dft.accelerate)(make()).run()
+    ref = make()
+    for key in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(ref, key, getattr(mf, key))
+    x = np.random.default_rng(3).normal(size=(3, mf.mo_occ.size ** 2))
+    with lib.temporary_env(mf.with_solvent, equilibrium_solvation=True), \
+            lib.temporary_env(ref.with_solvent, equilibrium_solvation=True):
+        aop, g, hdiag = mstab.internal_hessian(mf)
+        g0, hop, hdiag0 = (newton_ah.gen_g_hop_uhf if spin else newton_ah.gen_g_hop_rhf)(ref, ref.mo_coeff, ref.mo_occ)
+        assert _close(g, g0, 1e-8) and _close(hdiag, 2 * hdiag0)
+        v = x[:, :g.size]
+        assert _close(aop(list(v)), [2 * hop(w) for w in v])
+        if not spin:
+            hop1, hop2, hd = mstab.external_hessians(mf)
+            r1, rd1, r2, rd2 = pstab._gen_hop_rhf_external(ref)
+            assert _close(hop1(list(v)), [r1(w) for w in v]) and _close(hop2(list(v)), [r2(w) for w in v])
+    # mf.stability() takes the solvated route through the MO-space operators
+    calls = []
+    orig = mstab.internal_hessian
+    monkeypatch.setattr(mstab, "internal_hessian", lambda m: calls.append(1) or orig(m))
+    out = mf.stability(external=not spin, return_status=True)
+    assert calls and not mf.with_solvent.equilibrium_solvation
+    assert out[2:] == ref.stability(external=not spin, return_status=True)[2:]

@@ -5,12 +5,14 @@ pyscf's default grids, density fitting or exact integrals as the case says;
 accelerated with ``mojoscf.dft.accelerate`` for mojoscf, whose
 ``mf.TDA()``/``mf.TDDFT()`` then create the mojoscf.tdscf classes) and solves
 for the lowest excited states with pyscf's Davidson solvers (conv_tol 1e-5).
-Reported: the TD time, the SCF time and the largest difference of the
-excitation energies; with ``--grad`` also the nuclear gradient of the first
-excited state (``td.nuc_grad_method()``, exact-integral cases) and the largest
-difference of the gradients.  Usage:
+The solvated cases run the SCF with ``mf.PCM()`` (C-PCM) or ``mf.SMD()`` in
+water and pyscf's default non-equilibrium TD solvent (``mf.TDA()``: the
+optical dielectric constant 1.78).  Reported: the TD time, the SCF time and
+the largest difference of the excitation energies; with ``--grad`` also the
+nuclear gradient of the first excited state (``td.nuc_grad_method()``,
+exact-integral cases) and the largest difference of the gradients.  Usage:
 
-    python benchmarks/bench_tddft.py [--cases a,b,...] [--grad] [--list]
+    python benchmarks/bench_tddft.py [--cases a,b,...] [--grad] [--list] [--cache FILE]
 """
 from __future__ import annotations
 
@@ -21,7 +23,7 @@ import sys
 
 CU4 = 'square_planar_atoms("Cu", ["NH3"] * 4, [2.03] * 4)'
 
-# key: (label, atoms, basis, charge, spin, xc, method, nstates, density fitting)
+# key: (label, atoms, basis, charge, spin, xc, method, nstates, density fitting[, solvent model])
 CASES = {
     "bz-b3lyp-tddft": ("benzene / def2-SVP B3LYP, TDDFT", "BENZENE_ATOMS", "def2-svp", 0, 0, "b3lyp", "TDDFT", 10, True),
     "fc-pbe0-tda": ("ferrocene / def2-SVP PBE0, TDA", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", "TDA", 10, True),
@@ -37,6 +39,13 @@ CASES = {
     "fc-pbe0-tda-x": ("ferrocene / def2-SVP PBE0, TDA", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", "TDA", 10, False),
     "fc-pbe-casida-x": ("ferrocene / def2-SVP PBE, TDDFT (Casida)", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe", "TDDFT", 10, False),
     "cu-b3lyp-tda-x": ("[Cu(NH3)4]2+ doublet / def2-SVP B3LYP, TDA (UKS)", CU4, "def2-svp", 2, 1, "b3lyp", "TDA", 8, False),
+    # implicit solvent (water)
+    "fc-pbe0-tda-pcm": ("ferrocene / def2-SVP PBE0, TDA, C-PCM", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0", "TDA",
+                        10, True, "pcm"),
+    "fc-pbe0-tddft-smd": ("ferrocene / def2-SVP PBE0, TDDFT, SMD", "ferrocene_atoms()", "def2-svp", 0, 0, "pbe0",
+                          "TDDFT", 10, True, "smd"),
+    "cu-b3lyp-tda-pcm": ("[Cu(NH3)4]2+ doublet / def2-SVP B3LYP, TDA (UKS), C-PCM", CU4, "def2-svp", 2, 1, "b3lyp",
+                         "TDA", 8, True, "pcm"),
 }
 
 WORKER = r'''
@@ -58,6 +67,11 @@ else:   # the reference must be plain pyscf: mojoscf patches some pyscf function
 mf = (dft.UKS if %(spin)d else dft.RKS)(mol, xc=%(xc)r)
 if %(df)r:
     mf = mf.density_fit()
+if %(solvent)r == "pcm":
+    mf = mf.PCM()
+elif %(solvent)r == "smd":
+    mf = mf.SMD()
+    mf.with_solvent.solvent = "water"
 mf.verbose = 0; mf.conv_tol = 1e-9; mf.max_cycle = 100
 if driver == "mojoscf":
     mojoscf.dft.accelerate(mf)
@@ -75,9 +89,10 @@ print(json.dumps(dict(tscf=tscf, ttd=ttd, e=np.asarray(e).tolist(), conv=bool(np
 
 
 def run(case, driver, bench_dir, grad=False):
-    _, atoms, basis, charge, spin, xc, method, nstates, df = CASES[case]
+    _, atoms, basis, charge, spin, xc, method, nstates, df, *solvent = CASES[case]
     code = WORKER % dict(bench_dir=bench_dir, atoms=atoms, basis=basis, charge=charge, spin=spin, xc=xc,
-                         method=method, nstates=nstates, driver=driver, df=df, grad=grad and not df)
+                         method=method, nstates=nstates, driver=driver, df=df, grad=grad and not df,
+                         solvent=solvent[0] if solvent else None)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -91,7 +106,25 @@ def main():
     ap.add_argument("--cases", default=",".join(CASES))
     ap.add_argument("--grad", action="store_true", help="also the gradient of the first excited state (exact integrals)")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--cache", default=None, help="JSON file keeping pyscf's results between runs")
     args = ap.parse_args()
+    cache = {}
+    if args.cache and os.path.exists(args.cache):
+        with open(args.cache) as f:
+            cache = json.load(f)
+
+    def result(key, driver):
+        tag = f"{key}/{driver}/{'grad' if args.grad else 'td'}"
+        if driver != "pyscf" or tag not in cache:
+            out = run(key, driver, bench_dir, args.grad)
+            if driver != "pyscf":
+                return out
+            cache[tag] = out
+            if args.cache:
+                with open(args.cache, "w") as f:
+                    json.dump(cache, f)
+        return cache[tag]
+
     if args.list:
         print("\n".join(f"{k:18s} {v[0]}{'' if v[8] else ', exact integrals'}" for k, v in CASES.items()))
         return
@@ -101,8 +134,8 @@ def main():
           + (f" | {'grad pyscf':>10s} {'mojoscf':>8s} {'x':>5s} {'max|dg|':>8s}" if args.grad else ""))
     for key in args.cases.split(","):
         name, nstates, df = CASES[key][0], CASES[key][7], CASES[key][8]
-        ref = run(key, "pyscf", bench_dir, args.grad)
-        moj = run(key, "mojoscf", bench_dir, args.grad)
+        ref = result(key, "pyscf")
+        moj = result(key, "mojoscf")
         flag = "" if ref["conv"] and moj["conv"] else "  NOT CONVERGED"
         n = min(len(ref["e"]), len(moj["e"]))
         de = abs(np.array(ref["e"][:n]) - np.array(moj["e"][:n])).max() * 27.211386

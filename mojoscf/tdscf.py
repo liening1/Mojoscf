@@ -38,7 +38,10 @@ other's spinning BLAS threads.
 Applies to RHF/UHF and RKS/UKS objects with pyscf's in-core density fitting
 or exact integrals (the objects :func:`mojoscf.dft.accelerate` returns create
 these classes from ``mf.TDA()``, ``mf.TDDFT()``, ``mf.CasidaTDDFT()``);
-point-group restrictions (``wfnsym``), solvent models, short-range-only
+solvated objects (``mf.PCM()``, SMD, ...) get the solvent's response to the
+transition density as pyscf's ``TDSCFWithSolvent`` adds it (by default the
+non-equilibrium copy with the optical dielectric constant 1.78), next to the
+Coulomb term; point-group restrictions (``wfnsym``), short-range-only
 hybrids, NLC response, DF tensors that do not fit in ``max_memory`` and
 objects with a ``get_jk`` of their own fall back to pyscf's operator.
 
@@ -214,13 +217,9 @@ def _operator(td):
         return None
     if mf.mo_coeff is None or not np.isrealobj(mf.mo_coeff):
         return None
-    try:
-        from pyscf.solvent._attach_solvent import _Solvation
-
-        if isinstance(mf, _Solvation):
-            return None
-    except ImportError:  # pragma: no cover - older pyscf
-        pass
+    solvent = _td_solvent(td)
+    if solvent is False:
+        return None
     ks = isinstance(mf, hf.KohnShamDFT)
     unrestricted = isinstance(mf, uhf.UHF)
     if not (unrestricted or isinstance(mf, hf.RHF)) or isinstance(mf, rohf.ROHF):
@@ -235,7 +234,8 @@ def _operator(td):
         if not td.exclude_nlc and mf.do_nlc():
             return None
     chans = _channels(td)
-    parts = _response_parts(mf, chans, singlet, kind == "rpa", td.max_memory, logger.new_logger(td))
+    parts = _response_parts(mf, chans, singlet, kind == "rpa", td.max_memory, logger.new_logger(td),
+                            solvent=solvent)
     if parts is None:
         return None
     two, xc = parts
@@ -245,7 +245,7 @@ def _operator(td):
 
 
 def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, mo_occ=None, unrestricted=None,
-                    exact_mo=True):
+                    exact_mo=True, solvent=None):
     """``(two, xc)`` of the occupied-virtual response of ``mf`` (RHF/UHF/RKS/UKS) for the channels ``chans``,
     or None when pyscf's AO operator has to run.  The XC kernel is that of the density of ``mo_coeff``,
     ``mo_occ`` (default ``mf``'s); ``unrestricted`` (default: whether ``mf`` is UHF) selects the
@@ -259,7 +259,9 @@ def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, 
     (integral-direct); ``xc(factors)`` the XC kernel part (:func:`_xc_response`,
     None for Hartree-Fock).  ``singlet`` selects the RKS kernel (ignored for
     UHF/UKS; None: the orbital Hessian's, see :func:`_xc_response`);
-    ``need_b`` builds the B-type exchange (x and y vectors).
+    ``need_b`` builds the B-type exchange (x and y vectors).  With a
+    ``solvent`` object ``two`` adds its response to the transition densities
+    wherever J enters (:func:`_solvent_two`).
     """
     from pyscf.scf import hf, uhf
 
@@ -283,7 +285,58 @@ def _response_parts(mf, chans, singlet, need_b, max_memory, log, mo_coeff=None, 
         two = None
     if two is None:
         return None
+    if solvent is not None:
+        two = _solvent_two(two, chans, solvent)
     return two, _xc_response(mf, ks, unrestricted, singlet, chans, mo_coeff, mo_occ)
+
+
+def _td_solvent(td):
+    """The solvent whose response pyscf's ``TDSCFWithSolvent.gen_response`` adds (``td.with_solvent``: the
+    non-equilibrium copy with the optical dielectric constant, or the ground state's), None without a
+    solvent model, False when pyscf's operator has to run (other solvated TD objects)."""
+    try:
+        from pyscf.solvent._attach_solvent import TDSCFWithSolvent, _Solvation
+    except ImportError:  # pragma: no cover - older pyscf
+        return None
+    if not isinstance(td._scf, _Solvation) and not isinstance(td, _Solvation):
+        return None
+    if not isinstance(td, TDSCFWithSolvent) or not hasattr(td.with_solvent, "_B_dot_x"):
+        return False
+    return td.with_solvent
+
+
+def _solvent_two(two, chans, solvent):
+    """``two(xs, ys, jscale)`` plus the solvent response, which enters as J does: for w = x + y (TDA: x) and
+    d_s = C_v w_s^T C_o^T, ``solvent._B_dot_x`` of the symmetric density ``jscale / 2 sum_s (d_s + d_s^T)``
+    (pyscf's ``vind`` densities: 2 d for RKS singlets, d for UKS; triplets, jscale 0, get none), projected
+    C_o^T V C_v on the top and bottom blocks of every channel."""
+
+    def op(xs, ys, jscale):
+        tops, bots = two(xs, ys, jscale)
+        n = len(xs[0])
+        if not jscale or n == 0:
+            return tops, bots
+        ws = xs if ys is None else [x + y for x, y in zip(xs, ys)]
+        dm = 0.0
+        for ch, w in zip(chans, ws):
+            if not _empty(ch, n):
+                d = ch.orbv @ (w.transpose(0, 2, 1) @ ch.orbo.T)
+                dm = dm + d + d.transpose(0, 2, 1)
+        if np.ndim(dm) == 0:
+            return tops, bots
+        v = np.asarray(solvent._B_dot_x(0.5 * jscale * dm)).reshape(n, *dm.shape[1:])
+        tops = list(tops)
+        bots = None if bots is None else list(bots)
+        for s, ch in enumerate(chans):
+            if _empty(ch, n):
+                continue
+            t = ch.orbo.T @ v @ ch.orbv
+            tops[s] = tops[s] + t
+            if bots is not None:
+                bots[s] = bots[s] + t
+        return tops, bots
+
+    return op
 
 
 def _df_two_electron(mf, chans, kterms, cderi, need_j, need_b, max_memory, log):

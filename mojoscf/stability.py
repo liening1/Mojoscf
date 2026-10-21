@@ -19,8 +19,11 @@ preconditioners, thresholds and the orbital rotation are pyscf's; the
 starting space adds unit vectors on the lowest diagonal elements to pyscf's
 single vector (:func:`_guesses`), so that the lowest roots of symmetric
 molecules do not depend on rounding noise.  RHF/RKS (internal and external)
-and UHF/UKS (internal) objects take this route; ROHF, GHF, the UHF -> GHF
-analysis, point-group symmetry labels, solvent models and the cases
+and UHF/UKS (internal) objects take this route, also with a solvent model:
+pyscf's ``_Solvation.stability`` lets the solvent respond (equilibrium
+solvation, unless it is frozen), which adds its ``_B_dot_x`` of the
+first-order densities to the products (:func:`_with_solvent`); ROHF, GHF,
+the UHF -> GHF analysis, point-group symmetry labels and the cases
 :mod:`mojoscf.tdscf` leaves to pyscf run pyscf's code.
 
 >>> mf = mojoscf.dft.accelerate(dft.UKS(mol, xc="b3lyp").density_fit()).run()
@@ -52,18 +55,51 @@ def _supported(mf):
         return False
     if mf.mol.symmetry:
         return False
-    try:
-        from pyscf.solvent._attach_solvent import _Solvation
-
-        if isinstance(mf, _Solvation):
-            return False
-    except ImportError:  # pragma: no cover - older pyscf
-        pass
+    solvent = _solvent(mf)
+    if solvent is not None and not hasattr(solvent, "_B_dot_x"):
+        return False
     if isinstance(mf, rohf.ROHF) or not isinstance(mf, (hf.RHF, uhf.UHF)):
         return False
     if isinstance(mf, hf.KohnShamDFT):
         mf._numint.libxc.test_deriv_order(mf.xc, 2, raise_error=True)
     return True
+
+
+def _solvent(mf):
+    """The solvent object whose response pyscf's ``gen_response`` of ``mf`` adds (equilibrium solvation),
+    or None."""
+    try:
+        from pyscf.solvent._attach_solvent import _Solvation
+    except ImportError:  # pragma: no cover - older pyscf
+        return None
+    if not isinstance(mf, _Solvation) or not mf.with_solvent.equilibrium_solvation:
+        return None
+    return mf.with_solvent
+
+
+def _with_solvent(aop, chans, solvent, dm_scale, scale):
+    """``aop`` plus pyscf's equilibrium solvent response: ``solvent._B_dot_x`` of the first-order density
+    ``dm_scale sum_s (d_s + d_s^T)``, d_s = C_v x_s C_o^T, projected on every channel and scaled by
+    ``scale`` like the rest of the product."""
+    sizes = [ch.nvir * ch.nocc for ch in chans]
+
+    def op(xs):
+        xs = np.asarray(xs).reshape(len(xs), -1)
+        out = np.array(aop(xs))
+        dm1 = 0.0
+        p0 = 0
+        for ch, k in zip(chans, sizes):
+            d = ch.orbv @ xs[:, p0:p0 + k].reshape(-1, ch.nvir, ch.nocc) @ ch.orbo.T
+            dm1 = dm1 + d + d.transpose(0, 2, 1)
+            p0 += k
+        v = solvent._B_dot_x(dm_scale * dm1)
+        p0 = 0
+        for ch, k in zip(chans, sizes):
+            out[:, p0:p0 + k] += scale * (ch.orbv.T @ v @ ch.orbo).reshape(len(xs), k)
+            p0 += k
+        return list(out)
+
+    return op
 
 
 def _channels(mf):
@@ -89,15 +125,19 @@ def _parts(mf, chans, singlet):
     return tdscf._response_parts(mf, chans, singlet, True, mf.max_memory, logger.new_logger(mf))
 
 
-def _fock_blocks(mf, chans):
-    """[(F_vv, F_oo, g = F_vo)] per channel in the MO basis, the Fock matrix built as pyscf's ``gen_g_hop_*``."""
+def _fock_blocks(mf, chans, external=False):
+    """[(F_vv, F_oo, g = F_vo)] per channel in the MO basis, the Fock matrix built as pyscf's ``gen_g_hop_*``
+    (``mf.get_fock``, which adds a solvent model's potential) or, with ``external``, as its
+    ``_gen_hop_rhf_external`` (``get_hcore() + get_veff()``, which does not)."""
     from pyscf.scf import uhf
 
     dm0 = mf.make_rdm1(mf.mo_coeff, mf.mo_occ)
-    if isinstance(mf, uhf.UHF):
-        focks = mf.get_fock(dm=dm0)
-    else:
+    if external:
         focks = [mf.get_hcore() + mf.get_veff(mf.mol, dm0)]
+    else:
+        focks = mf.get_fock(dm=dm0)
+        if not isinstance(mf, uhf.UHF):
+            focks = [focks]
     out = []
     for f, ch in zip(focks, chans):
         out.append((
@@ -197,16 +237,19 @@ def internal_hessian(mf):
         return None
     two, xc = parts
     fock = _fock_blocks(mf, chans)
+    solvent = _solvent(mf)
     if isinstance(mf, uhf.UHF):
         g = np.hstack([f[2].ravel() for f in fock])
         hdiag = np.hstack([(f[0].diagonal()[:, None] - f[1].diagonal()).ravel() for f in fock]) * 2
         # h_op: dm1_s = d_s + d_s^T, d_s = C_v x_s C_o^T
-        return _vo_op(chans, fock, two, xc, 1.0, 1.0, 2.0, 2.0), g, hdiag
+        aop = _vo_op(chans, fock, two, xc, 1.0, 1.0, 2.0, 2.0)
+        return (aop if solvent is None else _with_solvent(aop, chans, solvent, 1.0, 2.0)), g, hdiag
     fvv, foo, gvo = fock[0]
     g = gvo.ravel() * 2
     hdiag = (fvv.diagonal()[:, None] - foo.diagonal()).ravel() * 4
     # h_op: dm1 = 2 (d + d^T), and pyscf's RHF h_op returns twice the product
-    return _vo_op(chans, fock, two, xc, 1.0, 2.0, 4.0, 4.0), g, hdiag
+    aop = _vo_op(chans, fock, two, xc, 1.0, 2.0, 4.0, 4.0)
+    return (aop if solvent is None else _with_solvent(aop, chans, solvent, 2.0, 4.0)), g, hdiag
 
 
 def external_hessians(mf):
@@ -221,12 +264,17 @@ def external_hessians(mf):
     if parts is None:
         return None
     two, xc = parts
-    fock = _fock_blocks(mf, chans)
+    fock = _fock_blocks(mf, chans, external=True)
     fvv, foo, _ = fock[0]
     hdiag = (fvv.diagonal()[:, None] - foo.diagonal()).ravel()
-    # real -> complex: dm1 = 2 (d - d^T), no Coulomb or XC; RHF -> UHF: dm1 = 2 (d + d^T), triplet kernel
+    # real -> complex: dm1 = 2 (d - d^T), no Coulomb, XC or solvent; RHF -> UHF: dm1 = 2 (d + d^T), triplet
+    # kernel, and (equilibrium solvation) the solvent response to dm1, which pyscf's solvated gen_response adds
+    # for the triplet density as well
     hop1 = _vo_op(chans, fock, two, None, -1.0, 0.0, 0.0, 1.0)
     hop2 = _vo_op(chans, fock, two, xc, 1.0, 0.0, 4.0, 1.0)
+    solvent = _solvent(mf)
+    if solvent is not None:
+        hop2 = _with_solvent(hop2, chans, solvent, 2.0, 1.0)
     return hop1, hop2, hdiag
 
 

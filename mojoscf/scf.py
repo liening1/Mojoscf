@@ -135,6 +135,41 @@ def _plain_next(mf, hook, name) -> bool:
     return False
 
 
+def _solvated_next(mf, hook, name) -> bool:
+    """True if the ``name`` that ``mf`` inherits past ``hook`` is pyscf's solvent model's (``_Solvation``),
+    which wraps the method of one of pyscf's plain SCF classes (a TD constructor wrapped by
+    ``_for_tdscf``)."""
+    mro = type(mf).__mro__
+    solvated = False
+    for cls in mro[mro.index(hook) + 1:]:
+        if name in cls.__dict__:
+            if solvated:
+                return cls.__module__ in _BASE_SCF_MODULES
+            if cls.__module__ != "pyscf.solvent._attach_solvent":
+                return False
+            solvated = True
+    return False
+
+
+def _solvated_stability(mf, *args, **kwargs):
+    """pyscf's ``_Solvation.stability`` (the solvent responds to the orbital rotations unless it is frozen)
+    with the orbital Hessian of :mod:`mojoscf.stability`."""
+    from . import stability
+
+    with lib.temporary_env(mf.with_solvent, equilibrium_solvation=not mf.with_solvent.frozen):
+        return stability.stability(mf, *args, **kwargs)
+
+
+def _solvated_td(mf, name, equilibrium_solvation=False):
+    """pyscf's solvated TD object (what ``_Solvation.<name>`` builds: ``_for_tdscf``, by default with the
+    non-equilibrium solvent) around mojoscf's TD class ``name`` (:mod:`mojoscf.tdscf`)."""
+    from pyscf.solvent._attach_solvent import _for_tdscf
+
+    from . import tdscf
+
+    return _for_tdscf(getattr(tdscf, name)(mf), equilibrium_solvation=equilibrium_solvation)
+
+
 def _hook_diis(mf, hook):
     """``DIIS`` of a hooked object: :class:`mojoscf.CDIIS` where pyscf's default CDIIS would run (no
     point-group symmetry, whose error vectors pyscf masks by irrep, no rollback or DIIS file)."""
@@ -636,6 +671,8 @@ class _MojoHFHook:
 
     def stability(self, *args, **kwargs):
         """pyscf's stability analysis with the orbital Hessian of :mod:`mojoscf.stability`."""
+        if _solvated_next(self, _MojoHFHook, "stability"):
+            return _solvated_stability(self, *args, **kwargs)
         if not _plain_next(self, _MojoHFHook, "stability"):
             return super().stability(*args, **kwargs)
         from . import stability
@@ -644,6 +681,8 @@ class _MojoHFHook:
 
     def TDA(self, *args, **kwargs):
         """pyscf's TDA with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
+        if _is_hf(self) and _solvated_next(self, _MojoHFHook, "TDA"):
+            return _solvated_td(self, "TDA", *args, **kwargs)
         if not (_is_hf(self) and _plain_next(self, _MojoHFHook, "TDA")):
             return super().TDA(*args, **kwargs)
         from . import tdscf
@@ -652,6 +691,8 @@ class _MojoHFHook:
 
     def TDHF(self, *args, **kwargs):
         """pyscf's TDHF (RPA) with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
+        if _is_hf(self) and _solvated_next(self, _MojoHFHook, "TDHF"):
+            return _solvated_td(self, "TDHF", *args, **kwargs)
         if not (_is_hf(self) and _plain_next(self, _MojoHFHook, "TDHF")):
             return super().TDHF(*args, **kwargs)
         from . import tdscf

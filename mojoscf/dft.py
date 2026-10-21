@@ -1286,13 +1286,16 @@ class _MojoKSHook:
 
         return hessian.accelerate(super().Hessian())
 
-    # The response methods below are mojoscf's where pyscf's plain RKS/UKS ones would run; a decoration's
-    # own (a solvent model wraps the TD object and sets up the solvent response) is kept.
+    # The response methods below are mojoscf's where pyscf's plain RKS/UKS ones would run; a solvent model's
+    # (pyscf's _Solvation: the solvent response of the stability analysis, the TD wrapper) is rebuilt around
+    # them, any other decoration's own is kept.
 
     def stability(self, *args, **kwargs):
         """pyscf's stability analysis with the orbital Hessian of :mod:`mojoscf.stability`."""
-        from .scf import _plain_next
+        from .scf import _plain_next, _solvated_next, _solvated_stability
 
+        if _solvated_next(self, _MojoKSHook, "stability"):
+            return _solvated_stability(self, *args, **kwargs)
         if not _plain_next(self, _MojoKSHook, "stability"):
             return super().stability(*args, **kwargs)
         from . import stability
@@ -1301,8 +1304,10 @@ class _MojoKSHook:
 
     def TDA(self, *args, **kwargs):
         """pyscf's TDA with the response in the occupied-virtual space (:mod:`mojoscf.tdscf`)."""
-        from .scf import _plain_next
+        from .scf import _plain_next, _solvated_next, _solvated_td
 
+        if _solvated_next(self, _MojoKSHook, "TDA"):
+            return _solvated_td(self, "TDA", *args, **kwargs)
         if not _plain_next(self, _MojoKSHook, "TDA"):
             return super().TDA(*args, **kwargs)
         from . import tdscf
@@ -1311,8 +1316,10 @@ class _MojoKSHook:
 
     def TDDFT(self, *args, **kwargs):
         """pyscf's ``TDDFT`` (full TDDFT for hybrids, the Casida form otherwise) with :mod:`mojoscf.tdscf`."""
-        from .scf import _plain_next
+        from .scf import _plain_next, _solvated_next, _solvated_td
 
+        if _solvated_next(self, _MojoKSHook, "TDDFT"):
+            return _solvated_td(self, "TDDFT", *args, **kwargs)
         if not _plain_next(self, _MojoKSHook, "TDDFT"):
             return super().TDDFT(*args, **kwargs)
         from . import tdscf

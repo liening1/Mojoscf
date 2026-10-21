@@ -305,3 +305,39 @@ def test_hartree_fock_td_hooks():
             assert isinstance(td, mtd._MojoTD) and not isinstance(ref, mtd._MojoTD)
             td.nstates = ref.nstates = 3
             assert abs(td.kernel()[0] - ref.kernel()[0]).max() < 1e-9
+
+
+@pytest.mark.parametrize("spin, xc, df, model", [
+    (0, "pbe0", True, "pcm"), (0, "pbe", True, "pcm"), (0, "b3lyp", False, "pcm"), (1, "b3lyp", True, "pcm"),
+    (0, None, True, "pcm"), (1, None, False, "pcm"), (0, "pbe0", True, "smd"),
+])
+def test_solvated_operators_match_pyscf(spin, xc, df, model):
+    """mf.PCM()/SMD() objects: pyscf's solvated TD wrapper around the MO-space operator, whose solvent term (the
+    non-equilibrium copy, or the ground state's with equilibrium_solvation) enters as J does."""
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+
+    def make():
+        if xc is None:
+            mf = (scf.UHF if spin else scf.RHF)(mol)
+        else:
+            mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc)
+        mf = mf.density_fit() if df else mf
+        mf = mf.PCM() if model == "pcm" else mf.SMD()
+        if model == "smd":
+            mf.with_solvent.solvent = "water"
+        mf.conv_tol = 1e-10
+        return mf
+
+    mf = (mojoscf.accelerate if xc is None else mojoscf.dft.accelerate)(make()).run()
+    ref = make()
+    for key in ("mo_coeff", "mo_occ", "mo_energy", "e_tot", "converged"):
+        setattr(ref, key, getattr(mf, key))
+    for name in ("TDA", "TDHF" if xc is None else "TDDFT"):
+        for eq in (False, True):
+            for singlet in (True,) if spin else (True, False):
+                td_m = getattr(mf, name)(equilibrium_solvation=eq)
+                td_p = getattr(ref, name)(equilibrium_solvation=eq)
+                assert isinstance(td_m, mtd._MojoTD) and td_m.with_solvent.equilibrium_solvation == eq
+                if not spin:
+                    td_m.singlet = td_p.singlet = singlet
+                _check(td_m, td_p, nstates=3, op_tol=1e-10, e_tol=1e-9)
