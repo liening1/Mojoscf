@@ -1291,13 +1291,18 @@ The implementation is built around a few decisions, each measured:
   (`tools/gen_eri_kernel.py` writes the register-blocked code).  The unrolled
   L=4 recursion takes 11 ns instead of over 100 ns with run-time loops.
 * **SIMD over primitive quartets.**  Eight inner primitive pairs are processed
-  together: prefactors, the Boys function (table rows gathered per lane,
-  branch-free blend with the asymptotic form) and the Hermite recursion run as
-  8-wide vectors, the transforms keep eight independent FMA chains in
-  registers and take R as an embedded broadcast operand, and all lanes of a
-  batch accumulate before one store.  Single primitive quartets use a scalar
-  version of the same code (or, in the drivers, the batches below).  Vector
-  operands are 64-byte aligned (cache-line splits had cost 1.45x).
+  together: prefactors, the Boys function (each lane's table row loaded as
+  whole vectors and transposed 8 x 8 in registers, branch-free blend with the
+  asymptotic form) and the Hermite recursion run as 8-wide vectors, the
+  transforms keep eight independent FMA chains in registers and take R as an
+  embedded broadcast operand, and all lanes of a batch accumulate before one
+  store.  Single primitive quartets use a scalar version of the same code
+  (or, in the drivers, the batches below).  Vector operands are 64-byte
+  aligned (cache-line splits had cost 1.45x).  The table rows were first read
+  with hardware gathers, which cost about 20 cycles each on Xeons with the
+  GDS ("Downfall") microcode mitigation: two thirds of an (ss|ss) lane-kernel call
+  (74 ns per eight primitive quartets, 25 ns with the transposes) and 20% of
+  a (pp|pp) one.
 * **SIMD over kets.**  Segmented basis sets (def2, Pople) are dominated by
   quartets whose pairs have one or a few primitive pairs, where vectorising
   over the primitives of one quartet leaves most lanes empty.  `eri_batch`
@@ -1311,7 +1316,15 @@ The implementation is built around a few decisions, each measured:
   transform `(o|k) = sum_{h_k} U[o][h_k] E_K[h_k][k]` runs once per ket
   primitive pair afterwards.  The direct J/K, the in-core ERIs, the
   three-centre integrals and the DF gradient queue each bra's kets by class
-  and flush full batches.  `lanes_preferred` keeps a quartet on the
+  and flush full batches.  In the direct J/K, kets with one primitive pair
+  and two shells of l_c + l_d <= 3 (2l + 1 functions each; 71% of the
+  batched kets of ferrocene / def2-SVP) are queued by (l_c, l_d) instead and
+  stay one ket per lane to the end: `(o|kl) = sum_h U[o][h] E[h][kl]` and the
+  six J/K contractions are vector FMAs over the kets, with the density
+  elements of each lane gathered before and its sums added to the matrices
+  after (`lanes_digest1`; half the cost per ket of transforming and
+  digesting the kets one at a time).  The other quartets are digested by
+  `digest_cd`, unrolled over the ket's functions at compile time.  `lanes_preferred` keeps a quartet on the
   single-quartet path where per-class timings showed that to be faster
   (kets with five or more primitive pairs against a less contracted bra,
   contracted kets against bras of Hermite degree above 2).  The four-centre

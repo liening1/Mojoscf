@@ -257,7 +257,7 @@ def kernel() -> str:
     A('''def eri_kernel_spec[LO: Int, LI: Int](
     nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
     nip: Int, pin: F64Ptr, ei: F64Ptr, si: Int,
-    btab: F64Ptr, m: F64Ptr, rbuf: F64Ptr,
+    btab: F64Ptr, m: F64Ptr,
 ):
     """(outer|inner) for Hermite degrees LO, LI known at compile time; M[o][i] += result.
 
@@ -266,9 +266,9 @@ def kernel() -> str:
     are processed W at a time: prefactors, Boys arguments and the Hermite
     Coulomb recursion are evaluated as SIMD vectors over the W primitive
     quartets (only the table look-up of the Boys function runs per lane) and
-    R is stored as ``rbuf[h W + lane]``; otherwise one primitive quartet at a
+    R is stored as ``rv[h W + lane]``; otherwise one primitive quartet at a
     time with scalar arithmetic.  Either way the transforms take R as an
-    embedded broadcast operand.  ``rbuf`` must be 64-byte aligned.
+    embedded broadcast operand.
     """
     comptime NHO = nherm(LO)
     comptime NHI = nherm(LI)
@@ -279,11 +279,12 @@ def kernel() -> str:
     var opad = padded(nop)
     var ipad = padded(nip)
     var tb = stack_allocation[NHO * SIMAX, Float64, alignment=64]()
-    var rv = rbuf                                   # vector path: two recursion levels, [h][lane]
-    var fbv = rbuf.unsafe_offset(2 * NHL * W)       # vector path: gathered table rows, then scaled F_n
-    var tv = rbuf.unsafe_offset((2 * NHL + L + 8) * W)   # vector path: F_n
-    var rs = rbuf.unsafe_offset((2 * NHL + 2 * L + 9) * W)   # scalar path: two recursion levels
-    var fbs = rs.unsafe_offset(2 * NHL)                        # scalar path: scaled Boys values
+    # recursion scratch on the stack: every offset is a compile-time constant, so these can live in registers
+    var rv = stack_allocation[2 * NHL * W, Float64, alignment=64]()    # vector path: two recursion levels, [h][lane]
+    var fbv = stack_allocation[((L + 15) // 8) * 8 * W, Float64, alignment=64]()   # vector path: table rows, then scaled F_n
+    var tv = stack_allocation[(L + 1) * W, Float64, alignment=64]()    # vector path: F_n
+    var rs = stack_allocation[2 * NHL, Float64, alignment=64]()        # scalar path: two recursion levels
+    var fbs = stack_allocation[L + 1, Float64, alignment=64]()         # scalar path: scaled Boys values
     for ko in range(nop):
         var p = po[unsafe_offset=ko]
         var ip = po[unsafe_offset=opad + ko]
@@ -305,7 +306,7 @@ def kernel() -> str:
                 var pref = pin.unsafe_load[width=W](ipad + ki0) * (TWO_PI_52 * ip) * sqrt(inv_s)
                 var tt = alpha * (x * x + y * y + z * z)
                 # Boys function of all lanes: Taylor expansion about the nearest grid point
-                # (table rows gathered per lane), blended with the asymptotic form for T >= TMAX
+                # (table rows of the lanes), blended with the asymptotic form for T >= TMAX
                 var near = tt.lt(BoysTable.TMAX)
                 var ttc = min(tt, SIMD[DType.float64, W](BoysTable.TMAX))
                 var kk = (ttc * BoysTable.INV_DT + 0.5).cast[DType.int64]()
@@ -318,8 +319,45 @@ def kernel() -> str:
                 var c5 = c4 * dt * 0.2
                 var c6 = c5 * dt * 0.16666666666666666
                 var c7 = c6 * dt * 0.14285714285714285
-                comptime for mm in range(L + 8):
-                    fbv.unsafe_store(mm * W, btab.unsafe_gather(off + SIMD[DType.int64, W](mm)))
+                comptime if W == 8:
+                    # each lane's row loaded whole and the 8 x 8 blocks transposed in registers:
+                    # hardware gathers cost about 20 cycles each on CPUs with the GDS mitigation
+                    comptime for blk in range((L + 15) // 8):
+                        var r0 = btab.unsafe_load[width=8](Int(off[0]) + 8 * blk)
+                        var r1 = btab.unsafe_load[width=8](Int(off[1]) + 8 * blk)
+                        var r2 = btab.unsafe_load[width=8](Int(off[2]) + 8 * blk)
+                        var r3 = btab.unsafe_load[width=8](Int(off[3]) + 8 * blk)
+                        var r4 = btab.unsafe_load[width=8](Int(off[4]) + 8 * blk)
+                        var r5 = btab.unsafe_load[width=8](Int(off[5]) + 8 * blk)
+                        var r6 = btab.unsafe_load[width=8](Int(off[6]) + 8 * blk)
+                        var r7 = btab.unsafe_load[width=8](Int(off[7]) + 8 * blk)
+                        var t0 = r0.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r1)
+                        var t1 = r0.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r1)
+                        var t2 = r2.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r3)
+                        var t3 = r2.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r3)
+                        var t4 = r4.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r5)
+                        var t5 = r4.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r5)
+                        var t6 = r6.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r7)
+                        var t7 = r6.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r7)
+                        var u0 = t0.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t2)
+                        var u1 = t0.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t2)
+                        var u2 = t1.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t3)
+                        var u3 = t1.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t3)
+                        var u4 = t4.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t6)
+                        var u5 = t4.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t6)
+                        var u6 = t5.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t7)
+                        var u7 = t5.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t7)
+                        fbv.unsafe_store((8 * blk) * W, u0.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u4))
+                        fbv.unsafe_store((8 * blk + 1) * W, u2.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u6))
+                        fbv.unsafe_store((8 * blk + 2) * W, u1.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u5))
+                        fbv.unsafe_store((8 * blk + 3) * W, u3.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u7))
+                        fbv.unsafe_store((8 * blk + 4) * W, u0.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u4))
+                        fbv.unsafe_store((8 * blk + 5) * W, u2.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u6))
+                        fbv.unsafe_store((8 * blk + 6) * W, u1.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u5))
+                        fbv.unsafe_store((8 * blk + 7) * W, u3.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u7))
+                else:
+                    comptime for mm in range(L + 8):
+                        fbv.unsafe_store(mm * W, btab.unsafe_gather(off + SIMD[DType.int64, W](mm)))
                 comptime for n in range(L + 1):
                     var fv = (
                         fbv.unsafe_load[width=W](n * W) + c1 * fbv.unsafe_load[width=W]((n + 1) * W)
@@ -392,7 +430,6 @@ def lanes_kernel() -> str:
     A = out.append
     A('''def eri_kernel_lanes[LO: Int, LI: Int](
     nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int, pin: F64Ptr, nvec: Int, btab: F64Ptr, ubuf: F64Ptr,
-    rbuf: F64Ptr,
 ):
     """U[o][hi][lane] = sum_ko sum_ho (-1)^{|ho|} E_O[ko][ho][o] R_{ko,lane}[ho + hi] over nvec W lanes.
 
@@ -403,7 +440,7 @@ def lanes_kernel() -> str:
     the lanes' Hermite functions.  Per outer primitive pair and W lanes the
     prefactors, the Boys function and the Hermite recursion run as in
     ``eri_kernel_spec``'s vector path, then the outer transform adds vector
-    FMAs over the lanes (E_O broadcast).  ``rbuf`` must be 64-byte aligned.
+    FMAs over the lanes (E_O broadcast).
     """
     comptime NHO = nherm(LO)
     comptime NHI = nherm(LI)
@@ -413,9 +450,10 @@ def lanes_kernel() -> str:
     comptime NCH = 4 if NHI <= 2 else 1             # FMA chains per accumulator (split over ho)
     var opad = padded(nop)
     var ipad = nvec * W
-    var rv = rbuf                                   # two recursion levels, [h][lane]
-    var fbv = rbuf.unsafe_offset(2 * NHL * W)       # gathered table rows, then scaled F_n
-    var tv = rbuf.unsafe_offset((2 * NHL + L + 8) * W)   # F_n
+    # recursion scratch on the stack: every offset is a compile-time constant, so these can live in registers
+    var rv = stack_allocation[2 * NHL * W, Float64, alignment=64]()    # two recursion levels, [h][lane]
+    var fbv = stack_allocation[((L + 15) // 8) * 8 * W, Float64, alignment=64]()   # table rows, then scaled F_n
+    var tv = stack_allocation[(L + 1) * W, Float64, alignment=64]()    # F_n
     for x in range(no * NHI * nvec):
         ubuf.unsafe_store(x * W, SIMD[DType.float64, W](0.0))
     for ko in range(nop):

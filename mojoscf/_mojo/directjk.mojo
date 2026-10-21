@@ -23,8 +23,12 @@ primitive pairs (the bra).  The bra's kets are queued by class (Hermite
 degree and component count) and evaluated together by ``eri_batch``: their
 primitive pairs, up to BATCH_LANES of them, are the SIMD lanes of one
 kernel call, so even single-primitive quartets of segmented basis sets run
-vectorised.  Kets beyond the lane kernels' degrees go through
-``eri_quartet`` one at a time.
+vectorised.  Kets of one primitive pair and two shells of degree lc + ld
+<= LMAX1 (most kets of segmented basis sets) are queued by (lc, ld) instead
+and stay one per lane after the kernel: their integrals and all six J/K
+contractions are vector operations over the lanes (``lanes_digest1``).
+Kets beyond the lane kernels' degrees go through ``eri_quartet`` one at a
+time.
 
 With ``omega`` > 0 the integrals are those of the long-range operator
 erf(omega r12) / r12: the bra side of every quartet comes from a second,
@@ -33,15 +37,16 @@ operator remain valid upper bounds.
 """
 from std.atomic import Atomic
 from std.math import sqrt
-from std.memory import Pointer
+from std.memory import Pointer, stack_allocation
 from std.python import PythonObject
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
 from _mojo.linalg import F64Ptr, list_ptr, vfill, vaxpy
 from _mojo.integrals import (
-    Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, I64Ptr, IntPtr, eri_quartet, eri_batch, schwarz_bounds,
+    Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, I64Ptr, IntPtr, eri_quartet, eri_batch, eri_batch_u,
+    schwarz_bounds, W, aligned_addr,
     shell_nfunc, batch_supported, batch_classes, lanes_preferred, int_ptr, KetQueue, attenuate, I_A, I_B, I_LAB,
-    I_NCOMP, I_NP,
+    I_NCOMP, I_NP, I_STRIDE, nherm,
 )
 
 
@@ -215,11 +220,98 @@ def digest_nd[DO_J: Bool, DO_K: Bool, ND: Int](
             vaxpy(ak.unsafe_offset((j0 + j) * nao + l0), ND, scale, kbd.unsafe_offset(j * ND))
 
 
+def digest_cd[DO_J: Bool, DO_K: Bool, NC: Int, ND: Int](
+    blk: F64Ptr, na: Int, nb: Int, i0: Int, j0: Int, k0: Int, l0: Int, nao: Int, scale: Float64,
+    dj: F64Ptr, aj: F64Ptr, dk: F64Ptr, ak: F64Ptr,
+):
+    """``digest`` for a ket of NC x ND functions, unrolled over the ket.
+
+    Sums over the ket stay in registers and every sum is added to the
+    matrices once it is complete, so there is no scratch to clear and the only
+    loops (over the bra's functions) have the same length for all kets of a
+    bra.  The density elements of the ket block are read once per quartet.
+    """
+    comptime NCD = NC * ND
+    var s2 = 2.0 * scale
+    var dcd = stack_allocation[NCD, Float64]()    # D_cd (J)
+    var jcd = stack_allocation[NCD, Float64]()    # 2 s sum_ij (ij|cd) D_ij (J)
+    var dad = stack_allocation[ND, Float64]()     # D_il, D_ik of the current bra row i (K)
+    var dac = stack_allocation[NC, Float64]()
+    var dbd = stack_allocation[ND, Float64]()     # D_jl, D_jk of the current j (K)
+    var dbc = stack_allocation[NC, Float64]()
+    var kad = stack_allocation[ND, Float64]()     # K_il over j, k; K_ik over j, l (row i)
+    var kac = stack_allocation[NC, Float64]()
+    var kbd = stack_allocation[ND, Float64]()     # K_jl over k (one (i, j))
+    comptime if DO_J:
+        comptime for k in range(NC):
+            comptime for l in range(ND):
+                dcd[unsafe_offset=k * ND + l] = dj[unsafe_offset=(k0 + k) * nao + l0 + l]
+                jcd[unsafe_offset=k * ND + l] = 0.0
+    for i in range(na):
+        var ri = (i0 + i) * nao
+        comptime if DO_K:
+            comptime for l in range(ND):
+                dad[unsafe_offset=l] = dk[unsafe_offset=ri + l0 + l]
+                kad[unsafe_offset=l] = 0.0
+            comptime for k in range(NC):
+                dac[unsafe_offset=k] = dk[unsafe_offset=ri + k0 + k]
+                kac[unsafe_offset=k] = 0.0
+        for j in range(nb):
+            var rj = (j0 + j) * nao
+            var g = blk.unsafe_offset((i * nb + j) * NCD)
+            var dij = 0.0
+            comptime if DO_J:
+                dij = s2 * dj[unsafe_offset=ri + j0 + j]
+            comptime if DO_K:
+                comptime for l in range(ND):
+                    dbd[unsafe_offset=l] = dk[unsafe_offset=rj + l0 + l]
+                    kbd[unsafe_offset=l] = 0.0
+                comptime for k in range(NC):
+                    dbc[unsafe_offset=k] = dk[unsafe_offset=rj + k0 + k]
+            var sj = 0.0
+            comptime for k in range(NC):
+                var sac = 0.0
+                var sbc = 0.0
+                comptime for l in range(ND):
+                    var v = g[unsafe_offset=k * ND + l]
+                    comptime if DO_J:
+                        sj += v * dcd[unsafe_offset=k * ND + l]
+                        jcd[unsafe_offset=k * ND + l] += v * dij
+                    comptime if DO_K:
+                        sac += v * dbd[unsafe_offset=l]
+                        sbc += v * dad[unsafe_offset=l]
+                        kad[unsafe_offset=l] += v * dbc[unsafe_offset=k]
+                        kbd[unsafe_offset=l] += v * dac[unsafe_offset=k]
+                comptime if DO_K:
+                    kac[unsafe_offset=k] += sac
+                    ak[unsafe_offset=rj + k0 + k] += scale * sbc
+            comptime if DO_J:
+                aj[unsafe_offset=ri + j0 + j] += s2 * sj
+            comptime if DO_K:
+                comptime for l in range(ND):
+                    ak[unsafe_offset=rj + l0 + l] += scale * kbd[unsafe_offset=l]
+        comptime if DO_K:
+            comptime for k in range(NC):
+                ak[unsafe_offset=ri + k0 + k] += scale * kac[unsafe_offset=k]
+            comptime for l in range(ND):
+                ak[unsafe_offset=ri + l0 + l] += scale * kad[unsafe_offset=l]
+    comptime if DO_J:
+        comptime for k in range(NC):
+            comptime for l in range(ND):
+                aj[unsafe_offset=(k0 + k) * nao + l0 + l] += jcd[unsafe_offset=k * ND + l]
+
+
 def digest_any[DO_J: Bool, DO_K: Bool](
     blk: F64Ptr, na: Int, nb: Int, nc: Int, nd: Int, i0: Int, j0: Int, k0: Int, l0: Int, nao: Int, scale: Float64,
     dj: F64Ptr, aj: F64Ptr, dk: F64Ptr, ak: F64Ptr, loc: F64Ptr,
 ):
-    """``digest``, through ``digest_nd`` for the common function counts of the last shell."""
+    """``digest``, through ``digest_cd`` for kets of s to f shells (spherical, one contraction) and
+    ``digest_nd`` for the common function counts of the last shell."""
+    comptime for KC in range(4):
+        comptime for KD in range(4):
+            if nc == 2 * KC + 1 and nd == 2 * KD + 1:
+                digest_cd[DO_J, DO_K, 2 * KC + 1, 2 * KD + 1](blk, na, nb, i0, j0, k0, l0, nao, scale, dj, aj, dk, ak)
+                return
     if nd == 1:
         digest_nd[DO_J, DO_K, 1](blk, na, nb, nc, i0, j0, k0, l0, nao, scale, dj, aj, dk, ak, loc)
     elif nd == 3:
@@ -264,6 +356,235 @@ def digest_quartet(
             digest_any[False, True](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, pj, qj, pk, qk, ploc)
 
 
+comptime LMAX1 = 3      # kets of ``flush_batch1``: shells of degree lc + ld <= LMAX1
+comptime NCLASS1 = 16   # their classes lc * 4 + ld
+
+
+def single_class(basis: Basis, tab: PairTable, sp: Int) -> Int:
+    """Class ``lc * 4 + ld`` of a pair ``flush_batch1`` takes as a ket, else -1.
+
+    That is a pair with one primitive pair, one contraction per shell and
+    2l + 1 functions per shell, of Hermite degree at most LMAX1.
+    """
+    if tab.get(sp, I_NP) != 1:
+        return -1
+    var c = tab.get(sp, I_A)
+    var d = tab.get(sp, I_B)
+    var lc = basis.l[c]
+    var ld = basis.l[d]
+    if lc + ld > LMAX1 or shell_nfunc(basis, c) != 2 * lc + 1 or shell_nfunc(basis, d) != 2 * ld + 1:
+        return -1
+    return lc * 4 + ld
+
+
+def lanes1_scratch(nfmax: Int, nset: Int) -> Int:
+    """Floats of scratch ``flush_batch1`` needs (bras of at most nfmax functions per shell, nset densities)."""
+    var ncd = 15    # largest ket block of degree <= LMAX1 (d x p)
+    var nc = 7
+    var nomax = nfmax * nfmax
+    return (nherm(LMAX1) * ncd + nomax * ncd + 2 * ncd + 6 * nfmax * nc + 2 * nc + nset * nomax) * W
+
+
+def lanes_digest1[LC: Int, LD: Int](
+    jk: DirectJK, sp: Int, kets: IntPtr, nket: Int, ipad: Int, ubuf: F64Ptr, scr: F64Ptr, nfmax: Int, n2: Int,
+    nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr,
+):
+    """``flush_batch1`` for kets of shells of degree LC, LD: one ket per SIMD lane.
+
+    For each W kets, the integrals (o|kl) = sum_h U[o][h] E[h][kl] of all bra
+    functions o are formed with the lanes as the vector dimension, the
+    densities each lane needs are gathered into lane-major blocks, the six
+    J/K contractions of ``digest`` run as vector FMAs over the lanes, and the
+    lanes' sums are added to the matrices at the end; the bra's Coulomb sums
+    are reduced over the lanes once per batch.
+    """
+    comptime NC = 2 * LC + 1
+    comptime ND = 2 * LD + 1
+    comptime NCD = NC * ND
+    comptime NHI = nherm(LC + LD)
+    comptime V = SIMD[DType.float64, W]
+    var nao = jk.nao
+    var a = jk.tab.get(sp, I_A)
+    var b = jk.tab.get(sp, I_B)
+    var i0 = jk.basis.ao_loc[a]
+    var na = jk.basis.ao_loc[a + 1] - i0
+    var j0 = jk.basis.ao_loc[b]
+    var nb = jk.basis.ao_loc[b + 1] - j0
+    var no = na * nb
+    var nomax = nfmax * nfmax
+    var sab = 0.5 if a == b else 1.0
+    var nset = max(nj, nk)
+    var el = scr                                        # E of the lanes, [h][kl][lane]
+    var gb = el.unsafe_offset(nherm(LMAX1) * 15 * W)    # (o|kl), [o][kl][lane]
+    var dcd = gb.unsafe_offset(nomax * 15 * W)          # D_kl times the lane's weight, [kl][lane]
+    var jcd = dcd.unsafe_offset(15 * W)                 # sum_ij (ij|kl) D_ij, [kl][lane]
+    var dac = jcd.unsafe_offset(15 * W)                 # D_ik, D_il, D_jk, D_jl, [i or j][k or l][lane]
+    var dad = dac.unsafe_offset(nfmax * 7 * W)
+    var dbc = dad.unsafe_offset(nfmax * 7 * W)
+    var dbd = dbc.unsafe_offset(nfmax * 7 * W)
+    var kbc = dbd.unsafe_offset(nfmax * 7 * W)          # K_jk, K_jl over i, [j][k or l][lane]
+    var kbd = kbc.unsafe_offset(nfmax * 7 * W)
+    var kac = kbd.unsafe_offset(nfmax * 7 * W)          # K_ik, K_il over j, [k or l][lane]
+    var kad = kac.unsafe_offset(7 * W)
+    var jab = kad.unsafe_offset(7 * W)                  # sum_kl (ij|kl) D_kl, [set][o][lane]
+    var k0s = stack_allocation[W, Int]()
+    var l0s = stack_allocation[W, Int]()
+    var sls = stack_allocation[W, Float64]()
+    var acc = stack_allocation[NCD * W, Float64]()
+    for x in range(nset * nomax):
+        jab.unsafe_store(x * W, V(0.0))
+    var v = 0
+    while v * W < nket:
+        var nx = min(W, nket - v * W)
+        for x in range(nx):
+            var ket = kets[unsafe_offset=v * W + x]
+            var c = jk.tab.get(ket, I_A)
+            var d = jk.tab.get(ket, I_B)
+            k0s[unsafe_offset=x] = jk.basis.ao_loc[c]
+            l0s[unsafe_offset=x] = jk.basis.ao_loc[d]
+            var sl = 0.5 if c == d else 1.0
+            if ket == sp:
+                sl *= 0.5
+            sls[unsafe_offset=x] = sl
+            var e = jk.tab.e_ptr(ket)
+            var sk = jk.tab.get(ket, I_STRIDE)
+            comptime for h in range(NHI):
+                comptime for kl in range(NCD):
+                    el[unsafe_offset=(h * NCD + kl) * W + x] = e[unsafe_offset=h * sk + kl]
+        # lanes past the batch: U is zero there and the stale E values are finite
+        for o in range(no):
+            var u = ubuf.unsafe_offset(o * NHI * ipad + v * W)
+            var g = gb.unsafe_offset(o * NCD * W)
+            comptime for kl in range(NCD):
+                acc.unsafe_store(kl * W, V(0.0))
+            comptime for h in range(NHI):
+                var uh = u.unsafe_load[width=W](h * ipad)
+                comptime for kl in range(NCD):
+                    acc.unsafe_store(kl * W, acc.unsafe_load[width=W](kl * W) + uh * el.unsafe_load[width=W]((h * NCD + kl) * W))
+            comptime for kl in range(NCD):
+                g.unsafe_store(kl * W, acc.unsafe_load[width=W](kl * W))
+        for st in range(nset):
+            var do_j = st < nj
+            var do_k = st < nk
+            var pj = dmj.unsafe_offset(st * n2)
+            var qj = aj.unsafe_offset(st * n2)
+            var pk = dmk.unsafe_offset(st * n2)
+            var qk = ak.unsafe_offset(st * n2)
+            if do_j:
+                for x in range(nx):
+                    var sl = sls[unsafe_offset=x]
+                    var k0 = k0s[unsafe_offset=x]
+                    var l0 = l0s[unsafe_offset=x]
+                    comptime for k in range(NC):
+                        comptime for l in range(ND):
+                            dcd[unsafe_offset=(k * ND + l) * W + x] = sl * pj[unsafe_offset=(k0 + k) * nao + l0 + l]
+                comptime for kl in range(NCD):
+                    jcd.unsafe_store(kl * W, V(0.0))
+            if do_k:
+                for x in range(nx):
+                    var k0 = k0s[unsafe_offset=x]
+                    var l0 = l0s[unsafe_offset=x]
+                    for i in range(na):
+                        var r = pk.unsafe_offset((i0 + i) * nao)
+                        comptime for k in range(NC):
+                            dac[unsafe_offset=(i * NC + k) * W + x] = r[unsafe_offset=k0 + k]
+                        comptime for l in range(ND):
+                            dad[unsafe_offset=(i * ND + l) * W + x] = r[unsafe_offset=l0 + l]
+                    for j in range(nb):
+                        var r = pk.unsafe_offset((j0 + j) * nao)
+                        comptime for k in range(NC):
+                            dbc[unsafe_offset=(j * NC + k) * W + x] = r[unsafe_offset=k0 + k]
+                        comptime for l in range(ND):
+                            dbd[unsafe_offset=(j * ND + l) * W + x] = r[unsafe_offset=l0 + l]
+                for x in range(nb * NC):
+                    kbc.unsafe_store(x * W, V(0.0))
+                for x in range(nb * ND):
+                    kbd.unsafe_store(x * W, V(0.0))
+            for i in range(na):
+                if do_k:
+                    comptime for k in range(NC):
+                        kac.unsafe_store(k * W, V(0.0))
+                    comptime for l in range(ND):
+                        kad.unsafe_store(l * W, V(0.0))
+                for j in range(nb):
+                    var o = i * nb + j
+                    var g = gb.unsafe_offset(o * NCD * W)
+                    if do_j:
+                        var dij = pj[unsafe_offset=(i0 + i) * nao + j0 + j]
+                        var sj = V(0.0)
+                        comptime for kl in range(NCD):
+                            var gv = g.unsafe_load[width=W](kl * W)
+                            sj += gv * dcd.unsafe_load[width=W](kl * W)
+                            jcd.unsafe_store(kl * W, jcd.unsafe_load[width=W](kl * W) + gv * dij)
+                        var pjab = jab.unsafe_offset((st * nomax + o) * W)
+                        pjab.unsafe_store(0, pjab.unsafe_load[width=W](0) + sj)
+                    if do_k:
+                        comptime for k in range(NC):
+                            var sac = V(0.0)
+                            var sbc = V(0.0)
+                            var dbck = dbc.unsafe_load[width=W]((j * NC + k) * W)
+                            var dack = dac.unsafe_load[width=W]((i * NC + k) * W)
+                            comptime for l in range(ND):
+                                var gv = g.unsafe_load[width=W]((k * ND + l) * W)
+                                sac += gv * dbd.unsafe_load[width=W]((j * ND + l) * W)
+                                sbc += gv * dad.unsafe_load[width=W]((i * ND + l) * W)
+                                kad.unsafe_store(l * W, kad.unsafe_load[width=W](l * W) + gv * dbck)
+                                kbd.unsafe_store((j * ND + l) * W, kbd.unsafe_load[width=W]((j * ND + l) * W) + gv * dack)
+                            kac.unsafe_store(k * W, kac.unsafe_load[width=W](k * W) + sac)
+                            kbc.unsafe_store((j * NC + k) * W, kbc.unsafe_load[width=W]((j * NC + k) * W) + sbc)
+                if do_k:
+                    var r = qk.unsafe_offset((i0 + i) * nao)
+                    for x in range(nx):
+                        var f = sab * sls[unsafe_offset=x]
+                        var k0 = k0s[unsafe_offset=x]
+                        var l0 = l0s[unsafe_offset=x]
+                        comptime for k in range(NC):
+                            r[unsafe_offset=k0 + k] += f * kac[unsafe_offset=k * W + x]
+                        comptime for l in range(ND):
+                            r[unsafe_offset=l0 + l] += f * kad[unsafe_offset=l * W + x]
+            if do_k:
+                for x in range(nx):
+                    var f = sab * sls[unsafe_offset=x]
+                    var k0 = k0s[unsafe_offset=x]
+                    var l0 = l0s[unsafe_offset=x]
+                    for j in range(nb):
+                        var r = qk.unsafe_offset((j0 + j) * nao)
+                        comptime for k in range(NC):
+                            r[unsafe_offset=k0 + k] += f * kbc[unsafe_offset=(j * NC + k) * W + x]
+                        comptime for l in range(ND):
+                            r[unsafe_offset=l0 + l] += f * kbd[unsafe_offset=(j * ND + l) * W + x]
+            if do_j:
+                for x in range(nx):
+                    var f = 2.0 * sab * sls[unsafe_offset=x]
+                    var k0 = k0s[unsafe_offset=x]
+                    var l0 = l0s[unsafe_offset=x]
+                    comptime for k in range(NC):
+                        comptime for l in range(ND):
+                            qj[unsafe_offset=(k0 + k) * nao + l0 + l] += f * jcd[unsafe_offset=(k * ND + l) * W + x]
+        v += 1
+    for st in range(nj):
+        var qj = aj.unsafe_offset(st * n2)
+        for i in range(na):
+            for j in range(nb):
+                var sj = jab.unsafe_load[width=W]((st * nomax + i * nb + j) * W).reduce_add()
+                qj[unsafe_offset=(i0 + i) * nao + j0 + j] += 2.0 * sab * sj
+
+
+def flush_batch1(
+    jk: DirectJK, tb: PairTable, sp: Int, kets: IntPtr, nket: Int, cls: Int, mut ws: EriWork, mut wb: EriBatch,
+    scr: F64Ptr, nfmax: Int, n2: Int, nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr,
+):
+    """Integrals of bra ``sp`` with queued kets of class ``cls`` (``single_class``) folded into the J/K
+    accumulators, one ket per SIMD lane (``lanes_digest1``)."""
+    var ipad = eri_batch_u(tb, sp, jk.tab, kets, nket, jk.boys, ws, wb)
+    var ubuf = F64Ptr(unsafe_from_address=wb.uaddr)
+    comptime for LC in range(LMAX1 + 1):
+        comptime for LD in range(LMAX1 + 1 - LC):
+            if cls == LC * 4 + LD:
+                lanes_digest1[LC, LD](jk, sp, kets, nket, ipad, ubuf, scr, nfmax, n2, nj, nk, dmj, dmk, aj, ak)
+                return
+
+
 def flush_batch(
     jk: DirectJK, tb: PairTable, sp: Int, kets: IntPtr, nket: Int, mut ws: EriWork, mut wb: EriBatch, n2: Int,
     nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, ploc: F64Ptr,
@@ -284,7 +605,7 @@ def flush_batch(
 def _jk_bra(
     self: DirectJK, tb: PairTable, sp: Int, mut ws: EriWork, mut wb: EriBatch, mut queue: KetQueue, ploc: F64Ptr,
     pcond: F64Ptr, pq: F64Ptr, npairs: Int, nbas: Int, nao: Int, n2: Int, nj: Int, nk: Int, dmj: F64Ptr,
-    dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, tol: Float64,
+    dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, tol: Float64, lscr: F64Ptr,
 ):
     """The quartets of bra pair ``sp`` folded into a worker's J/K accumulators (``DirectJK.jk``); ``tb`` is the
     bra-side pair table (``self.tab``, or its attenuated copy for the long-range operator)."""
@@ -292,6 +613,7 @@ def _jk_bra(
     if qab == 0.0:
         return
     var pkcls = int_ptr(self.kcls)
+    var pkone = int_ptr(self.kone)
     var a = self.tab.get(sp, I_A)
     var b = self.tab.get(sp, I_B)
     var dab = pcond[unsafe_offset=a * nbas + b]
@@ -315,6 +637,17 @@ def _jk_bra(
             continue
         var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
         if kc >= 0 and lanes_preferred(self.tab, sp, self.tab, spk):
+            var k1 = pkone[unsafe_offset=spk]
+            if k1 >= 0:
+                var q1 = self.nclass + k1
+                if queue.full(q1, 1):
+                    flush_batch1(
+                        self, tb, sp, queue.kets(q1), queue.cnt[q1], k1, ws, wb, lscr, self.nfmax, n2, nj, nk, dmj,
+                        dmk, aj, ak,
+                    )
+                    queue.clear(q1)
+                queue.push(q1, spk, 1)
+                continue
             if queue.full(kc, npk):
                 flush_batch(self, tb, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
                 queue.clear(kc)
@@ -328,6 +661,14 @@ def _jk_bra(
         if queue.cnt[kc] > 0:
             flush_batch(self, tb, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
             queue.clear(kc)
+    for k1 in range(NCLASS1):
+        var q1 = self.nclass + k1
+        if queue.cnt[q1] > 0:
+            flush_batch1(
+                self, tb, sp, queue.kets(q1), queue.cnt[q1], k1, ws, wb, lscr, self.nfmax, n2, nj, nk, dmj, dmk,
+                aj, ak,
+            )
+            queue.clear(q1)
 
 
 struct DirectJK(Movable):
@@ -342,6 +683,8 @@ struct DirectJK(Movable):
     var omega: Float64
     var q: List[Float64]      # Schwarz bound per shell pair a >= b (index a (a + 1) / 2 + b)
     var kcls: List[Int]       # batch class of each pair as a ket (-1: not batched)
+    var kone: List[Int]       # class of each pair as a ket of ``flush_batch1`` (-1: not one)
+    var order: List[Int]      # bra pairs in the order the workers take them: most primitive pairs first
     var nclass: Int
     var nbas: Int
     var nao: Int
@@ -374,6 +717,29 @@ struct DirectJK(Movable):
         var kcls = List[Int](length=max(npairs, 1), fill=-1)
         self.nclass = batch_classes(tab, kcls)
         self.kcls = kcls^
+        var kone = List[Int](length=max(npairs, 1), fill=-1)
+        for sp in range(npairs):
+            kone[sp] = single_class(basis, tab, sp)
+        self.kone = kone^
+        # a bra takes the kets with at most as many primitive pairs, so the bras with the most primitive
+        # pairs have the most work: they go first, which keeps the workers' last tasks short
+        var maxnp = 0
+        for sp in range(npairs):
+            maxnp = max(maxnp, tab.get(sp, I_NP))
+        var start = List[Int](length=maxnp + 2, fill=0)
+        for sp in range(npairs):
+            start[tab.get(sp, I_NP)] += 1
+        var acc = 0
+        for np in range(maxnp, -1, -1):
+            var c = start[np]
+            start[np] = acc
+            acc += c
+        var order = List[Int](length=max(npairs, 1), fill=0)
+        for sp in range(npairs - 1, -1, -1):
+            var np = tab.get(sp, I_NP)
+            order[start[np]] = sp
+            start[np] += 1
+        self.order = order^
         self.active = True
         self.nbas = nbas
         self.nao = basis.nao
@@ -403,6 +769,8 @@ struct DirectJK(Movable):
         self.boys = BoysTable(empty=True)
         self.q = List[Float64]()
         self.kcls = List[Int]()
+        self.kone = List[Int]()
+        self.order = List[Int]()
         self.nclass = 0
         self.basis = basis^
         _ = sa^
@@ -460,20 +828,23 @@ struct DirectJK(Movable):
             var ploc = list_ptr(loc)
             var aj = pacc.unsafe_offset(w * nacc * n2)
             var ak = aj.unsafe_offset(nj * n2)
-            var queue = KetQueue(self.nclass)    # kets of the current bra waiting for a batch
+            var queue = KetQueue(self.nclass + NCLASS1)    # kets of the current bra waiting for a batch
+            var lsl = List[Float64](length=lanes1_scratch(nfmax, max(nj, nk)) + W, fill=0.0)
+            var lscr = F64Ptr(unsafe_from_address=aligned_addr(lsl))
             while True:
                 var task = Int(pcount[].fetch_add(1))
                 if task >= npairs:
                     break
-                var sp = npairs - 1 - task
+                var sp = self.order[task]
                 if attenuated:
-                    _jk_bra(self, self.tabw, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol)
+                    _jk_bra(self, self.tabw, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol, lscr)
                 else:
-                    _jk_bra(self, self.tab, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol)
+                    _jk_bra(self, self.tab, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol, lscr)
             _ = wb^
             _ = queue^
             _ = ws^
             _ = loc^
+            _ = lsl^
 
         if nworkers == 1:
             work(0)

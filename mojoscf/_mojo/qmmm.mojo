@@ -52,7 +52,6 @@ from _mojo.integrals import (
 comptime CHUNK = 8 * W          # charges per kernel call (eight lane vectors)
 comptime GROUP = 16             # chunks per task
 comptime POINT_ZETA = 1.0e30    # exponent standing in for a point charge
-comptime RBUF = (2 * 220 + 2 * LMAX_POT + 9) * W    # recursion scratch for degrees up to LMAX_POT (nherm(9) = 220)
 
 
 struct ChargeLanes(Movable):
@@ -137,10 +136,8 @@ def mm_potential_core(
     def work(w: Int) {imm basis, imm tab, imm lanes, imm btab, imm pacc, imm pcount, imm ntask, imm ngroup, imm npairs, imm nao, imm n2}:
         var maxc = tab.maxcomp
         var ub = List[Float64](length=maxc * CHUNK + 2 * W, fill=0.0)
-        var rbl = List[Float64](length=RBUF + 2 * W, fill=0.0)
         var vacc = List[Float64](length=maxc * W + 2 * W, fill=0.0)
         var pu = F64Ptr(unsafe_from_address=aligned_addr(ub))
-        var prb = F64Ptr(unsafe_from_address=aligned_addr(rbl))
         var pv = F64Ptr(unsafe_from_address=aligned_addr(vacc))
         var acc = pacc.unsafe_offset(w * n2)
         while True:
@@ -158,7 +155,7 @@ def mm_potential_core(
             vfill(pv, no * W, 0.0)
             for c in range(g * GROUP, min((g + 1) * GROUP, lanes.nchunk)):
                 var nv = lanes.nvec(c)
-                lanes_dispatch(lo, 0, np, tab.prim_ptr(sp), tab.e_ptr(sp), so, no, lanes.chunk(c), nv, btab, pu, prb)
+                lanes_dispatch(lo, 0, np, tab.prim_ptr(sp), tab.e_ptr(sp), so, no, lanes.chunk(c), nv, btab, pu)
                 var ipad = nv * W
                 for o in range(no):
                     var s = pv.unsafe_load[width=W](o * W)
@@ -178,7 +175,6 @@ def mm_potential_core(
                     if a != b:
                         acc[unsafe_offset=(j0 + j) * nao + i0 + i] += val
         _ = ub^
-        _ = rbl^
         _ = vacc^
 
     if nworkers == 1:
@@ -233,11 +229,9 @@ def mm_esp_core(
 
     def work(w: Int) {imm basis, imm tab, imm lanes, imm btab, imm pacc, imm pcount, imm ntask, imm ngroup, imm npairs, imm nao, imm per, imm nset, imm nch, imm dms, imm st, imm esize}:
         var ub = List[Float64](length=max(nset, 1) * CHUNK + 2 * W, fill=0.0)
-        var rbl = List[Float64](length=RBUF + 2 * W, fill=0.0)
         var econ = List[Float64](length=esize + 2 * W, fill=0.0)
         var pe = F64Ptr(unsafe_from_address=aligned_addr(econ))
         var pu = F64Ptr(unsafe_from_address=aligned_addr(ub))
-        var prb = F64Ptr(unsafe_from_address=aligned_addr(rbl))
         var acc = pacc.unsafe_offset(w * per)
         var n2 = nao * nao
         while True:
@@ -276,7 +270,7 @@ def mm_esp_core(
             for c in range(g * GROUP, min((g + 1) * GROUP, lanes.nchunk)):
                 var nv = lanes.nvec(c)
                 var ipad = nv * W
-                lanes_dispatch(lo, 0, np, tab.prim_ptr(sp), pe, st, nset, lanes.chunk(c), nv, btab, pu, prb)
+                lanes_dispatch(lo, 0, np, tab.prim_ptr(sp), pe, st, nset, lanes.chunk(c), nv, btab, pu)
                 var k0 = c * CHUNK
                 var nk = min(CHUNK, nch - k0)
                 for s in range(nset):
@@ -285,7 +279,6 @@ def mm_esp_core(
                     for k in range(nk):
                         dst[unsafe_offset=k] += src[unsafe_offset=k]
         _ = ub^
-        _ = rbl^
         _ = econ^
 
     if nworkers == 1:
@@ -346,13 +339,11 @@ def mm_grad_core(
     def work(w: Int) {imm basis, imm tab2, imm lanes, imm btab, imm pacc, imm pcount, imm ntask, imm ngroup, imm npairs, imm nao, imm n2, imm per, imm nmat, imm nfor, imm dm, imm want_mat, imm want_force, imm want_atoms, imm st, imm esize}:
         var maxc = tab2.maxcomp
         var ub = List[Float64](length=maxc * CHUNK + 2 * W, fill=0.0)
-        var rbl = List[Float64](length=RBUF + 2 * W, fill=0.0)
         var vacc = List[Float64](length=maxc * W + 2 * W, fill=0.0)
         var dloc = List[Float64](length=maxc + 1, fill=0.0)
         var econ = List[Float64](length=(esize if not want_mat else 1) + 2 * W, fill=0.0)
         var pe = F64Ptr(unsafe_from_address=aligned_addr(econ))
         var pu = F64Ptr(unsafe_from_address=aligned_addr(ub))
-        var prb = F64Ptr(unsafe_from_address=aligned_addr(rbl))
         var pv = F64Ptr(unsafe_from_address=aligned_addr(vacc))
         var pd = list_ptr(dloc)
         var macc = pacc.unsafe_offset(w * per)
@@ -409,7 +400,7 @@ def mm_grad_core(
                 var nv = lanes.nvec(c)
                 var ipad = nv * W
                 if not want_mat:
-                    lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), pe, st, 6, lanes.chunk(c), nv, btab, pu, prb)
+                    lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), pe, st, 6, lanes.chunk(c), nv, btab, pu)
                     var k0 = c * CHUNK
                     var nk = min(CHUNK, lanes.nch - k0)
                     for v in range(nv):
@@ -435,7 +426,7 @@ def mm_grad_core(
                                 fk[unsafe_offset=1] -= f1[lane]
                                 fk[unsafe_offset=2] -= f2[lane]
                     continue
-                lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), tab2.e_ptr(sp), so, no, lanes.chunk(c), nv, btab, pu, prb)
+                lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), tab2.e_ptr(sp), so, no, lanes.chunk(c), nv, btab, pu)
                 if want_mat:
                     for o in range(no):
                         var s = pv.unsafe_load[width=W](o * W)
@@ -494,7 +485,6 @@ def mm_grad_core(
                                     ((x + 3) * nab + i * nb + j) * W
                                 ).reduce_add()
         _ = ub^
-        _ = rbl^
         _ = vacc^
         _ = dloc^
         _ = econ^
@@ -579,10 +569,8 @@ def mm_potential_sets_core(
     def work(w: Int) {imm basis, imm tab, imm lanes, imm btab, imm pw, imm pact, imm pcount, imm npairs, imm nchunk, imm nset, imm nao, imm n2, imm deriv, imm v_out}:
         var maxc = tab.maxcomp
         var ub = List[Float64](length=maxc * CHUNK + 2 * W, fill=0.0)
-        var rbl = List[Float64](length=RBUF + 2 * W, fill=0.0)
         var sacc = List[Float64](length=nset * maxc * W + 2 * W, fill=0.0)
         var pu = F64Ptr(unsafe_from_address=aligned_addr(ub))
-        var prb = F64Ptr(unsafe_from_address=aligned_addr(rbl))
         var ps = F64Ptr(unsafe_from_address=aligned_addr(sacc))
         while True:
             var task = Int(pcount[].fetch_add(1))
@@ -598,7 +586,7 @@ def mm_potential_sets_core(
             vfill(ps, nset * no * W, 0.0)
             for c in range(nchunk):
                 var nv = lanes.nvec(c)
-                lanes_dispatch(lo, 0, np, tab.prim_ptr(sp), tab.e_ptr(sp), so, no, lanes.chunk(c), nv, btab, pu, prb)
+                lanes_dispatch(lo, 0, np, tab.prim_ptr(sp), tab.e_ptr(sp), so, no, lanes.chunk(c), nv, btab, pu)
                 var ipad = nv * W
                 for s in range(nset):
                     if pact[unsafe_offset=c * nset + s] == 0:
@@ -643,7 +631,6 @@ def mm_potential_sets_core(
                                     ((x + 3) * nab + i * nb + j) * W
                                 ).reduce_add()
         _ = ub^
-        _ = rbl^
         _ = sacc^
 
     if nworkers == 1:
@@ -703,12 +690,10 @@ def mm_esp_grad_core(
     def work(w: Int) {imm basis, imm tab2, imm lanes, imm btab, imm pacc, imm pcount, imm ntask, imm ngroup, imm npairs, imm nao, imm nch, imm per, imm dm, imm st, imm esize}:
         var maxc = tab2.maxcomp
         var ub = List[Float64](length=6 * CHUNK + 2 * W, fill=0.0)
-        var rbl = List[Float64](length=RBUF + 2 * W, fill=0.0)
         var dloc = List[Float64](length=maxc + 1, fill=0.0)
         var econ = List[Float64](length=esize + 2 * W, fill=0.0)
         var pe = F64Ptr(unsafe_from_address=aligned_addr(econ))
         var pu = F64Ptr(unsafe_from_address=aligned_addr(ub))
-        var prb = F64Ptr(unsafe_from_address=aligned_addr(rbl))
         var pd = list_ptr(dloc)
         var acc = pacc.unsafe_offset(w * per)
         while True:
@@ -750,7 +735,7 @@ def mm_esp_grad_core(
             for c in range(g * GROUP, min((g + 1) * GROUP, lanes.nchunk)):
                 var nv = lanes.nvec(c)
                 var ipad = nv * W
-                lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), pe, st, ncc, lanes.chunk(c), nv, btab, pu, prb)
+                lanes_dispatch(lo, 0, np, tab2.prim_ptr(sp), pe, st, ncc, lanes.chunk(c), nv, btab, pu)
                 var k0 = c * CHUNK
                 var nk = min(CHUNK, nch - k0)
                 for x in range(3):
@@ -764,7 +749,6 @@ def mm_esp_grad_core(
                         for k in range(nk):
                             db[unsafe_offset=k] += ubb[unsafe_offset=k]
         _ = ub^
-        _ = rbl^
         _ = dloc^
         _ = econ^
 
@@ -860,14 +844,12 @@ def mm_hess_core(
     def work(w: Int) {imm basis, imm tab3, imm lanes, imm btab, imm pacc, imm pcount, imm ntask, imm ngroup, imm npairs, imm nao, imm natm, imm nch, imm per, imm dm, imm st, imm esize, imm pvat, imm catom}:
         var maxc = tab3.maxcomp
         var ub = List[Float64](length=21 * CHUNK + 2 * W, fill=0.0)
-        var rbl = List[Float64](length=RBUF + 2 * W, fill=0.0)
         var dloc = List[Float64](length=maxc + 1, fill=0.0)
         var econ = List[Float64](length=esize + 2 * W, fill=0.0)
         var racl = List[Float64](length=21 * W + 2 * W, fill=0.0)
         var tl = List[Float64](length=64, fill=0.0)
         var pe = F64Ptr(unsafe_from_address=aligned_addr(econ))
         var pu = F64Ptr(unsafe_from_address=aligned_addr(ub))
-        var prb = F64Ptr(unsafe_from_address=aligned_addr(rbl))
         var pr = F64Ptr(unsafe_from_address=aligned_addr(racl))
         var pd = list_ptr(dloc)
         var pt = list_ptr(tl)          # [0, 21): one run's sums, [32, 53): the task's total
@@ -914,7 +896,7 @@ def mm_hess_core(
             for c in range(g * GROUP, min((g + 1) * GROUP, lanes.nchunk)):
                 var nv = lanes.nvec(c)
                 var ipad = nv * W
-                lanes_dispatch(lo, 0, np, tab3.prim_ptr(sp), pe, st, 21, lanes.chunk(c), nv, btab, pu, prb)
+                lanes_dispatch(lo, 0, np, tab3.prim_ptr(sp), pe, st, 21, lanes.chunk(c), nv, btab, pu)
                 for v in range(nv):
                     var at = pvat[unsafe_offset=c * (CHUNK // W) + v]
                     if at >= 0 and at == cur:
@@ -956,7 +938,6 @@ def mm_hess_core(
                     h[unsafe_offset=((ib * natm + ia) * 3 + x) * 3 + y] += tot[unsafe_offset=6 + 3 * y + x]
                     h[unsafe_offset=((ib * natm + ib) * 3 + x) * 3 + y] += tot[unsafe_offset=15 + _sym6(x, y)]
         _ = ub^
-        _ = rbl^
         _ = dloc^
         _ = econ^
         _ = racl^

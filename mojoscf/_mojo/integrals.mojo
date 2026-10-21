@@ -934,9 +934,7 @@ struct EriWork(Movable):
     var offo: List[Int]
     var offi: List[Int]
     var rowo: List[Int]
-    var rbuf: List[Float64]     # specialised kernels: levels of the Hermite Coulomb recursion
     var maddr: Int              # 64-byte aligned start of ``m``
-    var raddr: Int              # 64-byte aligned start of ``rbuf``
     var tbaddr: Int             # 64-byte aligned start of ``tb``
 
     def __init__(out self, maxcomp_b: Int, maxlab_b: Int, maxcomp_k: Int, maxlab_k: Int):
@@ -953,11 +951,7 @@ struct EriWork(Movable):
         self.offo = List[Int](length=nhmax, fill=0)
         self.offi = List[Int](length=nhmax, fill=0)
         self.rowo = List[Int](length=nhmax, fill=0)
-        self.rbuf = List[Float64](
-            length=(2 * nherm(2 * KMAX) + 4 * KMAX + 9) * W + 2 * nherm(2 * KMAX) + 2 * KMAX + 1 + 2 * W, fill=0.0
-        )
         self.maddr = aligned_addr(self.m)
-        self.raddr = aligned_addr(self.rbuf)
         self.tbaddr = aligned_addr(self.tb)
 
 
@@ -1093,7 +1087,7 @@ comptime VMIN = 3         # inner primitives from which the kernels vectorise ov
 def eri_kernel_spec[LO: Int, LI: Int](
     nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
     nip: Int, pin: F64Ptr, ei: F64Ptr, si: Int,
-    btab: F64Ptr, m: F64Ptr, rbuf: F64Ptr,
+    btab: F64Ptr, m: F64Ptr,
 ):
     """(outer|inner) for Hermite degrees LO, LI known at compile time; M[o][i] += result.
 
@@ -1102,9 +1096,9 @@ def eri_kernel_spec[LO: Int, LI: Int](
     are processed W at a time: prefactors, Boys arguments and the Hermite
     Coulomb recursion are evaluated as SIMD vectors over the W primitive
     quartets (only the table look-up of the Boys function runs per lane) and
-    R is stored as ``rbuf[h W + lane]``; otherwise one primitive quartet at a
+    R is stored as ``rv[h W + lane]``; otherwise one primitive quartet at a
     time with scalar arithmetic.  Either way the transforms take R as an
-    embedded broadcast operand.  ``rbuf`` must be 64-byte aligned.
+    embedded broadcast operand.
     """
     comptime NHO = nherm(LO)
     comptime NHI = nherm(LI)
@@ -1115,11 +1109,12 @@ def eri_kernel_spec[LO: Int, LI: Int](
     var opad = padded(nop)
     var ipad = padded(nip)
     var tb = stack_allocation[NHO * SIMAX, Float64, alignment=64]()
-    var rv = rbuf                                   # vector path: two recursion levels, [h][lane]
-    var fbv = rbuf.unsafe_offset(2 * NHL * W)       # vector path: gathered table rows, then scaled F_n
-    var tv = rbuf.unsafe_offset((2 * NHL + L + 8) * W)   # vector path: F_n
-    var rs = rbuf.unsafe_offset((2 * NHL + 2 * L + 9) * W)   # scalar path: two recursion levels
-    var fbs = rs.unsafe_offset(2 * NHL)                        # scalar path: scaled Boys values
+    # recursion scratch on the stack: every offset is a compile-time constant, so these can live in registers
+    var rv = stack_allocation[2 * NHL * W, Float64, alignment=64]()    # vector path: two recursion levels, [h][lane]
+    var fbv = stack_allocation[((L + 15) // 8) * 8 * W, Float64, alignment=64]()   # vector path: table rows, then scaled F_n
+    var tv = stack_allocation[(L + 1) * W, Float64, alignment=64]()    # vector path: F_n
+    var rs = stack_allocation[2 * NHL, Float64, alignment=64]()        # scalar path: two recursion levels
+    var fbs = stack_allocation[L + 1, Float64, alignment=64]()         # scalar path: scaled Boys values
     for ko in range(nop):
         var p = po[unsafe_offset=ko]
         var ip = po[unsafe_offset=opad + ko]
@@ -1141,7 +1136,7 @@ def eri_kernel_spec[LO: Int, LI: Int](
                 var pref = pin.unsafe_load[width=W](ipad + ki0) * (TWO_PI_52 * ip) * sqrt(inv_s)
                 var tt = alpha * (x * x + y * y + z * z)
                 # Boys function of all lanes: Taylor expansion about the nearest grid point
-                # (table rows gathered per lane), blended with the asymptotic form for T >= TMAX
+                # (table rows of the lanes), blended with the asymptotic form for T >= TMAX
                 var near = tt.lt(BoysTable.TMAX)
                 var ttc = min(tt, SIMD[DType.float64, W](BoysTable.TMAX))
                 var kk = (ttc * BoysTable.INV_DT + 0.5).cast[DType.int64]()
@@ -1154,8 +1149,45 @@ def eri_kernel_spec[LO: Int, LI: Int](
                 var c5 = c4 * dt * 0.2
                 var c6 = c5 * dt * 0.16666666666666666
                 var c7 = c6 * dt * 0.14285714285714285
-                comptime for mm in range(L + 8):
-                    fbv.unsafe_store(mm * W, btab.unsafe_gather(off + SIMD[DType.int64, W](mm)))
+                comptime if W == 8:
+                    # each lane's row loaded whole and the 8 x 8 blocks transposed in registers:
+                    # hardware gathers cost about 20 cycles each on CPUs with the GDS mitigation
+                    comptime for blk in range((L + 15) // 8):
+                        var r0 = btab.unsafe_load[width=8](Int(off[0]) + 8 * blk)
+                        var r1 = btab.unsafe_load[width=8](Int(off[1]) + 8 * blk)
+                        var r2 = btab.unsafe_load[width=8](Int(off[2]) + 8 * blk)
+                        var r3 = btab.unsafe_load[width=8](Int(off[3]) + 8 * blk)
+                        var r4 = btab.unsafe_load[width=8](Int(off[4]) + 8 * blk)
+                        var r5 = btab.unsafe_load[width=8](Int(off[5]) + 8 * blk)
+                        var r6 = btab.unsafe_load[width=8](Int(off[6]) + 8 * blk)
+                        var r7 = btab.unsafe_load[width=8](Int(off[7]) + 8 * blk)
+                        var t0 = r0.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r1)
+                        var t1 = r0.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r1)
+                        var t2 = r2.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r3)
+                        var t3 = r2.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r3)
+                        var t4 = r4.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r5)
+                        var t5 = r4.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r5)
+                        var t6 = r6.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r7)
+                        var t7 = r6.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r7)
+                        var u0 = t0.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t2)
+                        var u1 = t0.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t2)
+                        var u2 = t1.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t3)
+                        var u3 = t1.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t3)
+                        var u4 = t4.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t6)
+                        var u5 = t4.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t6)
+                        var u6 = t5.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t7)
+                        var u7 = t5.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t7)
+                        fbv.unsafe_store((8 * blk) * W, u0.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u4))
+                        fbv.unsafe_store((8 * blk + 1) * W, u2.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u6))
+                        fbv.unsafe_store((8 * blk + 2) * W, u1.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u5))
+                        fbv.unsafe_store((8 * blk + 3) * W, u3.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u7))
+                        fbv.unsafe_store((8 * blk + 4) * W, u0.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u4))
+                        fbv.unsafe_store((8 * blk + 5) * W, u2.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u6))
+                        fbv.unsafe_store((8 * blk + 6) * W, u1.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u5))
+                        fbv.unsafe_store((8 * blk + 7) * W, u3.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u7))
+                else:
+                    comptime for mm in range(L + 8):
+                        fbv.unsafe_store(mm * W, btab.unsafe_gather(off + SIMD[DType.int64, W](mm)))
                 comptime for n in range(L + 1):
                     var fv = (
                         fbv.unsafe_load[width=W](n * W) + c1 * fbv.unsafe_load[width=W]((n + 1) * W)
@@ -1603,7 +1635,6 @@ def eri_kernel_spec[LO: Int, LI: Int](
 
 def eri_kernel_lanes[LO: Int, LI: Int](
     nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int, pin: F64Ptr, nvec: Int, btab: F64Ptr, ubuf: F64Ptr,
-    rbuf: F64Ptr,
 ):
     """U[o][hi][lane] = sum_ko sum_ho (-1)^{|ho|} E_O[ko][ho][o] R_{ko,lane}[ho + hi] over nvec W lanes.
 
@@ -1614,7 +1645,7 @@ def eri_kernel_lanes[LO: Int, LI: Int](
     the lanes' Hermite functions.  Per outer primitive pair and W lanes the
     prefactors, the Boys function and the Hermite recursion run as in
     ``eri_kernel_spec``'s vector path, then the outer transform adds vector
-    FMAs over the lanes (E_O broadcast).  ``rbuf`` must be 64-byte aligned.
+    FMAs over the lanes (E_O broadcast).
     """
     comptime NHO = nherm(LO)
     comptime NHI = nherm(LI)
@@ -1624,9 +1655,10 @@ def eri_kernel_lanes[LO: Int, LI: Int](
     comptime NCH = 4 if NHI <= 2 else 1             # FMA chains per accumulator (split over ho)
     var opad = padded(nop)
     var ipad = nvec * W
-    var rv = rbuf                                   # two recursion levels, [h][lane]
-    var fbv = rbuf.unsafe_offset(2 * NHL * W)       # gathered table rows, then scaled F_n
-    var tv = rbuf.unsafe_offset((2 * NHL + L + 8) * W)   # F_n
+    # recursion scratch on the stack: every offset is a compile-time constant, so these can live in registers
+    var rv = stack_allocation[2 * NHL * W, Float64, alignment=64]()    # two recursion levels, [h][lane]
+    var fbv = stack_allocation[((L + 15) // 8) * 8 * W, Float64, alignment=64]()   # table rows, then scaled F_n
+    var tv = stack_allocation[(L + 1) * W, Float64, alignment=64]()    # F_n
     for x in range(no * NHI * nvec):
         ubuf.unsafe_store(x * W, SIMD[DType.float64, W](0.0))
     for ko in range(nop):
@@ -1647,7 +1679,7 @@ def eri_kernel_lanes[LO: Int, LI: Int](
             var pref = pin.unsafe_load[width=W](ipad + ki0) * (TWO_PI_52 * ip) * sqrt(inv_s)
             var tt = alpha * (x * x + y * y + z * z)
             # Boys function of all lanes: Taylor expansion about the nearest grid point
-            # (table rows gathered per lane), blended with the asymptotic form for T >= TMAX
+            # (table rows of the lanes), blended with the asymptotic form for T >= TMAX
             var near = tt.lt(BoysTable.TMAX)
             var ttc = min(tt, SIMD[DType.float64, W](BoysTable.TMAX))
             var kk = (ttc * BoysTable.INV_DT + 0.5).cast[DType.int64]()
@@ -1660,8 +1692,45 @@ def eri_kernel_lanes[LO: Int, LI: Int](
             var c5 = c4 * dt * 0.2
             var c6 = c5 * dt * 0.16666666666666666
             var c7 = c6 * dt * 0.14285714285714285
-            comptime for mm in range(L + 8):
-                fbv.unsafe_store(mm * W, btab.unsafe_gather(off + SIMD[DType.int64, W](mm)))
+            comptime if W == 8:
+                # each lane's row loaded whole and the 8 x 8 blocks transposed in registers:
+                # hardware gathers cost about 20 cycles each on CPUs with the GDS mitigation
+                comptime for blk in range((L + 15) // 8):
+                    var r0 = btab.unsafe_load[width=8](Int(off[0]) + 8 * blk)
+                    var r1 = btab.unsafe_load[width=8](Int(off[1]) + 8 * blk)
+                    var r2 = btab.unsafe_load[width=8](Int(off[2]) + 8 * blk)
+                    var r3 = btab.unsafe_load[width=8](Int(off[3]) + 8 * blk)
+                    var r4 = btab.unsafe_load[width=8](Int(off[4]) + 8 * blk)
+                    var r5 = btab.unsafe_load[width=8](Int(off[5]) + 8 * blk)
+                    var r6 = btab.unsafe_load[width=8](Int(off[6]) + 8 * blk)
+                    var r7 = btab.unsafe_load[width=8](Int(off[7]) + 8 * blk)
+                    var t0 = r0.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r1)
+                    var t1 = r0.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r1)
+                    var t2 = r2.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r3)
+                    var t3 = r2.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r3)
+                    var t4 = r4.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r5)
+                    var t5 = r4.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r5)
+                    var t6 = r6.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r7)
+                    var t7 = r6.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r7)
+                    var u0 = t0.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t2)
+                    var u1 = t0.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t2)
+                    var u2 = t1.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t3)
+                    var u3 = t1.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t3)
+                    var u4 = t4.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t6)
+                    var u5 = t4.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t6)
+                    var u6 = t5.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t7)
+                    var u7 = t5.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t7)
+                    fbv.unsafe_store((8 * blk) * W, u0.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u4))
+                    fbv.unsafe_store((8 * blk + 1) * W, u2.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u6))
+                    fbv.unsafe_store((8 * blk + 2) * W, u1.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u5))
+                    fbv.unsafe_store((8 * blk + 3) * W, u3.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u7))
+                    fbv.unsafe_store((8 * blk + 4) * W, u0.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u4))
+                    fbv.unsafe_store((8 * blk + 5) * W, u2.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u6))
+                    fbv.unsafe_store((8 * blk + 6) * W, u1.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u5))
+                    fbv.unsafe_store((8 * blk + 7) * W, u3.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u7))
+            else:
+                comptime for mm in range(L + 8):
+                    fbv.unsafe_store(mm * W, btab.unsafe_gather(off + SIMD[DType.int64, W](mm)))
             comptime for n in range(L + 1):
                 var fv = (
                     fbv.unsafe_load[width=W](n * W) + c1 * fbv.unsafe_load[width=W]((n + 1) * W)
@@ -1970,7 +2039,7 @@ def run_kernel(
             comptime for LI_ in range(KMAX_EXT + 1):
                 comptime if (LO_ <= KMAX and LI_ <= KMAX) or (LO_ <= 2 and LI_ <= KMAX_EXT) or (LI_ <= 2 and LO_ <= KMAX_EXT):
                     if lo == LO_ and li == LI_:
-                        eri_kernel_spec[LO_, LI_](nop, po, eo, so, no, nip, pin, ei, si, btab, m, F64Ptr(unsafe_from_address=ws.raddr))
+                        eri_kernel_spec[LO_, LI_](nop, po, eo, so, no, nip, pin, ei, si, btab, m)
                         return
     eri_kernel_generic(lo, li, ht, nop, po, eo, so, no, nip, pin, ei, si, boys, ws, m)
 
@@ -1988,18 +2057,14 @@ comptime LMAX_POT = 9     # outer degrees of eri_kernel_lanes against s-type lan
 
 def lanes_dispatch(
     lo: Int, li: Int, nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
-    pin: F64Ptr, nvec: Int, btab: F64Ptr, ubuf: F64Ptr, rb: F64Ptr,
+    pin: F64Ptr, nvec: Int, btab: F64Ptr, ubuf: F64Ptr,
 ):
-    """``eri_kernel_lanes[lo, li]`` for lo, li <= KMAX, or li = 0 and lo <= LMAX_POT.
-
-    ``rb`` is the recursion scratch (64-byte aligned, at least
-    (2 nherm(lo + li) + 2 (lo + li) + 9) W values).
-    """
+    """``eri_kernel_lanes[lo, li]`` for lo, li <= KMAX, or li = 0 and lo <= LMAX_POT."""
     comptime for LO_ in range(LMAX_POT + 1):
         comptime for LI_ in range(KMAX + 1):
             comptime if LO_ <= KMAX or LI_ == 0:
                 if lo == LO_ and li == LI_:
-                    eri_kernel_lanes[LO_, LI_](nop, po, eo, so, no, pin, nvec, btab, ubuf, rb)
+                    eri_kernel_lanes[LO_, LI_](nop, po, eo, so, no, pin, nvec, btab, ubuf)
                     return
 
 
@@ -2008,7 +2073,7 @@ def run_kernel_lanes(
     pin: F64Ptr, nvec: Int, boys: BoysTable, ws: EriWork, ubuf: F64Ptr,
 ):
     """``eri_kernel_lanes[lo, li]``; the caller checks ``batch_supported`` first."""
-    lanes_dispatch(lo, li, nop, po, eo, so, no, pin, nvec, list_ptr(boys.table), ubuf, F64Ptr(unsafe_from_address=ws.raddr))
+    lanes_dispatch(lo, li, nop, po, eo, so, no, pin, nvec, list_ptr(boys.table), ubuf)
 
 
 def lanes_ket_transform[LI: Int](
@@ -2099,6 +2164,40 @@ struct EriBatch(Movable):
         return list_ptr(self.out).unsafe_offset(k * self.ostride)
 
 
+def eri_batch_u(
+    tb: PairTable, ib: Int, tk: PairTable, kets: IntPtr, nket: Int, boys: BoysTable, ws: EriWork, mut wb: EriBatch
+) -> Int:
+    """The first half of ``eri_batch``: U of ``eri_kernel_lanes`` (at ``wb.uaddr``) with the primitive pairs of
+    the kets as lanes, in order.  Returns the lane count of U (a multiple of W)."""
+    var npo = tb.get(ib, I_NP)
+    var lo = tb.get(ib, I_LAB)
+    var no = tb.get(ib, I_NCOMP)
+    var so = tb.get(ib, I_STRIDE)
+    var li = tk.get(kets[unsafe_offset=0], I_LAB)
+    var nl = 0
+    for k in range(nket):
+        nl += tk.get(kets[unsafe_offset=k], I_NP)
+    var nvec = (nl + W - 1) // W
+    var ipad = nvec * W
+    var pin = F64Ptr(unsafe_from_address=wb.paddr)
+    var lane = 0
+    for k in range(nket):
+        var ik = kets[unsafe_offset=k]
+        var np = tk.get(ik, I_NP)
+        var pp = tk.prim_ptr(ik)
+        var pst = padded(np)
+        for kp in range(np):
+            comptime for f in range(PFIELDS):
+                pin[unsafe_offset=f * ipad + lane + kp] = pp[unsafe_offset=f * pst + kp]
+        lane += np
+    # unused lanes: zero prefactor data, so R and U vanish there
+    for f in range(PFIELDS):
+        for x in range(nl, ipad):
+            pin[unsafe_offset=f * ipad + x] = 0.0
+    run_kernel_lanes(lo, li, npo, tb.prim_ptr(ib), tb.e_ptr(ib), so, no, pin, nvec, boys, ws, F64Ptr(unsafe_from_address=wb.uaddr))
+    return ipad
+
+
 def eri_batch(
     tb: PairTable, ib: Int, tk: PairTable, kets: IntPtr, nket: Int, boys: BoysTable, ws: EriWork, mut wb: EriBatch
 ):
@@ -2112,40 +2211,17 @@ def eri_batch(
     one SIMD lane of ``eri_kernel_lanes``, which contracts the bra; each
     lane's ket transform follows.
     """
-    var npo = tb.get(ib, I_NP)
-    var lo = tb.get(ib, I_LAB)
+    var ipad = eri_batch_u(tb, ib, tk, kets, nket, boys, ws, wb)
     var no = tb.get(ib, I_NCOMP)
-    var so = tb.get(ib, I_STRIDE)
     var k0 = kets[unsafe_offset=0]
     var li = tk.get(k0, I_LAB)
     var nk = tk.get(k0, I_NCOMP)
     var sk = tk.get(k0, I_STRIDE)
-    var nl = 0
-    for k in range(nket):
-        nl += tk.get(kets[unsafe_offset=k], I_NP)
-    var nvec = (nl + W - 1) // W
-    var ipad = nvec * W
-    var pin = F64Ptr(unsafe_from_address=wb.paddr)
-    var lane = 0
-    for k in range(nket):
-        var ik = kets[unsafe_offset=k]
-        var np = tk.get(ik, I_NP)
-        var pp = tk.prim_ptr(ik)
-        var pst = padded(np)
-        for f in range(PFIELDS):
-            for kp in range(np):
-                pin[unsafe_offset=f * ipad + lane + kp] = pp[unsafe_offset=f * pst + kp]
-        lane += np
-    # unused lanes: zero prefactor data, so R and U vanish there
-    for f in range(PFIELDS):
-        for x in range(nl, ipad):
-            pin[unsafe_offset=f * ipad + x] = 0.0
     var ubuf = F64Ptr(unsafe_from_address=wb.uaddr)
-    run_kernel_lanes(lo, li, npo, tb.prim_ptr(ib), tb.e_ptr(ib), so, no, pin, nvec, boys, ws, ubuf)
     var out = list_ptr(wb.out)
+    var lane = 0
     comptime for LI_ in range(KMAX + 1):
         if li == LI_:
-            lane = 0
             for k in range(nket):
                 var ik = kets[unsafe_offset=k]
                 var np = tk.get(ik, I_NP)
