@@ -57,7 +57,8 @@ iteration then runs without touching Python or pyscf's C code at all.
   space (Coulomb and exchange through MO-basis DF tensors or exact
   integrals, the XC kernel in one fused pass): 3.3 to 8.6x faster than
   pyscf's operators for benzene, ferrocene and Cu(II) complexes, with the
-  same excitation energies; excited-state gradients 3.9 to 4.5x faster,
+  same excitation energies (6.5 to 8x in implicit solvent: PCM, SMD);
+  excited-state gradients 3.9 to 4.5x faster,
   the SCF stability analysis on the same operators 8 to 24x, and
   second-order SCF (`mf.newton()`, also ROKS and with solvent models)
   2.6 to 4.5x.
@@ -834,9 +835,38 @@ orbitals, density fitting and exact integrals (in-core MO matrices, AO
 densities with in-core or integral-direct J/K; `tests/test_tdscf.py`), and
 the excitation energies to 1e-12 Hartree; the excited-state gradients agree
 with pyscf's on the same TD solution to 1e-11 (`tests/test_tdgrad.py`).
-`wfnsym` restrictions, solvent models, short-range-only hybrids and DF
-tensors that do not fit in `max_memory` run pyscf's operator (Kohn-Sham
-objects still with the Mojo XC kernels).
+`wfnsym` restrictions, short-range-only hybrids and DF tensors that do not
+fit in `max_memory` run pyscf's operator (Kohn-Sham objects still with the
+Mojo XC kernels).
+
+**Solvent models.**  `mf.TDA()`/`mf.TDDFT()` of a solvated object (`mf.PCM()`,
+`mf.SMD()`, ...) is pyscf's `TDSCFWithSolvent`: the gas-phase response plus
+the solvent's `_B_dot_x` of the transition density, by default from a copy
+of the solvent with the optical dielectric constant 1.78 (non-equilibrium
+solvation; `equilibrium_solvation=True` keeps the ground state's).  The
+accelerated objects build that wrapper around the mojoscf TD classes, whose
+operator adds the solvent's response wherever the Coulomb term enters: to
+the symmetric part of the transition densities of all trial vectors at
+once (x + y, none for triplets), with the Mojo PCM kernels, projected on
+both blocks.  The products agree with pyscf's to about 1e-14 (relative) for
+TDA, full TDDFT and the Casida form, RKS singlets and triplets, UKS,
+RHF/UHF, PCM and SMD, equilibrium and non-equilibrium solvation, DF or
+exact integrals (`tests/test_tdscf.py`).  `bench_tddft.py` in water (same
+machine and settings as the table above):
+
+| system                                                   | nao | states | TD pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dE\| [eV] |
+|----------------------------------------------------------|----:|---:|-------:|------:|-----:|------:|-----:|--------:|
+| ferrocene / def2-SVP PBE0, TDA, C-PCM                    | 221 | 10 |  856.3 | 112.0 | 7.6x | 210.3 | 33.0 | 1.8e-06 |
+| ferrocene / def2-SVP PBE0, TDDFT, SMD                    | 221 | 10 | 1917.1 | 239.8 | 8.0x | 304.2 | 40.1 | 1.9e-07 |
+| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP, TDA (UKS), C-PCM  | 147 |  8 |  265.1 |  40.8 | 6.5x |  57.0 | 10.3 | 3.3e-11 |
+
+pyscf evaluates the solvent's response to every trial vector from
+three-centre integrals over the surface (`int3c2e`); here the potential at
+the surface points and the potential matrices of all vectors of an
+iteration come from one pass each of the Mojo PCM kernels (13 s of the
+112 s of the ferrocene TDA, for 2404 surface points; the rest is the
+gas-phase response).  The ferrocene energies differ by up to 2e-6 eV for
+the reason given above (independently converged SCFs).
 
 With exact integrals (pyscf's default) and the nuclear gradient of the first
 excited state (`td.nuc_grad_method()`, `bench_tddft.py --grad`), on the
@@ -871,7 +901,12 @@ for all vectors of an iteration at once (`lib.davidson1` with a batched
 operator in place of pyscf's per-vector `lib.davidson`), with pyscf's Fock
 blocks, preconditioner, thresholds and orbital rotation; the products agree
 with pyscf's to 1e-9 (relative) for RHF/RKS/UHF/UKS with global and
-range-separated hybrids, DF or exact (`tests/test_stability.py`).  The
+range-separated hybrids, DF or exact (`tests/test_stability.py`).  With a
+solvent model the analysis lets the solvent respond, as pyscf's
+`_Solvation.stability` does (equilibrium solvation unless the solvent is
+frozen): its `_B_dot_x` of the first-order densities enters the products
+of the internal and the RHF -> UHF analyses, the latter with the Fock
+matrix and the solvent term of pyscf's own external operator.  The
 starting space adds unit vectors on the lowest diagonal elements to pyscf's
 single vector, and Davidson follows as many roots as there are starting
 vectors (the lowest `nroots` are reported).  From pyscf's vector alone
@@ -1655,7 +1690,7 @@ but slow for more than a few dozen orbitals.
 | VV10 terms of the analytical Hessian (`pyscf.hessian.rks`: `_get_enlc_deriv2`, `_get_vnlc_deriv1`, `get_vnlc_resp` in every CPHF iteration) | C double loops over all ordered pairs of NLC grid points, three divisions per pair, the pair terms evaluated again for every six trial densities (`f_t`) or every grid-weight derivative | Mojo (`_mojo/nlc.mojo`, `mojoscf.nlchess`): the symmetric sums once per unordered pair, the trial and weight-derivative sums as GEMMs of tiles of pair coefficients, the grid-response sums per atom; the CPHF response from the XC kernels with the ground-state sums once |
 | XC response kernels (`cache_xc_kernel`, `nr_rks_fxc`, `nr_uks_fxc`: TDDFT, CPHF) | Python loop over blocks per density: C AO values, NumPy GEMMs and `einsum` | Mojo (`xc_fxc_core`): one fused pass, response densities, kernel contraction and potential per block; for transition densities from their occupied-virtual factors |
 | Analytical Hessians (`pyscf.hessian.rks`/`uks`, DF or not): XC second-derivative terms, first-order Fock matrices, CPHF | Python loops over grid blocks (AO values up to third derivatives, one nao x nao matrix per atom and direction), per-atom `einsum`s over libcint derivative integrals with HDF5 intermediates (DF), per-atom `_get_jk` calls over libcint derivative integrals (exact), AO first-order densities through `get_jk` and `nr_rks_fxc` per CPHF iteration | Mojo (`xc_hess_core`, `xc_h1_core`, `hess_df3c_core`, `int3c2e_ip1_core`, `hess_df_ip1_k_core`, `hess_dfk_rk_core`, `cphf_k_core`; exact: `hess2e_core`, `h1_2e_core`) + BLAS: XC terms contracted inside one grid pass, Fock derivatives and CPHF in the MO basis, second-derivative integrals contracted as produced, DF response vectors whitened with the metric's Cholesky factor, exact first-order Fock matrices of all atoms from one 8-fold pass; pyscf's driver and CPHF solver |
-| TDA/TDDFT/TDHF response (`pyscf.tdscf` `gen_vind`), DF | AO transition densities through `get_jk` (DF with non-symmetric densities: Python loop, `einsum`) and the XC kernel | Mojo (`_mojo/dfmo.mojo`, `mojoscf.tdscf`): MO-basis DF tensors once, Coulomb and exchange of all trial vectors in the occupied-virtual space (per-Q GEMMs), XC response projected in the kernel; pyscf's Davidson solvers |
+| TDA/TDDFT/TDHF response (`pyscf.tdscf` `gen_vind`), DF | AO transition densities through `get_jk` (DF with non-symmetric densities: Python loop, `einsum`) and the XC kernel; with a solvent model `_B_dot_x` per call (`int3c2e` over the surface) | Mojo (`_mojo/dfmo.mojo`, `mojoscf.tdscf`): MO-basis DF tensors once, Coulomb and exchange of all trial vectors in the occupied-virtual space (per-Q GEMMs), XC response projected in the kernel, the solvent response of all vectors from the Mojo PCM kernels; pyscf's Davidson solvers |
 | TDA/TDDFT/TDHF response, exact integrals | AO transition densities through `get_jk` with `hermi=0` (`_vhf.incore` or libcint + `libcvhf` direct) and the XC kernel | in-core ERIs transformed once to (ov) x (ov) matrices (GEMMs per iteration), or J/K of all transition densities in one integral-direct pass (antisymmetric parts K only); long-range exchange from erf-attenuated Mojo integrals |
 | excited-state gradients (`pyscf.grad.tdrks`/`tduks`/`tdrhf`), exact integrals | derivative J/K of four densities (libcint `int2e_ip1`, `libcvhf`), `_contract_xc_kernel` (Python loops, AO second/third derivatives), Z-vector through `gen_response` | Mojo: the two-electron term as one 8-fold pass over the derivative integrals contracted with density pairs (`grad2e_pairs_core`, also long-range), the XC-kernel contractions in grid passes, Z-vector through the Mojo J/K and XC kernels; pyscf's driver |
 | SCF stability analysis (`mf.stability()`) | orbital Hessian one vector per Davidson call, AO densities through `gen_response` | the TDDFT operators above for all vectors of an iteration (`lib.davidson1`); pyscf's Fock blocks, preconditioner and rotation |
@@ -1726,8 +1761,9 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   with the Mojo J/K (DF tensor, in-core ERIs or integral-direct), eigensolver
   and DIIS (pyscf's DIIS with point-group symmetry, whose error vectors it
   masks by irrep) and the Mojo gradients, stability analysis and excited
-  states where pyscf's plain methods would run; a decoration's own (a
-  solvent model's TD wrapper and stability set-up) is kept.  `accelerate`
+  states where pyscf's plain methods would run; a solvent model's TD
+  wrapper and stability set-up are rebuilt around them, other decorations'
+  own methods are kept.  `accelerate`
   hands Kohn-Sham objects to `mojoscf.dft.accelerate` and rejects GHF and
   Dirac-HF; `mojoscf.is_supported(mf)` tells whether the native loop runs.
 * **Kohn-Sham** RKS/UKS objects get the Mojo kernels with
@@ -1742,17 +1778,19 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
 * **Excited states**: `mojoscf.tdscf` (what `mf.TDA()`, `mf.TDDFT()` and
   `mf.CasidaTDDFT()` of accelerated objects create) builds the response of
   RHF/UHF/RKS/UKS references with in-core density fitting or exact integrals
-  in the occupied-virtual space; point-group restricted states (`wfnsym`),
-  solvent models, short-range-only hybrids, the NLC response, DF tensors
-  that do not fit in `max_memory` and objects with a `get_jk` of their own
-  keep pyscf's operator (with the Mojo XC response kernels for Kohn-Sham).
+  in the occupied-virtual space, also with a solvent model (pyscf's
+  `TDSCFWithSolvent` around them); point-group restricted states (`wfnsym`),
+  short-range-only hybrids, the NLC response, DF tensors that do not fit in
+  `max_memory`, ddCOSMO/PolEmbed TD wrappers and objects with a `get_jk` of
+  their own keep pyscf's operator (with the Mojo XC response kernels for
+  Kohn-Sham).
   Excited-state gradients (exact integrals; pyscf has no DF version) run
   pyscf's driver with the Mojo kernels (`mojoscf.tdgrad`).  ROKS/GHF and
   spin-flip TDDFT stay pyscf's.
 * **Stability analysis**: `mf.stability()` of the mojoscf classes runs the
   internal (RHF/RKS, UHF/UKS) and external RHF/RKS analyses with the
-  occupied-virtual operators; ROHF, GHF, the UHF -> GHF analysis,
-  point-group symmetry labels and solvent models use pyscf's.
+  occupied-virtual operators, also with a solvent model; ROHF, GHF, the
+  UHF -> GHF analysis and point-group symmetry labels use pyscf's.
 * **Second-order SCF**: `newton()` objects of RHF/RKS, UHF/UKS and ROHF/ROKS
   objects accelerated by mojoscf take the orbital Hessian from
   `mojoscf.soscf`, also with a solvent model.  These keep pyscf's
