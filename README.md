@@ -341,6 +341,18 @@ gradients.
   moved to the ket side and batched as well (*Gradient two-electron term*
   below): 12.2 -> 9.3 s (pyscf 41.9 s), 3.8 -> 2.7 s (17.5 s) and
   1.6 -> 1.2 s (7.3 s), i.e. 4.5x, 6.5x and 6.1x.
+* **Exact-integral Hessians.**  The two-electron second-derivative term
+  (`hess2e_core`) was over half of mojoscf's Hartree-Fock Hessian of
+  Ni(CO)4 / def2-SVP (14.5 of 26.2 s).  With translational invariance, the
+  derivative components contracted inside the kernel and the quartets of a
+  derivative pair summed in one call (*Hessian two-electron term* below)
+  it takes 2.8 s: the RHF Hessian 26.2 -> 13.3 s (pyscf 117.6 s, 4.5x ->
+  8.8x), the UHF Hessian of [Fe(H2O)6]2+ / def2-SVP 126.8 -> 97.7 s (pyscf
+  416.5 s, 3.3x -> 4.3x), same SCF, 4 cores of a 2.8 GHz Xeon.  The
+  Hessians agree with the previous ones to 5e-10 and with pyscf's (from its
+  own SCF) to 1e-8.  Most of the remaining time is now the CPHF J/K over
+  the in-core integrals (3N first-order densities per iteration, twice for
+  UHF) and the first-order Fock matrices (`h1_2e_core`).
 
 ### DF-CASSCF of metal complexes
 
@@ -1079,9 +1091,10 @@ keeps pyscf's driver, nuclear term and CPHF solver and replaces the rest:
   erf(omega r)/r.
 * **Exact integrals** (pyscf's default) follow the same plan with the
   four-centre derivative integrals of the engine: the Coulomb/exchange
-  partial Hessian from one pass over the unique shell quartets with the
-  second-derivative integrals contracted with the density products as they
-  are produced (`hess2e_core`), the first-order Fock matrices of all 3N
+  partial Hessian from the unique shell quartets, the second-derivative
+  integrals contracted with the density products inside the kernel and
+  never formed (`hess2e_core`, see *Hessian two-electron term* in the
+  engine section), the first-order Fock matrices of all 3N
   perturbations from one pass with the first-derivative integrals of all
   four centres digested into derivative J/K matrices (`h1_2e_core`, in
   place of pyscf's per-atom `_get_jk` calls in `make_h1`), and the CPHF
@@ -1364,6 +1377,30 @@ The implementation is built around a few decisions, each measured:
   first.  This replaced one six-component bra pass and one three-component
   ket pass per quartet on the single-quartet path, where single-primitive
   quartets ran in scalar code.
+* **Hessian two-electron term** (`hess2e_core`).  A quartet's second
+  derivatives at its four centres have 78 components (21 within each pair,
+  36 between them); translational invariance leaves 45, those in a, c and
+  d: the 21 components of the ket pair, nabla a times nabla c and nabla d
+  (18) and nabla a nabla a (6), and the blocks of b follow.  A pair whose
+  shells sit on one atom needs only their sum, so one pass with the other
+  pair's 21 components gives every block, and quartets on one atom are
+  skipped.  Each pass has its derivatives on one pair (or one first
+  derivative on each) and runs through `eri_fused_raw`: G is first
+  contracted with the other pair's Hermite matrices (a small GEMM), and the
+  kernel contracts each derivative component with the result instead of
+  transforming it.  Profiling then showed the passes bound by memory: the
+  21-component Hermite matrices of a contracted d-p pair take 1.7 MB and
+  were read for every quartet.  What a pass adds to the Hessian depends on
+  the quartet only through the derivative pair and the atoms of the other
+  pair's centres it involves (b for the ket pass, a and b for the mixed
+  one, none for nabla a nabla a), so the quartets of a derivative pair that
+  share them are summed in one kernel call, the other pairs' primitive
+  pairs joined as its inner side, which also fills the SIMD lanes (quartets
+  here average 5-10 primitive quartets).  The ket and mixed passes run over
+  blocks of four kets, so that each bra's matrices are read once per block.
+  From the minao density, 4 cores of a 2.8 GHz Xeon: Ni(CO)4 / def2-SVP
+  14.5 -> 2.8 s, [Fe(H2O)6]2+ / def2-SVP 31.2 -> 6.5 s (invariance alone
+  gave 7.5 and 16.1 s, the fused contraction then 5.3 s for Ni(CO)4).
 * Higher degrees use a generic kernel with run-time loops and
   register-tiled SIMD products.  Primitive pairs with `mu |AB|^2 > 60` are
   dropped (libcint's `EXPCUTOFF`), shell quartets are Schwarz-screened

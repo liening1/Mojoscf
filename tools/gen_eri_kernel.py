@@ -169,6 +169,51 @@ def boys_lane(dst: str, base: int) -> list[str]:
     return out
 
 
+def fused_step() -> list[str]:
+    """The outer step of ``eri_fused_raw``: contract each outer component's functions with T instead of
+    transforming."""
+    out = []
+    A = out.append
+    A("        if nx > 0:")
+    A("            # fused contraction: m[xi][x] += sum_ho (-1)^{|ho|} sum_c E_O[ko][ho][x no + c] T[ho][xi bs + c],")
+    A("            # vectors over c (T is zero past the no functions of each of the si / bs inner blocks); two")
+    A("            # components and four partial sums each at a time")
+    A("            var eob = eo.unsafe_offset(ko * NHO * so)")
+    A("            var bs = (no + W - 1) // W * W")
+    A("            var nvb = bs // W")
+    A("            for xi in range(si // bs):")
+    A("                var tbx = tb.unsafe_offset(xi * bs)")
+    A("                var mx = m.unsafe_offset(xi * nx * W)")
+    A("                var x = 0")
+    A("                while x < nx:")
+    A("                    var two = x + 1 < nx")
+    A("                    var e0 = eob.unsafe_offset(x * no)")
+    A("                    var e1 = eob.unsafe_offset((x + 1) * no) if two else e0")
+    for k in range(4):
+        A(f"                    var a{k} = SIMD[DType.float64, W](0.0)")
+        A(f"                    var b{k} = SIMD[DType.float64, W](0.0)")
+    A("                    for iv in range(nvb):")
+    A("                        comptime for ho in range(NHO):")
+    A("                            var t = tbx.unsafe_load[width=W](ho * si + iv * W)")
+    A("                            var u0 = e0.unsafe_load[width=W](ho * so + iv * W)")
+    A("                            var u1 = e1.unsafe_load[width=W](ho * so + iv * W)")
+    for k in range(4):
+        kw = "comptime if" if k == 0 else "elif"
+        A(f"                            {kw} ho % 4 == {k}:")
+        A("                                comptime if herm_odd(ho):")
+        A(f"                                    a{k} -= u0 * t")
+        A(f"                                    b{k} -= u1 * t")
+        A("                                else:")
+        A(f"                                    a{k} += u0 * t")
+        A(f"                                    b{k} += u1 * t")
+    A("                    mx.unsafe_store(x * W, mx.unsafe_load[width=W](x * W) + ((a0 + a1) + (a2 + a3)))")
+    A("                    if two:")
+    A("                        mx.unsafe_store((x + 1) * W, mx.unsafe_load[width=W]((x + 1) * W) + ((b0 + b1) + (b2 + b3)))")
+    A("                    x += 2")
+    A("            continue")
+    return out
+
+
 def outer_step() -> list[str]:
     out = []
     A = out.append
@@ -257,7 +302,7 @@ def kernel() -> str:
     A('''def eri_kernel_spec[LO: Int, LI: Int](
     nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
     nip: Int, pin: F64Ptr, ei: F64Ptr, si: Int,
-    btab: F64Ptr, m: F64Ptr,
+    btab: F64Ptr, m: F64Ptr, nx: Int,
 ):
     """(outer|inner) for Hermite degrees LO, LI known at compile time; M[o][i] += result.
 
@@ -268,7 +313,12 @@ def kernel() -> str:
     quartets (only the table look-up of the Boys function runs per lane) and
     R is stored as ``rv[h W + lane]``; otherwise one primitive quartet at a
     time with scalar arithmetic.  Either way the transforms take R as an
-    embedded broadcast operand.
+    embedded broadcast operand.  With ``nx`` > 0 the outer side has ``nx``
+    components of ``no`` functions each and the inner matrices are already
+    contracted with them (``eri_fused_raw``), in si / bs blocks xi of bs =
+    padded(no) columns: per outer primitive pair, instead of the outer
+    transform, ``m[(xi nx + x) W:][:W]`` accumulates partial sums of
+    sum_ho (-1)^{|ho|} sum_c E_O[ko][ho][x no + c] T[ho][xi bs + c].
     """
     comptime NHO = nherm(LO)
     comptime NHI = nherm(LI)
@@ -278,7 +328,7 @@ def kernel() -> str:
     var niv = si // W
     var opad = padded(nop)
     var ipad = padded(nip)
-    var tb = stack_allocation[NHO * SIMAX, Float64, alignment=64]()
+    var tb = stack_allocation[NHO * SIMAX_FUSED, Float64, alignment=64]()
     # recursion scratch on the stack: every offset is a compile-time constant, so these can live in registers
     var rv = stack_allocation[2 * NHL * W, Float64, alignment=64]()    # vector path: two recursion levels, [h][lane]
     var fbv = stack_allocation[((L + 15) // 8) * 8 * W, Float64, alignment=64]()   # vector path: table rows, then scaled F_n
@@ -407,6 +457,7 @@ def kernel() -> str:
     A("                var eb = ei.unsafe_offset(ki0 * NHI * si)")
     out += inner_block("rs", "1", 16)
     A("                ki0 += 1")
+    out += fused_step()
     out += outer_step()
     return "\n".join(out) + "\n"
 

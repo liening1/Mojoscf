@@ -31,7 +31,8 @@ from _mojo.dfjk import unpack_row
 from _mojo.integrals import (
     Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, KetQueue, IntPtr, aux_table, attenuate, eri_quartet, eri_batch,
     int3c2e_core, schwarz_bounds, shell_nfunc, batch_classes, batch_supported, lanes_preferred, int_ptr,
-    I_A, I_B, I_LAB, I_NP, I_NCOMP, I_STRIDE, BATCH_LANES, KMAX, eri_batch_u, nherm, padded, W,
+    I_A, I_B, I_LAB, I_NP, I_NCOMP, I_STRIDE, BATCH_LANES, KMAX, PFIELDS, eri_batch_u, eri_fused_raw, nherm, padded,
+    W,
 )
 
 
@@ -395,6 +396,30 @@ def _grad2e_flush(
         _grad_add(basis, acc, a, c, d, b, _quartet_weight(a, b, c, d, sp, spk), ga.unsafe_offset(9 * k), with_a)
 
 
+def _bras_by_nprim(tab: PairTable) -> List[Int]:
+    """The pairs of ``tab`` by decreasing number of primitive pairs (ties: the higher index first): the task order
+    of the drivers whose bra is the pair of a quartet with more primitive pairs, so the bras with the most kets
+    come first."""
+    var npairs = tab.npairs
+    var maxnp = 0
+    for sp in range(npairs):
+        maxnp = max(maxnp, tab.get(sp, I_NP))
+    var start = List[Int](length=maxnp + 2, fill=0)
+    for sp in range(npairs):
+        start[tab.get(sp, I_NP)] += 1
+    var tot = 0
+    for np in range(maxnp, -1, -1):
+        var cnt = start[np]
+        start[np] = tot
+        tot += cnt
+    var order = List[Int](length=max(npairs, 1), fill=0)
+    for sp in range(npairs - 1, -1, -1):
+        var np = tab.get(sp, I_NP)
+        order[start[np]] = sp
+        start[np] += 1
+    return order^
+
+
 comptime LAB_BATCH = 3      # kets (and two-centre bras) of grad2e_core's lane batches: degree <= 3
 
 
@@ -459,23 +484,7 @@ def _grad2e_driver(var basis: Basis, var boys: BoysTable, spec: GSpec, tol: Floa
             mck = max(mck, tab.get(sp, I_NCOMP))
         if lab <= LAB_BATCH + 1:
             mcb = max(mcb, tab.get(sp, I_NCOMP))
-    # bras with the most primitive pairs (the most kets) first
-    var maxnp = 0
-    for sp in range(npairs):
-        maxnp = max(maxnp, tab.get(sp, I_NP))
-    var start = List[Int](length=maxnp + 2, fill=0)
-    for sp in range(npairs):
-        start[tab.get(sp, I_NP)] += 1
-    var tot = 0
-    for np in range(maxnp, -1, -1):
-        var cnt = start[np]
-        start[np] = tot
-        tot += cnt
-    var order = List[Int](length=max(npairs, 1), fill=0)
-    for sp in range(npairs - 1, -1, -1):
-        var np = tab.get(sp, I_NP)
-        order[start[np]] = sp
-        start[np] += 1
+    var order = _bras_by_nprim(tab)
     var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
     var per = 3 * natm
     var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
@@ -599,7 +608,6 @@ def _grad2e_driver(var basis: Basis, var boys: BoysTable, spec: GSpec, tol: Floa
     _ = accl^
     _ = kcls^
     _ = order^
-    _ = start^
     _ = counter^
     _ = tab^
     _ = tab1^
@@ -715,13 +723,230 @@ def _sym3(c: Int) -> Int:
     return 5
 
 
-def _add_block(hess: F64Ptr, natm: Int, ia: Int, ja: Int, blk: F64Ptr, w: Float64, transpose: Bool):
-    """hess[ia][ja] += w blk (3 x 3, row-major), or w blk^T."""
-    var dst = hess.unsafe_offset((ia * natm + ja) * 9)
+def _hess_pair21(hq: F64Ptr, h: F64Ptr, p: Int, r: Int):
+    """Blocks H[p][p], H[p][r], H[r][p] and H[r][r] of ``hq`` (4 x 4 centre blocks of 3 x 3, row-major) from the
+    21 second-derivative components ``h`` of a pair of centres p, r (as ``_d2ops``)."""
     for x in range(3):
         for y in range(3):
-            var v = blk[unsafe_offset=y * 3 + x] if transpose else blk[unsafe_offset=x * 3 + y]
-            dst[unsafe_offset=x * 3 + y] += w * v
+            var s = _sym3(3 * x + y)
+            var v = h[unsafe_offset=6 + 3 * x + y]
+            hq[unsafe_offset=p * 45 + 3 * x + y] = h[unsafe_offset=s]
+            hq[unsafe_offset=r * 45 + 3 * x + y] = h[unsafe_offset=15 + s]
+            hq[unsafe_offset=(p * 4 + r) * 9 + 3 * x + y] = v
+            hq[unsafe_offset=(r * 4 + p) * 9 + 3 * y + x] = v
+
+
+def _hess_invariance(hq: F64Ptr, m: Int, mask: Int):
+    """The blocks of centre ``m`` in ``hq`` from those among the centres of ``mask`` (bit P for centre P; m is
+    not among them): the centre derivatives of an integral sum to zero, so nabla_m = -sum_P nabla_P."""
+    for q in range(4):
+        if (mask >> q) & 1 == 0:
+            continue
+        for xy in range(9):
+            var v = 0.0
+            for p in range(4):
+                if (mask >> p) & 1 != 0:
+                    v += hq[unsafe_offset=(p * 4 + q) * 9 + xy]
+            hq[unsafe_offset=(m * 4 + q) * 9 + xy] = -v
+            hq[unsafe_offset=(q * 4 + m) * 9 + (xy % 3) * 3 + xy // 3] = -v
+    for xy in range(9):
+        var v = 0.0
+        for q in range(4):
+            if (mask >> q) & 1 != 0:
+                v += hq[unsafe_offset=(m * 4 + q) * 9 + xy]
+        hq[unsafe_offset=m * 45 + xy] = -v
+
+
+def _hess_scatter(acc: F64Ptr, natm: Int, t0: Int, t1: Int, t2: Int, t3: Int, hq: F64Ptr, mask: Int, w: Float64):
+    """hess[atom P][atom Q] += w H[P][Q] for the centres P, Q of ``mask``, centre P on atom t_P."""
+    for p in range(4):
+        if (mask >> p) & 1 == 0:
+            continue
+        var tp = t0 if p == 0 else (t1 if p == 1 else (t2 if p == 2 else t3))
+        for q in range(4):
+            if (mask >> q) & 1 == 0:
+                continue
+            var tq = t0 if q == 0 else (t1 if q == 1 else (t2 if q == 2 else t3))
+            var dst = acc.unsafe_offset((tp * natm + tq) * 9)
+            var src = hq.unsafe_offset((p * 4 + q) * 9)
+            for xy in range(9):
+                dst[unsafe_offset=xy] += w * src[unsafe_offset=xy]
+
+
+def _fused_y(tp: PairTable, ip: Int, gp: F64Ptr, nr: Int, gs: Int, y: F64Ptr, nxi: Int, scale: Float64):
+    """The inner matrices of ``eri_fused_raw``: Y_kp[h][xi gs + c] = scale sum_r E_kp[h][xi nr + r] Gp[r][c] for
+    the ``nxi`` components xi of pair ``ip`` of ``tp`` (``nr`` functions r each) and G with rows of ``gs`` values
+    (zero past the other pair's functions c).
+
+    A small GEMM: the rows (kp, h, xi) of Y are consecutive, so blocks of four of them and two SIMD vectors of
+    columns share every load of G."""
+    var e = tp.e_ptr(ip)
+    var se = tp.get(ip, I_STRIDE)
+    var nrow = tp.get(ip, I_NP) * nherm(tp.get(ip, I_LAB)) * nxi
+    var nv = gs // W
+    comptime V = SIMD[DType.float64, W]
+    var sv = V(scale)
+    var r4 = 0
+    while r4 < nrow:
+        var nb = min(4, nrow - r4)
+        # E rows of the block (repeated past its end; those results are not stored)
+        var e0 = e.unsafe_offset((r4 // nxi) * se + (r4 % nxi) * nr)
+        var q1 = min(r4 + 1, nrow - 1)
+        var q2 = min(r4 + 2, nrow - 1)
+        var q3 = min(r4 + 3, nrow - 1)
+        var e1 = e.unsafe_offset((q1 // nxi) * se + (q1 % nxi) * nr)
+        var e2 = e.unsafe_offset((q2 // nxi) * se + (q2 % nxi) * nr)
+        var e3 = e.unsafe_offset((q3 // nxi) * se + (q3 % nxi) * nr)
+        var yb = y.unsafe_offset(r4 * gs)
+        var v = 0
+        while v < nv:
+            var two = v + 1 < nv
+            var a0 = V(0.0)
+            var a1 = V(0.0)
+            var a2 = V(0.0)
+            var a3 = V(0.0)
+            var b0 = V(0.0)
+            var b1 = V(0.0)
+            var b2 = V(0.0)
+            var b3 = V(0.0)
+            var gv = gp.unsafe_offset(v * W)
+            if two:
+                for r in range(nr):
+                    var g0 = gv.unsafe_load[width=W](r * gs)
+                    var g1 = gv.unsafe_load[width=W](r * gs + W)
+                    var c0 = V(e0[unsafe_offset=r])
+                    var c1 = V(e1[unsafe_offset=r])
+                    var c2 = V(e2[unsafe_offset=r])
+                    var c3 = V(e3[unsafe_offset=r])
+                    a0 += c0 * g0
+                    b0 += c0 * g1
+                    a1 += c1 * g0
+                    b1 += c1 * g1
+                    a2 += c2 * g0
+                    b2 += c2 * g1
+                    a3 += c3 * g0
+                    b3 += c3 * g1
+            else:
+                for r in range(nr):
+                    var g0 = gv.unsafe_load[width=W](r * gs)
+                    a0 += V(e0[unsafe_offset=r]) * g0
+                    a1 += V(e1[unsafe_offset=r]) * g0
+                    a2 += V(e2[unsafe_offset=r]) * g0
+                    a3 += V(e3[unsafe_offset=r]) * g0
+            yb.unsafe_store(v * W, a0 * sv)
+            if nb > 1:
+                yb.unsafe_store(gs + v * W, a1 * sv)
+            if nb > 2:
+                yb.unsafe_store(2 * gs + v * W, a2 * sv)
+            if nb > 3:
+                yb.unsafe_store(3 * gs + v * W, a3 * sv)
+            if two:
+                yb.unsafe_store(v * W + W, b0 * sv)
+                if nb > 1:
+                    yb.unsafe_store(gs + v * W + W, b1 * sv)
+                if nb > 2:
+                    yb.unsafe_store(2 * gs + v * W + W, b2 * sv)
+                if nb > 3:
+                    yb.unsafe_store(3 * gs + v * W + W, b3 * sv)
+            v += 2
+        r4 += 4
+
+
+def _order_by_key(keys: List[Int], nkey: Int) -> List[Int]:
+    """The indices i with keys[i] >= 0, ordered by key (stable; keys below ``nkey``)."""
+    var start = List[Int](length=nkey + 1, fill=0)
+    var n = 0
+    for i in range(len(keys)):
+        if keys[i] >= 0:
+            start[keys[i] + 1] += 1
+            n += 1
+    for k in range(nkey):
+        start[k + 1] += start[k]
+    var out = List[Int](length=max(n, 1), fill=0)
+    for i in range(len(keys)):
+        var k = keys[i]
+        if k >= 0:
+            out[start[k]] = i
+            start[k] += 1
+    if n == 0:
+        _ = out.pop()
+    return out^
+
+
+comptime GROUP_PRIMS = 128      # primitive pairs of the inner pairs of one grouped kernel call, at most
+comptime GROUP_Y = 1 << 17      # values of their G-contracted Hermite matrices, at most
+comptime KET_BLOCK = 4          # kets of one task of hess2e_core's ket sweep
+
+
+struct _Groups(Movable):
+    """``n`` groups of plain pairs queued as the inner side of one ``eri_fused_raw`` call of ``hess2e_core``
+    each: their primitive data (field-major) and G-contracted Hermite matrices Y (quartet weights included),
+    all of one Hermite degree, the derivative pair outer; the kernel sums over them."""
+
+    var prim: List[Float64]
+    var pin: List[Float64]
+    var y: List[Float64]
+    var cap: Int            # primitive pairs per group, at most
+    var capy: Int           # values of Y per group, at most
+    var np: List[Int]       # primitive pairs queued
+    var ny: List[Int]       # values of Y used
+    var key: List[Int]      # the group key (-1: empty)
+    var t0: List[Int]       # atoms of the group's centres
+    var t1: List[Int]
+
+    def __init__(out self, n: Int, maxnp: Int, maxny: Int):
+        """Room for GROUP_PRIMS primitive pairs and GROUP_Y values of Y per group, or one pair of ``maxnp`` and
+        ``maxny``."""
+        self.cap = max(GROUP_PRIMS, maxnp)
+        self.capy = max(GROUP_Y, maxny)
+        self.prim = List[Float64](length=n * PFIELDS * self.cap, fill=0.0)
+        self.pin = List[Float64](length=PFIELDS * padded(self.cap) + W, fill=0.0)
+        self.y = List[Float64](length=n * self.capy + W, fill=0.0)
+        self.np = List[Int](length=n, fill=0)
+        self.ny = List[Int](length=n, fill=0)
+        self.key = List[Int](length=n, fill=-1)
+        self.t0 = List[Int](length=n, fill=0)
+        self.t1 = List[Int](length=n, fill=0)
+
+    def fits(self, g: Int, np: Int, ny: Int) -> Bool:
+        return self.np[g] + np <= self.cap and self.ny[g] + ny <= self.capy
+
+    def ybase(self, g: Int) -> F64Ptr:
+        return list_ptr(self.y).unsafe_offset(g * self.capy)
+
+    def ytail(self, g: Int) -> F64Ptr:
+        return list_ptr(self.y).unsafe_offset(g * self.capy + self.ny[g])
+
+    def add(mut self, g: Int, tp: PairTable, ip: Int, ny: Int):
+        """Queue the primitive pairs of pair ``ip`` of ``tp`` in group ``g``, whose ``ny`` values of Y were written
+        at ``ytail(g)``."""
+        var np = tp.get(ip, I_NP)
+        var pp = tp.prim_ptr(ip)
+        var pst = padded(np)
+        var dst = list_ptr(self.prim).unsafe_offset(g * PFIELDS * self.cap + self.np[g])
+        for f in range(PFIELDS):
+            for k in range(np):
+                dst[unsafe_offset=f * self.cap + k] = pp[unsafe_offset=f * pst + k]
+        self.np[g] += np
+        self.ny[g] += ny
+
+    def packed(mut self, g: Int) -> F64Ptr:
+        """Group ``g``'s primitive data as the kernel's five arrays of padded(np) values."""
+        var n = self.np[g]
+        var ipad = padded(n)
+        var pin = list_ptr(self.pin)
+        var src = list_ptr(self.prim).unsafe_offset(g * PFIELDS * self.cap)
+        for f in range(PFIELDS):
+            for k in range(n):
+                pin[unsafe_offset=f * ipad + k] = src[unsafe_offset=f * self.cap + k]
+            for k in range(n, ipad):
+                pin[unsafe_offset=f * ipad + k] = 0.0
+        return pin
+
+    def clear(mut self, g: Int):
+        self.np[g] = 0
+        self.ny[g] = 0
+        self.key[g] = -1
 
 
 def hess2e_core(
@@ -732,16 +957,36 @@ def hess2e_core(
 
     G as in ``grad2e_core`` (``jfac`` Dj Dj - ``kfac``/2 sum_s exchange products
     of the symmetric ``nk`` matrices Dk_s).  Each unique quartet a >= b,
-    c >= d, ab >= cd is evaluated with its eight permutations folded into a
-    weight, three times: with the 21 second-derivative components of the bra
-    pair (nabla_a nabla_a, nabla_a nabla_b, nabla_b nabla_b), with those of the
-    ket pair, and with the first derivatives of both pairs (nabla_a, nabla_b
-    by nabla_c, nabla_d); every component block is contracted with G as it is
-    produced and the 3 x 3 blocks go to the atoms of the four centres
-    (d^2/dR dR = nabla nabla).  A quartet is skipped when the largest Schwarz
-    bound of the three derivative products times max |G| is below ``tol``.
-    ``hess`` (natm x natm x 3 x 3) is overwritten.  ``omega`` > 0: the
-    long-range operator erf(omega r12) / r12.
+    c >= d, ab >= cd stands for its eight permutations (a weight); its bra
+    is the pair with more primitive pairs (d^2/dR dR = nabla nabla).  The
+    centre derivatives of an integral sum to zero, so the blocks of one
+    centre follow from those of the other three: three passes give the
+    second derivatives in a, c and d, the 21 components of the ket pair
+    (nabla_c nabla_c, nabla_c nabla_d, nabla_d nabla_d), nabla_a times
+    nabla_c and nabla_d, and nabla_a nabla_a, and those of b follow.  When
+    the two shells of a pair sit on the same atom only their sum is needed,
+    and one pass with the 21 components of the other pair gives every block;
+    quartets on a single atom do not depend on the geometry.
+
+    Every pass has derivatives on one pair (or one first derivative on each)
+    and runs through ``eri_fused_raw``: G is contracted with the Hermite
+    matrices of the other pair first, so the derivative pair's components
+    cost a dot product per Hermite row instead of a transform.  What a pass
+    adds to the Hessian depends on the quartet only through the derivative
+    pair and the atoms of the other pair's centres it involves (b for the
+    ket pass, a and b for the mixed one, none for nabla_a nabla_a, the ket's
+    atom for one-centre kets), so all quartets of a derivative pair sharing
+    those (and a Hermite degree) are summed in one kernel call, the
+    derivative pair outer, the others' primitive pairs as the inner side:
+    the large derivative matrices are read once per group rather than per
+    quartet and the kernel vectorises over the joined primitive pairs.  The
+    ket and mixed passes run over blocks of kets (KET_BLOCK, so that a bra's
+    matrices are read once for the block), their bras ordered by (atom of b,
+    degree, atom of a); the others over bras.  A quartet is skipped when the
+    Schwarz bound of its passes times max |G| is below ``tol``.  ``hess``
+    (natm x natm x 3 x 3) is overwritten.  ``omega`` > 0: the long-range
+    operator erf(omega r12) / r12 (the plain and the six-component tables,
+    one side of every pass, attenuated after the Schwarz bounds are taken).
     """
     var nbas = basis.nbas
     var nao = basis.nao
@@ -759,17 +1004,13 @@ def hess2e_core(
     var q = schwarz_bounds(boys, tab, ht)
     var tab21 = PairTable(basis, basis, sa, sb, ht, 3)
     var q21 = schwarz_bounds(boys, tab21, ht)
-    var tab6 = PairTable(basis, basis, sa, sb, ht, 2)
-    var q6 = schwarz_bounds(boys, tab6, ht)
-    var none = List[Int]()
-    var tab6w: PairTable
+    var tab2 = PairTable(basis, basis, sa, sb, ht, 2)
+    var q6 = schwarz_bounds(boys, tab2, ht)
+    var tab1 = PairTable(basis, basis, sa, sb, ht, 1)
+    var tabaa = PairTable(basis, basis, sa, sb, ht, 4)
     if omega > 0.0:
         attenuate(tab, omega)
-        tab6w = PairTable(basis, basis, sa, sb, ht, 2)
-        attenuate(tab6w, omega)
-    else:
-        tab6w = PairTable(basis, basis, none, none, ht)
-    var attenuated = omega > 0.0
+        attenuate(tab2, omega)
     # largest |Dj| and largest |Dk_s| per shell block
     var cj = List[Float64](length=max(nbas * nbas, 1), fill=0.0)
     var ck = List[Float64](length=max(nbas * nbas, 1), fill=0.0)
@@ -784,152 +1025,233 @@ def hess2e_core(
             for s in range(nk):
                 m = max(m, _block_max(dmk.unsafe_offset(s * n2), nao, i0, i1, j0, j1))
             ck[a * nbas + b] = m
+    var spec = GSpec(
+        False, nao, nbas, Int(dmj), nk, Int(dmk), jfac, kfac, Int(list_ptr(cj)), Int(list_ptr(ck)), 0, 0, 0, 0, 0, 0,
+        0, 0, 0,
+    )
     var nfmax = 1
     for a in range(nbas):
         nfmax = max(nfmax, shell_nfunc(basis, a))
-    var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
+    # orders: bras of the ket sweep by (atom of b, degree, atom of a); two-centre kets of the bra sweep by
+    # degree, one-centre ones by (atom, degree); kets of the ket sweep by increasing primitive pairs (the kets
+    # with the most bras first) in blocks of KET_BLOCK, then the two-centre bras by decreasing primitive pairs
+    var nl = 2 * basis.lmax + 1
+    var kb = List[Int](length=max(npairs, 1), fill=-1)
+    var k3 = List[Int](length=max(npairs, 1), fill=-1)
+    var k2 = List[Int](length=max(npairs, 1), fill=-1)
+    var maxnp = 0
+    var maxrow = 0      # Hermite rows of a first-derivative pair, at most
+    for sp in range(npairs):
+        var ta = basis.atom[tab.get(sp, I_A)]
+        var tb = basis.atom[tab.get(sp, I_B)]
+        var lab = tab.get(sp, I_LAB)
+        maxnp = max(maxnp, tab.get(sp, I_NP))
+        maxrow = max(maxrow, tab.get(sp, I_NP) * nherm(lab + 1))
+        kb[sp] = (tb * nl + lab) * natm + ta
+        if ta != tb:
+            k3[sp] = lab
+        else:
+            k2[sp] = ta * nl + lab
+    var maxny = maxrow * 3 * padded(nfmax * nfmax)      # Y of one pair, at most
+    var obra = _order_by_key(kb, natm * nl * natm)
+    var oket3 = _order_by_key(k3, nl)
+    var oket2 = _order_by_key(k2, natm * nl)
+    var kk = List[Int](length=max(npairs, 1), fill=-1)
+    var kt = List[Int](length=max(npairs, 1), fill=-1)
+    for sp in range(npairs):
+        var np = tab.get(sp, I_NP)
+        if np > 0 and q[sp] > 0.0:
+            kk[sp] = np
+            if basis.atom[tab.get(sp, I_A)] != basis.atom[tab.get(sp, I_B)]:
+                kt[sp] = maxnp - np
+    var okets = _order_by_key(kk, maxnp + 1)
+    var obras = _order_by_key(kt, maxnp + 1)
+    var nkets = len(okets)
+    var nkblk = (nkets + KET_BLOCK - 1) // KET_BLOCK
+    var ntask = nkblk + len(obras)
+    var nworkers = min(parallelism_level(), ntask) if ntask >= 16 else 1
     var per = natm * natm * 9
     var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
     var pacc = list_ptr(accl)
     var pq = list_ptr(q)
     var pq21 = list_ptr(q21)
     var pq6 = list_ptr(q6)
-    var pcj = list_ptr(cj)
-    var pck = list_ptr(ck)
+    var pokets = int_ptr(okets)
+    var pobras = int_ptr(obras)
+    var pobra = int_ptr(obra)
+    var poket3 = int_ptr(oket3)
+    var poket2 = int_ptr(oket2)
+    var nbra = len(obra)
+    var nket3 = len(oket3)
+    var nket2 = len(oket2)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
-    var ajf = abs(jfac)
-    var akf = 0.5 * Float64(nk) * abs(kfac)
 
-    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab21, imm tab6, imm tab6w, imm attenuated, imm pq, imm pq21, imm pq6, imm pcj, imm pck, imm pacc, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm natm, imm per, imm nk, imm dmj, imm dmk, imm jfac, imm kfac, imm ajf, imm akf, imm tol, imm nfmax}:
+    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab1, imm tab2, imm tab21, imm tabaa, imm pq, imm pq21, imm pq6, imm spec, imm pacc, imm pcount, imm ntask, imm nkblk, imm nkets, imm pokets, imm pobras, imm pobra, imm poket3, imm poket2, imm nbra, imm nket3, imm nket2, imm natm, imm per, imm tol, imm nfmax, imm maxnp, imm maxny}:
         var ws = EriWork(tab21.maxcomp, tab21.maxlab, tab21.maxcomp, tab21.maxlab)
-        var gbuf = List[Float64](length=nfmax * nfmax * nfmax * nfmax + 8, fill=0.0)
+        var nfp = padded(nfmax * nfmax)
+        var gbuf = List[Float64](length=nfmax * nfmax * nfp + W, fill=0.0)
         var g = list_ptr(gbuf)
-        var hbuf = List[Float64](length=21 + 21 + 36 + 9 * 4 + 8, fill=0.0)
-        var hb = list_ptr(hbuf)                 # bra second derivatives (21)
-        var hk = hb.unsafe_offset(21)           # ket second derivatives (21)
-        var hm = hk.unsafe_offset(21)           # mixed [bra 6][ket 6]
-        var blk3 = hm.unsafe_offset(36)         # 3 x 3 scratch blocks
+        var ga = _Groups(KET_BLOCK, maxnp, maxny)  # ket sweep: the ket pass of each ket; bra sweep: group 0
+        var gb = _Groups(KET_BLOCK, maxnp, maxny)  # ket sweep: the mixed pass of each ket
+        var hbuf = List[Float64](length=21 + 18 + 144 + 8, fill=0.0)
+        var hx = list_ptr(hbuf)                 # the components of a grouped pass
+        var hq = hx.unsafe_offset(21 + 18)      # the 4 x 4 centre blocks
         var acc = pacc.unsafe_offset(w * per)
+        # the kets of a block: pair, atoms, function offsets and counts, bounds
+        var kbuf = List[Int](length=10 * KET_BLOCK, fill=0)
+        var ki = int_ptr(kbuf)
+        var qbuf = List[Float64](length=3 * KET_BLOCK, fill=0.0)
+        var kq = list_ptr(qbuf)
         while True:
-            var task = Int(pcount[].fetch_add(1))
-            if task >= npairs:
+            var it = Int(pcount[].fetch_add(1))
+            if it >= ntask:
                 break
-            var sp = npairs - 1 - task
-            var qab = pq[unsafe_offset=sp]
-            if qab == 0.0:
+            if it < nkblk:
+                # ket sweep: the ket pass of every bra and the mixed pass of the two-centre bras of a block of kets
+                var nblk = min(KET_BLOCK, nkets - it * KET_BLOCK)
+                for j in range(nblk):
+                    var spk = pokets[unsafe_offset=it * KET_BLOCK + j]
+                    var c = tab.get(spk, I_A)
+                    var d = tab.get(spk, I_B)
+                    var o = ki.unsafe_offset(10 * j)
+                    o[unsafe_offset=0] = spk
+                    o[unsafe_offset=1] = tab.get(spk, I_NP)
+                    o[unsafe_offset=2] = c
+                    o[unsafe_offset=3] = d
+                    o[unsafe_offset=4] = basis.atom[c]
+                    o[unsafe_offset=5] = basis.atom[d]
+                    o[unsafe_offset=6] = basis.ao_loc[c]
+                    o[unsafe_offset=7] = basis.ao_loc[c + 1] - basis.ao_loc[c]
+                    o[unsafe_offset=8] = basis.ao_loc[d]
+                    o[unsafe_offset=9] = basis.ao_loc[d + 1] - basis.ao_loc[d]
+                    kq[unsafe_offset=3 * j] = pq[unsafe_offset=spk]
+                    kq[unsafe_offset=3 * j + 1] = pq21[unsafe_offset=spk]
+                    kq[unsafe_offset=3 * j + 2] = pq6[unsafe_offset=spk]
+                for ib in range(nbra):
+                    var sp = pobra[unsafe_offset=ib]
+                    var npb = tab.get(sp, I_NP)
+                    var a = tab.get(sp, I_A)
+                    var b = tab.get(sp, I_B)
+                    var ta = basis.atom[a]
+                    var tb = basis.atom[b]
+                    var one_ab = ta == tb
+                    var qab = pq[unsafe_offset=sp]
+                    var q21ab = pq21[unsafe_offset=sp]
+                    var q6ab = pq6[unsafe_offset=sp]
+                    var i0 = basis.ao_loc[a]
+                    var na = basis.ao_loc[a + 1] - i0
+                    var j0 = basis.ao_loc[b]
+                    var nb = basis.ao_loc[b + 1] - j0
+                    var nab = na * nb
+                    var lab = tab.get(sp, I_LAB)
+                    for j in range(nblk):
+                        var o = ki.unsafe_offset(10 * j)
+                        var spk = o[unsafe_offset=0]
+                        var npk = o[unsafe_offset=1]
+                        if npb < npk or (npb == npk and sp < spk):
+                            continue
+                        var c = o[unsafe_offset=2]
+                        var d = o[unsafe_offset=3]
+                        var tc = o[unsafe_offset=4]
+                        var td = o[unsafe_offset=5]
+                        if tc == td and (not one_ab or ta == tc):
+                            continue
+                        var qq = qab * kq[unsafe_offset=3 * j + 1]
+                        if not one_ab:
+                            qq = max(max(qq, q21ab * kq[unsafe_offset=3 * j]), q6ab * kq[unsafe_offset=3 * j + 2])
+                        if qq < tol or qq * spec.gmax(a, b, c, d) < tol:
+                            continue
+                        var nc = o[unsafe_offset=7]
+                        var nd = o[unsafe_offset=9]
+                        var gs = padded(nc * nd)
+                        spec.fill(g, i0, na, j0, nb, o[unsafe_offset=6], nc, o[unsafe_offset=8], nd, gs)
+                        var wgt = _quartet_weight(a, b, c, d, sp, spk)
+                        # the ket pass, grouped by (atom of b, degree)
+                        var key = tb * 64 + lab
+                        var ny = npb * nherm(lab) * gs
+                        if ga.np[j] > 0 and (ga.key[j] != key or not ga.fits(j, npb, ny)):
+                            _hess_flush_ket(tab21, spk, ga, j, ht, boys, ws, hx, hq, acc, natm, tc, td)
+                        _fused_y(tab, sp, g, nab, gs, ga.ytail(j), 1, wgt)
+                        ga.add(j, tab, sp, ny)
+                        ga.key[j] = key
+                        ga.t1[j] = tb
+                        if one_ab:
+                            continue
+                        # the mixed pass, grouped by (atom of a, atom of b, degree)
+                        var keym = (ta * natm + tb) * 64 + lab
+                        var nym = npb * nherm(lab + 1) * 3 * gs
+                        if gb.np[j] > 0 and (gb.key[j] != keym or not gb.fits(j, npb, nym)):
+                            _hess_flush_mixed(tab2, spk, gb, j, ht, boys, ws, hx, hq, acc, natm, tc, td)
+                        _fused_y(tab1, sp, g, nab, gs, gb.ytail(j), 3, wgt)
+                        gb.add(j, tab1, sp, nym)
+                        gb.key[j] = keym
+                        gb.t0[j] = ta
+                        gb.t1[j] = tb
+                for j in range(nblk):
+                    var o = ki.unsafe_offset(10 * j)
+                    if ga.np[j] > 0:
+                        _hess_flush_ket(tab21, o[unsafe_offset=0], ga, j, ht, boys, ws, hx, hq, acc, natm, o[unsafe_offset=4], o[unsafe_offset=5])
+                    if gb.np[j] > 0:
+                        _hess_flush_mixed(tab2, o[unsafe_offset=0], gb, j, ht, boys, ws, hx, hq, acc, natm, o[unsafe_offset=4], o[unsafe_offset=5])
                 continue
+            # bra sweep: the nabla_a nabla_a pass and the one-centre kets of a two-centre bra
+            var sp = pobras[unsafe_offset=it - nkblk]
+            var npb = tab.get(sp, I_NP)
             var a = tab.get(sp, I_A)
             var b = tab.get(sp, I_B)
+            var ta = basis.atom[a]
+            var tb = basis.atom[b]
             var i0 = basis.ao_loc[a]
             var na = basis.ao_loc[a + 1] - i0
             var j0 = basis.ao_loc[b]
             var nb = basis.ao_loc[b + 1] - j0
             var nab = na * nb
-            var djab = ajf * pcj[unsafe_offset=a * nbas + b]
-            for spk in range(sp + 1):
-                var qcd = pq[unsafe_offset=spk]
-                var qq = max(max(pq21[unsafe_offset=sp] * qcd, qab * pq21[unsafe_offset=spk]),
-                             pq6[unsafe_offset=sp] * pq6[unsafe_offset=spk])
-                if qq < tol:
-                    continue
-                var c = tab.get(spk, I_A)
-                var d = tab.get(spk, I_B)
-                var gmax = djab * pcj[unsafe_offset=c * nbas + d] + akf * (
-                    pck[unsafe_offset=a * nbas + c] * pck[unsafe_offset=b * nbas + d]
-                    + pck[unsafe_offset=a * nbas + d] * pck[unsafe_offset=b * nbas + c]
-                )
-                if qq * gmax < tol:
-                    continue
-                var k0 = basis.ao_loc[c]
-                var nc = basis.ao_loc[c + 1] - k0
-                var l0 = basis.ao_loc[d]
-                var nd = basis.ao_loc[d + 1] - l0
-                var ncd = nc * nd
-                # G[ij][kl] of the block
-                for i in range(na):
-                    for j in range(nb):
-                        var row = g.unsafe_offset((i * nb + j) * ncd)
-                        var dij = jfac * dmj[unsafe_offset=(i0 + i) * nao + j0 + j]
-                        for k in range(nc):
-                            var dkrow = dmj.unsafe_offset((k0 + k) * nao + l0)
-                            for l in range(nd):
-                                row[unsafe_offset=k * nd + l] = dij * dkrow[unsafe_offset=l]
-                        for s in range(nk):
-                            var dm = dmk.unsafe_offset(s * n2)
-                            var di = dm.unsafe_offset((i0 + i) * nao)
-                            var dj = dm.unsafe_offset((j0 + j) * nao)
-                            for k in range(nc):
-                                var dik = 0.5 * kfac * di[unsafe_offset=k0 + k]
-                                var djk = 0.5 * kfac * dj[unsafe_offset=k0 + k]
-                                var r = row.unsafe_offset(k * nd)
-                                for l in range(nd):
-                                    r[unsafe_offset=l] -= dik * dj[unsafe_offset=l0 + l] + djk * di[unsafe_offset=l0 + l]
-                var nabcd = nab * ncd
-                var wgt = 0.5
-                if a != b:
-                    wgt *= 2.0
-                if c != d:
-                    wgt *= 2.0
-                if sp != spk:
-                    wgt *= 2.0
-                # bra second derivatives: layout [21][ij][kl]
-                if not eri_quartet(tab21, sp, tab, spk, ht, boys, ws):
-                    continue
-                var out = list_ptr(ws.out)
-                for x in range(21):
-                    hb[unsafe_offset=x] = vdot_serial(out.unsafe_offset(x * nabcd), g, nabcd)
-                # ket second derivatives: layout [ij][21][kl]
-                _ = eri_quartet(tab, sp, tab21, spk, ht, boys, ws)
-                vfill(hk, 21, 0.0)
-                for ij in range(nab):
-                    var grow = g.unsafe_offset(ij * ncd)
-                    for x in range(21):
-                        hk[unsafe_offset=x] += vdot_serial(out.unsafe_offset((ij * 21 + x) * ncd), grow, ncd)
-                # first derivatives of both pairs: layout [6][ij][6][kl]
-                if attenuated:
-                    _ = eri_quartet(tab6, sp, tab6w, spk, ht, boys, ws)
-                else:
-                    _ = eri_quartet(tab6, sp, tab6, spk, ht, boys, ws)
-                vfill(hm, 36, 0.0)
-                for x in range(6):
-                    for ij in range(nab):
-                        var grow = g.unsafe_offset(ij * ncd)
-                        var base = out.unsafe_offset(((x * nab + ij) * 6) * ncd)
-                        for y in range(6):
-                            hm[unsafe_offset=x * 6 + y] += vdot_serial(base.unsafe_offset(y * ncd), grow, ncd)
-                var atm_a = basis.atom[a]
-                var atm_b = basis.atom[b]
-                var atm_c = basis.atom[c]
-                var atm_d = basis.atom[d]
-                # aa, ab, bb and cc, cd, dd blocks
-                for side in range(2):
-                    var h = hb if side == 0 else hk
-                    var p = atm_a if side == 0 else atm_c
-                    var r = atm_b if side == 0 else atm_d
-                    for xy in range(9):
-                        blk3[unsafe_offset=xy] = h[unsafe_offset=_sym3(xy)]
-                    _add_block(acc, natm, p, p, blk3, wgt, False)
-                    for xy in range(9):
-                        blk3[unsafe_offset=xy] = h[unsafe_offset=15 + _sym3(xy)]
-                    _add_block(acc, natm, r, r, blk3, wgt, False)
-                    for xy in range(9):
-                        blk3[unsafe_offset=xy] = h[unsafe_offset=6 + xy]
-                    _add_block(acc, natm, p, r, blk3, wgt, False)
-                    _add_block(acc, natm, r, p, blk3, wgt, True)
-                # bra-ket blocks: (a or b) x (c or d)
-                for u in range(2):
-                    var p = atm_a if u == 0 else atm_b
-                    for v in range(2):
-                        var r = atm_c if v == 0 else atm_d
-                        for x in range(3):
-                            for y in range(3):
-                                blk3[unsafe_offset=x * 3 + y] = hm[unsafe_offset=(u * 3 + x) * 6 + v * 3 + y]
-                        _add_block(acc, natm, p, r, blk3, wgt, False)
-                        _add_block(acc, natm, r, p, blk3, wgt, True)
+            var gts = padded(nab)
+            var qab = pq[unsafe_offset=sp]
+            var q21ab = pq21[unsafe_offset=sp]
+            var q6ab = pq6[unsafe_offset=sp]
+            for side in range(2):
+                var nket = nket3 if side == 0 else nket2
+                var oket = poket3 if side == 0 else poket2
+                for ik in range(nket):
+                    var spk = oket[unsafe_offset=ik]
+                    var npk = tab.get(spk, I_NP)
+                    if npk > npb or (npk == npb and spk > sp):
+                        continue
+                    var c = tab.get(spk, I_A)
+                    var d = tab.get(spk, I_B)
+                    var qq = q21ab * pq[unsafe_offset=spk]
+                    if side == 0:
+                        qq = max(max(qq, qab * pq21[unsafe_offset=spk]), q6ab * pq6[unsafe_offset=spk])
+                    if qq < tol or qq * spec.gmax(a, b, c, d) < tol:
+                        continue
+                    var k0 = basis.ao_loc[c]
+                    var nc = basis.ao_loc[c + 1] - k0
+                    var l0 = basis.ao_loc[d]
+                    var nd = basis.ao_loc[d + 1] - l0
+                    var lcd = tab.get(spk, I_LAB)
+                    # G[kl][ij], the pair symmetry of G
+                    spec.fill(g, k0, nc, l0, nd, i0, na, j0, nb, gts)
+                    var wgt = _quartet_weight(a, b, c, d, sp, spk)
+                    var tc = basis.atom[c]
+                    var key = lcd if side == 0 else tc * 64 + lcd
+                    var ny = npk * nherm(lcd) * gts
+                    if ga.np[0] > 0 and (ga.key[0] != key or not ga.fits(0, npk, ny)):
+                        _hess_flush_bra(tab21 if side == 1 else tabaa, sp, side == 1, ga, ht, boys, ws, hx, hq, acc, natm, ta, tb)
+                    _fused_y(tab, spk, g, nc * nd, gts, ga.ytail(0), 1, wgt)
+                    ga.add(0, tab, spk, ny)
+                    ga.key[0] = key
+                    ga.t0[0] = tc
+                if ga.np[0] > 0:
+                    _hess_flush_bra(tab21 if side == 1 else tabaa, sp, side == 1, ga, ht, boys, ws, hx, hq, acc, natm, ta, tb)
         _ = ws^
         _ = gbuf^
+        _ = ga^
+        _ = gb^
         _ = hbuf^
+        _ = kbuf^
+        _ = qbuf^
 
     if nworkers == 1:
         work(0)
@@ -943,12 +1265,22 @@ def hess2e_core(
     _ = accl^
     _ = cj^
     _ = ck^
+    _ = kb^
+    _ = k3^
+    _ = k2^
+    _ = kk^
+    _ = kt^
+    _ = obra^
+    _ = oket3^
+    _ = oket2^
+    _ = okets^
+    _ = obras^
     _ = counter^
     _ = tab^
+    _ = tab1^
+    _ = tab2^
     _ = tab21^
-    _ = tab6^
-    _ = tab6w^
-    _ = none^
+    _ = tabaa^
     _ = q^
     _ = q21^
     _ = q6^
@@ -958,6 +1290,68 @@ def hess2e_core(
     _ = basis^
     _ = boys^
 
+
+def _hess_flush_ket(
+    tab21: PairTable, spk: Int, mut grp: _Groups, gi: Int, ht: HermTable, boys: BoysTable, mut ws: EriWork,
+    hx: F64Ptr, hq: F64Ptr, acc: F64Ptr, natm: Int, tc: Int, td: Int,
+):
+    """The ket pass of group ``gi``, bras sharing the atom of b (``t1``) and the degree: the 21 components of the
+    ket, and the blocks of b by translational invariance (nabla_a enters only through other passes)."""
+    var li = grp.key[gi] % 64
+    var nip = grp.np[gi]
+    var pin = grp.packed(gi)
+    eri_fused_raw(tab21, spk, 21, li, nip, pin, grp.ybase(gi), 1, ht, boys, ws, hx)
+    _hess_pair21(hq, hx, 2, 3)
+    _hess_invariance(hq, 1, 0b1100)
+    _hess_scatter(acc, natm, 0, grp.t1[gi], tc, td, hq, 0b1110, 1.0)
+    grp.clear(gi)
+
+
+def _hess_flush_mixed(
+    tab2: PairTable, spk: Int, mut grp: _Groups, gi: Int, ht: HermTable, boys: BoysTable, mut ws: EriWork,
+    hx: F64Ptr, hq: F64Ptr, acc: F64Ptr, natm: Int, tc: Int, td: Int,
+):
+    """The mixed pass of group ``gi``, two-centre bras sharing the atoms of a and b and the degree: nabla_a times
+    nabla_c and nabla_d, the ket's six components outer and nabla_a's three as the inner blocks."""
+    var li = grp.key[gi] % 64 + 1
+    var nip = grp.np[gi]
+    var pin = grp.packed(gi)
+    eri_fused_raw(tab2, spk, 6, li, nip, pin, grp.ybase(gi), 3, ht, boys, ws, hx)
+    vfill(hq, 144, 0.0)
+    for x in range(3):
+        for y in range(3):
+            hq[unsafe_offset=18 + 3 * x + y] = hx[unsafe_offset=6 * x + y]
+            hq[unsafe_offset=72 + 3 * y + x] = hx[unsafe_offset=6 * x + y]
+            hq[unsafe_offset=27 + 3 * x + y] = hx[unsafe_offset=6 * x + 3 + y]
+            hq[unsafe_offset=108 + 3 * y + x] = hx[unsafe_offset=6 * x + 3 + y]
+    _hess_invariance(hq, 1, 0b1101)
+    _hess_scatter(acc, natm, grp.t0[gi], grp.t1[gi], tc, td, hq, 0b1111, 1.0)
+    grp.clear(gi)
+
+
+def _hess_flush_bra(
+    td: PairTable, sp: Int, one_ket: Bool, mut grp: _Groups, ht: HermTable, boys: BoysTable, mut ws: EriWork,
+    hx: F64Ptr, hq: F64Ptr, acc: F64Ptr, natm: Int, ta: Int, tb: Int,
+):
+    """Group 0, kets of the two-centre bra ``sp`` with one degree: two-centre kets, nabla_a nabla_a (``td`` the
+    six-component table; the blocks of b by invariance), or kets on one atom (``t0``), the 21 components of the
+    bra (``td`` the 21-component table; the ket's atom by invariance)."""
+    var li = grp.key[0] % 64
+    var nip = grp.np[0]
+    var pin = grp.packed(0)
+    if one_ket:
+        eri_fused_raw(td, sp, 21, li, nip, pin, grp.ybase(0), 1, ht, boys, ws, hx)
+        _hess_pair21(hq, hx, 0, 1)
+        _hess_invariance(hq, 2, 0b0011)
+        _hess_scatter(acc, natm, ta, tb, grp.t0[0], 0, hq, 0b0111, 1.0)
+    else:
+        eri_fused_raw(td, sp, 6, li, nip, pin, grp.ybase(0), 1, ht, boys, ws, hx)
+        for x in range(3):
+            for y in range(3):
+                hq[unsafe_offset=3 * x + y] = hx[unsafe_offset=_sym3(3 * x + y)]
+        _hess_invariance(hq, 1, 0b0001)
+        _hess_scatter(acc, natm, ta, tb, 0, 0, hq, 0b0011, 1.0)
+    grp.clear(0)
 
 
 def df_grad_rhs(

@@ -58,7 +58,7 @@ from std.memory import Pointer, stack_allocation
 from std.runtime import parallelism_level
 from std.sys import simd_width_of
 from max.algorithm import parallelize
-from _mojo.linalg import F64Ptr, list_ptr, vfill, vaxpy, vscale
+from _mojo.linalg import F64Ptr, list_ptr, vfill, vaxpy, vscale, vdot_serial
 
 comptime W = simd_width_of[DType.float64]()
 comptime I64Ptr = Pointer[Int64, MutAnyOrigin]
@@ -611,7 +611,8 @@ def fill_pair(
     electron coordinate, minus the derivative with respect to the centre.
     With ``nderiv`` = 3 the 21 second-derivative components of ``_d2ops``
     (nabla_a nabla_a, nabla_a nabla_b, nabla_b nabla_b), Hermite degree
-    la + lb + 2, each the composition of two first-derivative operators.
+    la + lb + 2, each the composition of two first-derivative operators;
+    with ``nderiv`` = 4 only the first six of them, nabla_a nabla_a.
     """
     var la = ba.l[a]
     var lb = bb.l[b] if b >= 0 else 0
@@ -626,8 +627,8 @@ def fill_pair(
     var tbb = b >= 0 and bb.needs_transform(b)
     var transform = ta or tbb
     var deriv = nderiv > 0
-    var second = nderiv == 3
-    var ndir = (21 if second else 3 * nderiv) if deriv else 1
+    var second = nderiv >= 3
+    var ndir = (21 if nderiv == 3 else (6 if nderiv == 4 else 3 * nderiv)) if deriv else 1
     var ccomp0 = nca * ncarta * ncb * ncartb
     var ncomp0 = nca * nfa * ncb * nfb
     var ccomp = ndir * ccomp0
@@ -648,7 +649,7 @@ def fill_pair(
     var rab2 = (ax - bx) * (ax - bx) + (ay - by) * (ay - by) + (az - bz) * (az - bz)
     var fac = ba.func_scale(a) * (bb.func_scale(b) if b >= 0 else 1.0)
     var la_e = la + (2 if second else (1 if deriv else 0))
-    var lb_e = lb + (2 if second else (1 if nderiv == 2 else 0))
+    var lb_e = lb + (2 if nderiv == 3 else (1 if nderiv == 2 else 0))
     var s = la_e + lb_e + 1
     var lb1 = lb_e + 1
     var esz = (la_e + 1) * lb1 * s
@@ -805,9 +806,9 @@ struct PairTable(Movable):
     var maxlab: Int
 
     def __init__(out self, ba: Basis, bb: Basis, sa: List[Int], sb: List[Int], ht: HermTable, nderiv: Int = 0):
-        """Pairs (sa[i], sb[i]); ``nderiv`` as in ``fill_pair`` (then ``ht`` must reach la + lb + 1, + 2 for 3)."""
+        """Pairs (sa[i], sb[i]); ``nderiv`` as in ``fill_pair`` (then ``ht`` must reach la + lb + 1, + 2 for 3, 4)."""
         var deriv = nderiv > 0
-        var ndir = (21 if nderiv == 3 else 3 * nderiv) if deriv else 1
+        var ndir = (21 if nderiv == 3 else (6 if nderiv == 4 else 3 * nderiv)) if deriv else 1
         var n = len(sa)
         var info = List[Int](length=max(n, 1) * NINFO, fill=0)
         var maxcomp = 1
@@ -819,7 +820,7 @@ struct PairTable(Movable):
             var b = sb[i]
             var la = ba.l[a]
             var lb = bb.l[b] if b >= 0 else 0
-            var lab = la + lb + (2 if nderiv == 3 else (1 if deriv else 0))
+            var lab = la + lb + (2 if nderiv >= 3 else (1 if deriv else 0))
             var ncomp = ndir * shell_nfunc(ba, a) * shell_nfunc(bb, b)
             var np = pair_nprim(ba, a, bb, b)
             var stride = padded(ncomp)
@@ -1080,6 +1081,7 @@ def contract_rows[TWO: Bool, ACC: Bool](
 comptime KMAX = 4         # specialised kernels for Hermite degrees lo, li <= KMAX ...
 comptime KMAX_EXT = 6     # ... and for one side up to KMAX_EXT when the other is at most 2
 comptime SIMAX = 64       # widest inner side handled by the specialised kernels
+comptime SIMAX_FUSED = 128  # ... and in their fused contraction (``eri_fused_raw``)
 comptime VMIN = 3         # inner primitives from which the kernels vectorise over primitive quartets
 
 
@@ -1087,7 +1089,7 @@ comptime VMIN = 3         # inner primitives from which the kernels vectorise ov
 def eri_kernel_spec[LO: Int, LI: Int](
     nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
     nip: Int, pin: F64Ptr, ei: F64Ptr, si: Int,
-    btab: F64Ptr, m: F64Ptr,
+    btab: F64Ptr, m: F64Ptr, nx: Int,
 ):
     """(outer|inner) for Hermite degrees LO, LI known at compile time; M[o][i] += result.
 
@@ -1098,7 +1100,12 @@ def eri_kernel_spec[LO: Int, LI: Int](
     quartets (only the table look-up of the Boys function runs per lane) and
     R is stored as ``rv[h W + lane]``; otherwise one primitive quartet at a
     time with scalar arithmetic.  Either way the transforms take R as an
-    embedded broadcast operand.
+    embedded broadcast operand.  With ``nx`` > 0 the outer side has ``nx``
+    components of ``no`` functions each and the inner matrices are already
+    contracted with them (``eri_fused_raw``), in si / bs blocks xi of bs =
+    padded(no) columns: per outer primitive pair, instead of the outer
+    transform, ``m[(xi nx + x) W:][:W]`` accumulates partial sums of
+    sum_ho (-1)^{|ho|} sum_c E_O[ko][ho][x no + c] T[ho][xi bs + c].
     """
     comptime NHO = nherm(LO)
     comptime NHI = nherm(LI)
@@ -1108,7 +1115,7 @@ def eri_kernel_spec[LO: Int, LI: Int](
     var niv = si // W
     var opad = padded(nop)
     var ipad = padded(nip)
-    var tb = stack_allocation[NHO * SIMAX, Float64, alignment=64]()
+    var tb = stack_allocation[NHO * SIMAX_FUSED, Float64, alignment=64]()
     # recursion scratch on the stack: every offset is a compile-time constant, so these can live in registers
     var rv = stack_allocation[2 * NHL * W, Float64, alignment=64]()    # vector path: two recursion levels, [h][lane]
     var fbv = stack_allocation[((L + 15) // 8) * 8 * W, Float64, alignment=64]()   # vector path: table rows, then scaled F_n
@@ -1503,6 +1510,67 @@ def eri_kernel_spec[LO: Int, LI: Int](
                         else:
                             tb.unsafe_store(h0 * si + tbo, ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7)))
                 ki0 += 1
+        if nx > 0:
+            # fused contraction: m[xi][x] += sum_ho (-1)^{|ho|} sum_c E_O[ko][ho][x no + c] T[ho][xi bs + c],
+            # vectors over c (T is zero past the no functions of each of the si / bs inner blocks); two
+            # components and four partial sums each at a time
+            var eob = eo.unsafe_offset(ko * NHO * so)
+            var bs = (no + W - 1) // W * W
+            var nvb = bs // W
+            for xi in range(si // bs):
+                var tbx = tb.unsafe_offset(xi * bs)
+                var mx = m.unsafe_offset(xi * nx * W)
+                var x = 0
+                while x < nx:
+                    var two = x + 1 < nx
+                    var e0 = eob.unsafe_offset(x * no)
+                    var e1 = eob.unsafe_offset((x + 1) * no) if two else e0
+                    var a0 = SIMD[DType.float64, W](0.0)
+                    var b0 = SIMD[DType.float64, W](0.0)
+                    var a1 = SIMD[DType.float64, W](0.0)
+                    var b1 = SIMD[DType.float64, W](0.0)
+                    var a2 = SIMD[DType.float64, W](0.0)
+                    var b2 = SIMD[DType.float64, W](0.0)
+                    var a3 = SIMD[DType.float64, W](0.0)
+                    var b3 = SIMD[DType.float64, W](0.0)
+                    for iv in range(nvb):
+                        comptime for ho in range(NHO):
+                            var t = tbx.unsafe_load[width=W](ho * si + iv * W)
+                            var u0 = e0.unsafe_load[width=W](ho * so + iv * W)
+                            var u1 = e1.unsafe_load[width=W](ho * so + iv * W)
+                            comptime if ho % 4 == 0:
+                                comptime if herm_odd(ho):
+                                    a0 -= u0 * t
+                                    b0 -= u1 * t
+                                else:
+                                    a0 += u0 * t
+                                    b0 += u1 * t
+                            elif ho % 4 == 1:
+                                comptime if herm_odd(ho):
+                                    a1 -= u0 * t
+                                    b1 -= u1 * t
+                                else:
+                                    a1 += u0 * t
+                                    b1 += u1 * t
+                            elif ho % 4 == 2:
+                                comptime if herm_odd(ho):
+                                    a2 -= u0 * t
+                                    b2 -= u1 * t
+                                else:
+                                    a2 += u0 * t
+                                    b2 += u1 * t
+                            elif ho % 4 == 3:
+                                comptime if herm_odd(ho):
+                                    a3 -= u0 * t
+                                    b3 -= u1 * t
+                                else:
+                                    a3 += u0 * t
+                                    b3 += u1 * t
+                    mx.unsafe_store(x * W, mx.unsafe_load[width=W](x * W) + ((a0 + a1) + (a2 + a3)))
+                    if two:
+                        mx.unsafe_store((x + 1) * W, mx.unsafe_load[width=W]((x + 1) * W) + ((b0 + b1) + (b2 + b3)))
+                    x += 2
+            continue
         # outer transform: M[o] += sum_ho (-1)^{|ho|} E_O[ko][ho][o] T[ho]; blocks of four o
         # and two SIMD vectors give eight independent FMA chains
         var eob = eo.unsafe_offset(ko * NHO * so)
@@ -1961,9 +2029,10 @@ def eri_kernel_generic(
     lo: Int, li: Int, ht: HermTable,
     nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
     nip: Int, pin: F64Ptr, ei: F64Ptr, si: Int,
-    boys: BoysTable, mut ws: EriWork, m: F64Ptr,
+    boys: BoysTable, mut ws: EriWork, m: F64Ptr, nx: Int,
 ):
-    """(outer|inner) for any degrees with run-time loops and the register-tiled kernels; M[o][i] += result."""
+    """(outer|inner) for any degrees with run-time loops and the register-tiled kernels; M[o][i] += result
+    (with ``nx`` > 0 the fused contraction of ``eri_kernel_spec``)."""
     var big_l = lo + li
     var s1 = big_l + 1
     var s2 = s1 * s1
@@ -2016,6 +2085,15 @@ def eri_kernel_generic(
             if (ht.t[ho] + ht.u[ho] + ht.v[ho]) % 2 == 1:
                 vscale(tb.unsafe_offset(ho * si), si, -1.0)
         var eob = eo.unsafe_offset(ko * nho * so)
+        if nx > 0:
+            var bs = padded(no)
+            for xi in range(si // bs):
+                for x in range(nx):
+                    var t = 0.0
+                    for ho in range(nho):
+                        t += vdot_serial(eob.unsafe_offset(ho * so + x * no), tb.unsafe_offset(ho * si + xi * bs), no)
+                    m[unsafe_offset=(xi * nx + x) * W] += t
+            continue
         var o = 0
         while o + 2 <= no:
             contract_rows[True, True](
@@ -2031,17 +2109,17 @@ def run_kernel(
     lo: Int, li: Int, ht: HermTable,
     nop: Int, po: F64Ptr, eo: F64Ptr, so: Int, no: Int,
     nip: Int, pin: F64Ptr, ei: F64Ptr, si: Int,
-    boys: BoysTable, mut ws: EriWork, m: F64Ptr,
+    boys: BoysTable, mut ws: EriWork, m: F64Ptr, nx: Int = 0,
 ):
-    if si <= SIMAX:
+    if si <= SIMAX or (nx > 0 and si <= SIMAX_FUSED):
         var btab = list_ptr(boys.table)
         comptime for LO_ in range(KMAX_EXT + 1):
             comptime for LI_ in range(KMAX_EXT + 1):
                 comptime if (LO_ <= KMAX and LI_ <= KMAX) or (LO_ <= 2 and LI_ <= KMAX_EXT) or (LI_ <= 2 and LO_ <= KMAX_EXT):
                     if lo == LO_ and li == LI_:
-                        eri_kernel_spec[LO_, LI_](nop, po, eo, so, no, nip, pin, ei, si, btab, m)
+                        eri_kernel_spec[LO_, LI_](nop, po, eo, so, no, nip, pin, ei, si, btab, m, nx)
                         return
-    eri_kernel_generic(lo, li, ht, nop, po, eo, so, no, nip, pin, ei, si, boys, ws, m)
+    eri_kernel_generic(lo, li, ht, nop, po, eo, so, no, nip, pin, ei, si, boys, ws, m, nx)
 
 
 comptime BATCH_LANES = 4 * W     # primitive pairs of the kets of one eri_batch call, at most
@@ -2345,6 +2423,38 @@ def eri_quartet(
             for i in range(nb):
                 out[unsafe_offset=i * nk + j] = src[unsafe_offset=i]
     return True
+
+
+def eri_fused_raw(
+    td: PairTable, idd: Int, nx: Int, li: Int, nip: Int, pin: F64Ptr, y: F64Ptr, nxi: Int, ht: HermTable,
+    boys: BoysTable, mut ws: EriWork, hx: F64Ptr,
+):
+    """hx[xi nx + x] = sum_ij,kl (d_x kl|p_xi ij) G[ij][kl] for the ``nx`` derivative components x of pair ``idd``
+    of ``td`` (functions x n + kl) and the ``nxi`` components xi of an inner side p (functions xi m + ij; one
+    for a plain pair), never forming the integrals.
+
+    The inner side is given by its Hermite degree ``li``, ``nip`` >= 1
+    primitive pairs (``pin``: the five kernel arrays of padded(nip) values)
+    and its Hermite matrices contracted with G, Y_kp[h][xi bs + kl] =
+    sum_ij E_kp[h][xi m + ij] G[ij][kl] in ``y`` (one block of nherm rows of
+    nxi bs values per primitive pair, bs = padded(n), zero past n in every
+    component).  The kernel runs with ``idd`` outer and Y as the inner
+    matrices, and contracts each outer component with the result instead of
+    transforming it (``nx`` in ``eri_kernel_spec``): that replaces the
+    transforms over the nx n functions of ``idd`` by ones over nxi bs.  The
+    inner side may join the primitive pairs of several pairs of one degree
+    (their Y scaled by any weights): the kernel sums over them.  ``idd``
+    must have primitive pairs.
+    """
+    var n = td.get(idd, I_NCOMP) // nx
+    var m = F64Ptr(unsafe_from_address=ws.maddr)
+    vfill(m, nxi * nx * W, 0.0)
+    run_kernel(
+        td.get(idd, I_LAB), li, ht, td.get(idd, I_NP), td.prim_ptr(idd), td.e_ptr(idd), td.get(idd, I_STRIDE), n,
+        nip, pin, y, nxi * padded(n), boys, ws, m, nx,
+    )
+    for x in range(nxi * nx):
+        hx[unsafe_offset=x] = m.unsafe_load[width=W](x * W).reduce_add()
 
 
 def block_max_abs(ws: EriWork, n: Int) -> Float64:

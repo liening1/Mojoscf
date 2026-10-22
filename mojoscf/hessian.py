@@ -441,9 +441,9 @@ def exact_jk_partial(hessobj, mo_coeff, mo_occ, tol=1e-14):
 
     The second derivatives of E_J - sum_t c_t E_K(omega_t) at fixed density
     (pyscf's ``ej - hyb ek - (alpha - hyb) ek_lr`` of ``_partial_hess_ejk``)
-    from :func:`mojoscf.integrals.hess2e`: one pass over the unique shell
-    quartets per exchange operator, the second-derivative integrals contracted
-    with the density products as they are produced.
+    from :func:`mojoscf.integrals.hess2e`: the unique shell quartets once per
+    exchange operator, the second-derivative integrals contracted with the
+    density products inside the kernel.
     """
     if _exact_jk_reason(hessobj, mo_coeff, mo_occ) is not None:
         return None
