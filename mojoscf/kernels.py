@@ -569,3 +569,31 @@ def jk_s8(eri, dm, with_j=True, with_k=True, hermi=1):
     vj = vj.reshape(dm_in.shape) if with_j else None
     vk = vk.reshape(dm_in.shape) if with_k else None
     return vj, vk
+
+
+def _jk_sets_args(dm_j, dm_k, hermi):
+    """Stacks for the ``*_jk_sets`` kernels: the symmetric parts of ``dm_j`` and :func:`_sym_anti` of ``dm_k``."""
+    dj = np.asarray(dm_j, dtype=np.float64)
+    dk = np.asarray(dm_k, dtype=np.float64)
+    nao = dk.shape[-1]
+    dj = dj.reshape(-1, nao, nao)
+    dj = np.ascontiguousarray(0.5 * (dj + dj.transpose(0, 2, 1)))
+    dk = np.ascontiguousarray(dk.reshape(-1, nao, nao))
+    stack, anti = _sym_anti(dk, hermi)
+    return dj, dk.shape[0], stack, anti
+
+
+def jk_sets(eri, dm_j, dm_k, hermi=1):
+    """``(vj, vk)``: J of the densities ``dm_j`` and K of ``dm_k`` ((n, nao, nao) stacks) from 8-fold packed
+    ERIs in one call, as :func:`jk_s8` would give them (J of the symmetric parts; ``hermi`` for ``dm_k``):
+    for UHF response J of the spin sums and K per spin, without J of every spin density."""
+    eri = _c(eri)
+    dj, nk, stack, anti = _jk_sets_args(dm_j, dm_k, hermi)
+    nao = stack.shape[-1]
+    npair = nao * (nao + 1) // 2
+    if eri.ndim != 1 or eri.size != npair * (npair + 1) // 2:
+        raise ValueError("eri must be the 8-fold packed int2e vector for this nao")
+    vj = np.zeros(dj.shape)
+    vk = np.zeros(stack.shape)
+    get_extension().jk_s8_sets(eri, dj, stack, vj, vk, len(anti))
+    return vj, _merge_anti(None, vk, nk, anti)[1]

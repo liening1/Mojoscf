@@ -226,14 +226,17 @@ def cphf_operator(mf, mo_coeff=None, mo_occ=None):
             dms.append(d if unrestricted else 2.0 * d)
         ksc = 1.0 if unrestricted else 0.5
         dall = np.concatenate(dms)
-        if kfull != 0:
+        dtot = dms[0] + dms[1] if unrestricted else dms[0]     # J is that of the spin sums
+        if kfull != 0 and unrestricted:
+            vj, vk = dft.exact_jk_sets(mf, dtot, dall, 1)
+            vk = vk * (ksc * kfull)
+        elif kfull != 0:
             vj, vk = dft.exact_jk(mf, dall, 1, True, True)
             vk = vk * (ksc * kfull)
         else:
-            vj, vk = dft.exact_jk(mf, dall, 1, True, False)[0], np.zeros_like(dall)
+            vj, vk = dft.exact_jk(mf, dtot, 1, True, False)[0], np.zeros_like(dall)
         for c, omega in klr:
             vk = vk + dft.exact_jk(mf, dall, 1, False, True, omega)[1] * (ksc * c)
-        vj = vj.reshape(len(chans), nset, *vj.shape[1:]).sum(axis=0)
         vs = []
         for s, ch in enumerate(chans):
             v = vj - vk[s * nset:(s + 1) * nset]

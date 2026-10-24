@@ -87,6 +87,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_hess_dfk_rk]("hess_dfk_rk", docstring="hess_dfk_rk(co, g, ck, v1, v1ck, aoloc, auxloc, i0, nb, rk, seq_path, seq_prefix): the DF Hessian exchange response vectors of occupied rows i0 <= i < i0 + nb, rk (naux, natm, 3, nb, nocc).")
         m.def_function[py_hess_dfk_contract]("hess_dfk_contract", docstring="hess_dfk_contract(rt, lt, i0, nb, gram, hr, want_h, seq_path, seq_prefix): gram += sum_P rt_P rt_P^T, hr[a] += sum_P lt[:, P, i0:i0+nb] rt[P, a] for whitened rt (nw, 3 natm, nb, nocc).")
         m.def_function[py_jk_s8]("jk_s8", docstring="jk_s8(eri_s8, dms, vj, vk, with_j, with_k, nanti): J/K from 8-fold packed ERIs (the last nanti densities antisymmetric: K only).")
+        m.def_function[py_jk_s8_sets]("jk_s8_sets", docstring="jk_s8_sets(eri_s8, dms_j, dms_k, vj, vk, nanti): J of dms_j and K of dms_k (the last nanti antisymmetric) from 8-fold packed ERIs in one call.")
         m.def_function[py_factorize_density]("factorize_density", docstring="factorize_density(dm, orb_out, sign_out, rel_tol, path, prefix) -> m.")
         m.def_function[scf_kernel]("scf_kernel", docstring="Native RHF/UHF SCF driver; see mojoscf.scf.kernel.")
         m.def_function[py_boys_table]("boys_table", docstring="boys_table(out): fill out (721 * 40 float64) with the Boys-function table.")
@@ -132,6 +133,7 @@ def PyInit__mojoscf() abi("C") -> PythonObject:
         m.def_function[py_jk_ip1]("jk_ip1", docstring="jk_ip1(basis, table, dms, vj, vk, with_j, with_k, tol, omega): sum_kl (nabla i j|kl) D_lk and sum_jk (nabla i j|kl) D_jk (omega > 0: erf(omega r) / r).")
         m.def_function[py_h1_2e]("h1_2e", docstring="h1_2e(basis, table, dmj, dmk, tol, out, omega): d/dR_Ax J[Dj_s] and K[Dk_s] for every atom and direction, (natm, 3, nj + nk, nao, nao).")
         m.def_function[py_direct_jk]("direct_jk", docstring="direct_jk(basis, table, dms, vj, vk, with_j, with_k, tol, nanti, omega): integral-direct J/K in one pass (the last nanti densities antisymmetric: K only; omega > 0: erf(omega r) / r).")
+        m.def_function[py_direct_jk_sets]("direct_jk_sets", docstring="direct_jk_sets(basis, table, dms_j, dms_k, vj, vk, tol, nanti, omega): integral-direct J of dms_j and K of dms_k (the last nanti antisymmetric) in one pass.")
         return m.finalize()
     except e:
         abort(String("error creating the mojoscf._mojoscf module: ", e))
@@ -656,6 +658,18 @@ def py_jk_s8(
     return PythonObject(None)
 
 
+def py_jk_s8_sets(
+    eri: PythonObject, dms_j: PythonObject, dms_k: PythonObject, vj: PythonObject, vk: PythonObject,
+    nanti: PythonObject,
+) raises -> PythonObject:
+    """J of the (symmetric) densities dms_j and K of dms_k (the last nanti antisymmetric), one call."""
+    var nj = Int(py=dms_j.shape[0])
+    var nk = Int(py=dms_k.shape[0])
+    var nao = Int(py=dms_k.shape[1]) if nk > 0 else Int(py=dms_j.shape[1])
+    jk_s8_core(f64ptr(eri), nao, nj, f64ptr(dms_j), f64ptr(vj), nk, f64ptr(dms_k), f64ptr(vk), Int(py=nanti))
+    return PythonObject(None)
+
+
 # --------------------------------------------------------------------------
 # Integral engine
 # --------------------------------------------------------------------------
@@ -749,6 +763,20 @@ def py_direct_jk(
     var nj = nset - na if Bool(py=with_j) else 0
     var nk = nset if Bool(py=with_k) else 0
     jk.jk(nj, f64ptr(dms), f64ptr(vj), nk, f64ptr(dms), f64ptr(vk), Float64(py=tol), na if nk > 0 else 0)
+    _ = jk^
+    return PythonObject(None)
+
+
+def py_direct_jk_sets(
+    basis: PythonObject, table: PythonObject, dms_j: PythonObject, dms_k: PythonObject, vj: PythonObject,
+    vk: PythonObject, tol: PythonObject, nanti: PythonObject, omega: PythonObject,
+) raises -> PythonObject:
+    """vj[s] = J[dms_j[s]] (symmetric densities) and vk[s] = K[dms_k[s]] (the last nanti antisymmetric) in one
+    pass over the integrals (outputs overwritten); omega > 0: erf(omega r) / r."""
+    var jk = DirectJK(_basis(basis), _boys(table), Float64(py=omega))
+    var nj = Int(py=dms_j.shape[0])
+    var nk = Int(py=dms_k.shape[0])
+    jk.jk(nj, f64ptr(dms_j), f64ptr(vj), nk, f64ptr(dms_k), f64ptr(vk), Float64(py=tol), Int(py=nanti))
     _ = jk^
     return PythonObject(None)
 

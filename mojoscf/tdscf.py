@@ -526,6 +526,9 @@ def _exact_two_electron(mf, chans, kterms):
             # Coulomb only: of the symmetric part of the summed densities
             d = dms[0] if len(dms) == 1 else sum(dms)
             vj = dft.exact_jk(mf, 0.5 * (d + d.transpose(0, 2, 1)), 1, True, False)[0]
+        elif jscale and len(dms) == 2:
+            # J of the summed densities, K of each channel's, in one call
+            vj, vk = dft.exact_jk_sets(mf, dms[0] + dms[1], np.concatenate(dms), 0)
         elif jscale or cfull != 0:
             vj, vk = dft.exact_jk(mf, np.concatenate(dms), 0, bool(jscale), cfull != 0)
             if vj is not None:

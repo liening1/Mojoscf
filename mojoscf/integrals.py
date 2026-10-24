@@ -472,6 +472,19 @@ def get_jk(mol, dm, with_j=True, with_k=True, direct_scf_tol=1e-13, hermi=1, ome
     return vj, vk
 
 
+def get_jk_sets(mol, dm_j, dm_k, direct_scf_tol=1e-13, hermi=1, omega=0.0):
+    """Integral-direct J of the densities ``dm_j`` and K of ``dm_k`` ((n, nao, nao) stacks) in one pass over
+    the integrals, as :func:`get_jk` gives them (J of the symmetric parts; ``hermi`` for ``dm_k``)."""
+    from .kernels import _jk_sets_args, _merge_anti
+
+    dj, nk, stack, anti = _jk_sets_args(dm_j, dm_k, hermi)
+    vj = np.zeros(dj.shape)
+    vk = np.zeros(stack.shape)
+    get_extension().direct_jk_sets(basis_tables(mol), _boys_table(), dj, stack, vj, vk, float(direct_scf_tol),
+                                   len(anti), _omega4c(omega))
+    return vj, _merge_anti(None, vk, nk, anti)[1]
+
+
 def _int1e_ip(mol, centers, charges, want_st):
     _check(mol, allow_ecp=True)
     tables = basis_tables(mol)

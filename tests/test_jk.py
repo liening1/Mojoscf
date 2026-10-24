@@ -344,6 +344,28 @@ def test_direct_get_jk_many_densities(atom, basis, cart, rng):
     assert abs(vj - rj).max() < tol and abs(vk - rk).max() < tol
 
 
+@pytest.mark.parametrize("ndm", [2, 5])
+def test_jk_sets_incore_and_direct(h2o_dz, eri_s8, rng, ndm):
+    """J of one stack and K of another in one call (UHF response: J of the spin sums, K per spin)."""
+    n = h2o_dz.nao_nr()
+    a = rng.standard_normal((2 * ndm, n, n))
+    dk = a + a.transpose(0, 2, 1)
+    dj = dk[:ndm] + dk[ndm:]
+    rj = scf.hf.get_jk(h2o_dz, dj)[0]
+    rk = scf.hf.get_jk(h2o_dz, dk)[1]
+    vj, vk = mojoscf.kernels.jk_sets(eri_s8, dj, dk)
+    assert abs(vj - rj).max() < 1e-11 and abs(vk - rk).max() < 1e-11
+    vj, vk = mojoscf.integrals.get_jk_sets(h2o_dz, dj, dk, direct_scf_tol=0.0)
+    assert abs(vj - rj).max() < 1e-11 and abs(vk - rk).max() < 1e-11
+    # non-symmetric exchange densities, J of the symmetric parts of the sums
+    rk = scf.hf.get_jk(h2o_dz, a, hermi=0)[1]
+    rj = scf.hf.get_jk(h2o_dz, a[:ndm] + a[ndm:], hermi=0)[0]
+    vj, vk = mojoscf.kernels.jk_sets(eri_s8, a[:ndm] + a[ndm:], a, hermi=0)
+    assert abs(vj - rj).max() < 1e-11 and abs(vk - rk).max() < 1e-11
+    vj, vk = mojoscf.integrals.get_jk_sets(h2o_dz, a[:ndm] + a[ndm:], a, direct_scf_tol=0.0, hermi=0)
+    assert abs(vj - rj).max() < 1e-11 and abs(vk - rk).max() < 1e-11
+
+
 def test_incore_eris_and_df_tensor_from_mojo_engine(h2o_dz):
     mf = mojoscf.RHF(h2o_dz)
     mode, eri, _ = mojoscf.native_veff(mf)

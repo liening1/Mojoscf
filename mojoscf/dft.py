@@ -1225,6 +1225,26 @@ def exact_jk(mf, dm, hermi=1, with_j=True, with_k=True, omega=None):
     return integrals.get_jk(mol, dm, with_j, with_k, direct_scf_tol=mf.direct_scf_tol, hermi=hermi)
 
 
+def exact_jk_sets(mf, dm_j, dm_k, hermi=1):
+    """J of the densities ``dm_j`` and K of ``dm_k`` with exact integrals in one call of the kernels (in-core
+    or integral-direct, as :func:`exact_jk`): for UHF response J of the spin sums with K per spin.  J is that
+    of the symmetric parts; ``hermi`` applies to ``dm_k``.  None when ``mf._eri`` is not an 8-fold ERI
+    array."""
+    from . import kernels
+
+    mol = mf.mol
+    nao = mol.nao_nr()
+    npair = nao * (nao + 1) // 2
+    eri = getattr(mf, "_eri", None)
+    if eri is None and (mol.incore_anyway or mf._is_mem_enough()):
+        eri = mf._eri = integrals.int2e_s8(mol)
+    if eri is not None:
+        if isinstance(eri, np.ndarray) and eri.dtype == np.float64 and eri.size == npair * (npair + 1) // 2:
+            return kernels.jk_sets(eri.reshape(-1), dm_j, dm_k, hermi)
+        return None
+    return integrals.get_jk_sets(mol, dm_j, dm_k, direct_scf_tol=mf.direct_scf_tol, hermi=hermi)
+
+
 class _MojoKSHook:
     """In front of a pyscf Kohn-Sham class (:func:`accelerate`): J/K and the eigensolver from mojoscf."""
 
