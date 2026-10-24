@@ -32,7 +32,7 @@ from _mojo.integrals import (
     Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, KetQueue, IntPtr, aux_table, attenuate, eri_quartet, eri_batch,
     int3c2e_core, schwarz_bounds, shell_nfunc, batch_classes, batch_supported, lanes_preferred, int_ptr,
     I_A, I_B, I_LAB, I_NP, I_NCOMP, I_STRIDE, BATCH_LANES, KMAX, PFIELDS, eri_batch_u, eri_fused_raw, nherm, padded,
-    W,
+    W, bras_by_nprim, LAB_BATCH,
 )
 
 
@@ -396,33 +396,6 @@ def _grad2e_flush(
         _grad_add(basis, acc, a, c, d, b, _quartet_weight(a, b, c, d, sp, spk), ga.unsafe_offset(9 * k), with_a)
 
 
-def _bras_by_nprim(tab: PairTable) -> List[Int]:
-    """The pairs of ``tab`` by decreasing number of primitive pairs (ties: the higher index first): the task order
-    of the drivers whose bra is the pair of a quartet with more primitive pairs, so the bras with the most kets
-    come first."""
-    var npairs = tab.npairs
-    var maxnp = 0
-    for sp in range(npairs):
-        maxnp = max(maxnp, tab.get(sp, I_NP))
-    var start = List[Int](length=maxnp + 2, fill=0)
-    for sp in range(npairs):
-        start[tab.get(sp, I_NP)] += 1
-    var tot = 0
-    for np in range(maxnp, -1, -1):
-        var cnt = start[np]
-        start[np] = tot
-        tot += cnt
-    var order = List[Int](length=max(npairs, 1), fill=0)
-    for sp in range(npairs - 1, -1, -1):
-        var np = tab.get(sp, I_NP)
-        order[start[np]] = sp
-        start[np] += 1
-    return order^
-
-
-comptime LAB_BATCH = 3      # kets (and two-centre bras) of grad2e_core's lane batches: degree <= 3
-
-
 def _grad2e_driver(var basis: Basis, var boys: BoysTable, spec: GSpec, tol: Float64, de: F64Ptr, omega: Float64):
     """de[A][x] = d/dR_Ax of E2 = 1/2 sum_ijkl (ij|kl) G_ijkl at fixed G (``spec``), for every atom A.
 
@@ -484,7 +457,7 @@ def _grad2e_driver(var basis: Basis, var boys: BoysTable, spec: GSpec, tol: Floa
             mck = max(mck, tab.get(sp, I_NCOMP))
         if lab <= LAB_BATCH + 1:
             mcb = max(mcb, tab.get(sp, I_NCOMP))
-    var order = _bras_by_nprim(tab)
+    var order = bras_by_nprim(tab)
     var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
     var per = 3 * natm
     var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)

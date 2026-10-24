@@ -2379,6 +2379,34 @@ struct KetQueue(Movable):
         self.lanes[kc] = 0
 
 
+def bras_by_nprim(tab: PairTable) -> List[Int]:
+    """The pairs of ``tab`` by decreasing number of primitive pairs (ties: the higher index first): the task order
+    of the drivers whose bra is the pair of a quartet with more primitive pairs, so the bras with the most kets
+    come first."""
+    var npairs = tab.npairs
+    var maxnp = 0
+    for sp in range(npairs):
+        maxnp = max(maxnp, tab.get(sp, I_NP))
+    var start = List[Int](length=maxnp + 2, fill=0)
+    for sp in range(npairs):
+        start[tab.get(sp, I_NP)] += 1
+    var tot = 0
+    for np in range(maxnp, -1, -1):
+        var cnt = start[np]
+        start[np] = tot
+        tot += cnt
+    var order = List[Int](length=max(npairs, 1), fill=0)
+    for sp in range(npairs - 1, -1, -1):
+        var np = tab.get(sp, I_NP)
+        order[start[np]] = sp
+        start[np] += 1
+    return order^
+
+
+comptime LAB_BATCH = KMAX - 1   # kets (and two-centre bras) of the derivative lane batches: the derivative pair,
+                                # one degree higher, within the lane kernels
+
+
 def eri_quartet(
     tb: PairTable, ib: Int, tk: PairTable, ik: Int, ht: HermTable, boys: BoysTable, mut ws: EriWork
 ) -> Bool:

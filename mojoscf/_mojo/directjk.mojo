@@ -41,12 +41,12 @@ from std.memory import Pointer, stack_allocation
 from std.python import PythonObject
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
-from _mojo.linalg import F64Ptr, list_ptr, vfill, vaxpy
+from _mojo.linalg import F64Ptr, list_ptr, vcopy, vfill, vaxpy
 from _mojo.integrals import (
     Basis, BoysTable, HermTable, PairTable, EriWork, EriBatch, I64Ptr, IntPtr, eri_quartet, eri_batch, eri_batch_u,
     schwarz_bounds, W, aligned_addr,
     shell_nfunc, batch_supported, batch_classes, lanes_preferred, int_ptr, KetQueue, attenuate, I_A, I_B, I_LAB,
-    I_NCOMP, I_NP, I_STRIDE, nherm,
+    I_NCOMP, I_NP, I_STRIDE, nherm, bras_by_nprim, LAB_BATCH,
 )
 
 
@@ -1059,6 +1059,321 @@ def jk_ip1_core(
     _ = boys^
 
 
+comptime H1_NBLK = 9    # derivative blocks of one quartet folded together: three atoms besides the remaining
+                        # one, three directions each
+
+
+def digest_h1[DO_J: Bool, DO_K: Bool, NC: Int, ND: Int](
+    nblk: Int, bp: IntPtr, bst: IntPtr, aj: IntPtr, ak: IntPtr,
+    na: Int, nb: Int, i0: Int, j0: Int, k0: Int, l0: Int, nao: Int, scale: Float64, dj: F64Ptr, dk: F64Ptr,
+):
+    """``digest_cd`` for all derivative blocks of one quartet in one pass over its functions.
+
+    Block t = 3 g + x (atom g, direction x; ``nblk`` = 3 per atom) starts at
+    address bp[t], with rows ij of bst[t] values and the ket's NC x ND values
+    contiguous in each, and is folded into the matrices at addresses aj[t],
+    ak[t].  The blocks of all atoms of a quartet sum to zero (translational
+    invariance), so the remaining atom's matrices, at aj[nblk + x] and
+    ak[nblk + x], receive minus the sums over g: its block is never formed
+    or contracted.  The density elements are read once for all blocks.
+    """
+    comptime NCD = NC * ND
+    var ng = nblk // 3
+    var s2 = 2.0 * scale
+    var dcd = stack_allocation[NCD, Float64]()            # D_cd (J)
+    var jcd = stack_allocation[H1_NBLK * NCD, Float64]()  # per block: 2 s sum_ij (ij|cd) D_ij (J)
+    var dad = stack_allocation[ND, Float64]()             # D_il, D_ik of the current bra row i (K)
+    var dac = stack_allocation[NC, Float64]()
+    var dbd = stack_allocation[ND, Float64]()             # D_jl, D_jk of the current j (K)
+    var dbc = stack_allocation[NC, Float64]()
+    var kad = stack_allocation[H1_NBLK * ND, Float64]()   # per block: K_il over j, k; K_ik over j, l (row i)
+    var kac = stack_allocation[H1_NBLK * NC, Float64]()
+    var kbd = stack_allocation[ND, Float64]()             # K_jl over k (one block, one (i, j))
+    var ebc = stack_allocation[NC, Float64]()             # the remaining atom's K_jk, K_jl: sums over g
+    var ebd = stack_allocation[ND, Float64]()
+    comptime if DO_J:
+        comptime for k in range(NC):
+            comptime for l in range(ND):
+                dcd[unsafe_offset=k * ND + l] = dj[unsafe_offset=(k0 + k) * nao + l0 + l]
+        for t in range(nblk * NCD):
+            jcd[unsafe_offset=t] = 0.0
+    for i in range(na):
+        var ri = (i0 + i) * nao
+        comptime if DO_K:
+            comptime for l in range(ND):
+                dad[unsafe_offset=l] = dk[unsafe_offset=ri + l0 + l]
+            comptime for k in range(NC):
+                dac[unsafe_offset=k] = dk[unsafe_offset=ri + k0 + k]
+            for t in range(nblk * ND):
+                kad[unsafe_offset=t] = 0.0
+            for t in range(nblk * NC):
+                kac[unsafe_offset=t] = 0.0
+        for j in range(nb):
+            var rj = (j0 + j) * nao
+            var ij = i * nb + j
+            var dij = 0.0
+            comptime if DO_J:
+                dij = s2 * dj[unsafe_offset=ri + j0 + j]
+            comptime if DO_K:
+                comptime for l in range(ND):
+                    dbd[unsafe_offset=l] = dk[unsafe_offset=rj + l0 + l]
+                comptime for k in range(NC):
+                    dbc[unsafe_offset=k] = dk[unsafe_offset=rj + k0 + k]
+            for x in range(3):
+                var esj = 0.0
+                comptime if DO_K:
+                    comptime for k in range(NC):
+                        ebc[unsafe_offset=k] = 0.0
+                    comptime for l in range(ND):
+                        ebd[unsafe_offset=l] = 0.0
+                for g in range(ng):
+                    var t = 3 * g + x
+                    var gv = F64Ptr(unsafe_from_address=bp[unsafe_offset=t]).unsafe_offset(ij * bst[unsafe_offset=t])
+                    var pj = F64Ptr(unsafe_from_address=aj[unsafe_offset=t])
+                    var pk = F64Ptr(unsafe_from_address=ak[unsafe_offset=t])
+                    var jc = jcd.unsafe_offset(t * NCD)
+                    var kd = kad.unsafe_offset(t * ND)
+                    var kc = kac.unsafe_offset(t * NC)
+                    var sj = 0.0
+                    comptime if DO_K:
+                        comptime for l in range(ND):
+                            kbd[unsafe_offset=l] = 0.0
+                    comptime for k in range(NC):
+                        var sac = 0.0
+                        var sbc = 0.0
+                        comptime for l in range(ND):
+                            var v = gv[unsafe_offset=k * ND + l]
+                            comptime if DO_J:
+                                sj += v * dcd[unsafe_offset=k * ND + l]
+                                jc[unsafe_offset=k * ND + l] += v * dij
+                            comptime if DO_K:
+                                sac += v * dbd[unsafe_offset=l]
+                                sbc += v * dad[unsafe_offset=l]
+                                kd[unsafe_offset=l] += v * dbc[unsafe_offset=k]
+                                kbd[unsafe_offset=l] += v * dac[unsafe_offset=k]
+                        comptime if DO_K:
+                            kc[unsafe_offset=k] += sac
+                            pk[unsafe_offset=rj + k0 + k] += scale * sbc
+                            ebc[unsafe_offset=k] += sbc
+                    comptime if DO_J:
+                        pj[unsafe_offset=ri + j0 + j] += s2 * sj
+                        esj += sj
+                    comptime if DO_K:
+                        comptime for l in range(ND):
+                            pk[unsafe_offset=rj + l0 + l] += scale * kbd[unsafe_offset=l]
+                            ebd[unsafe_offset=l] += kbd[unsafe_offset=l]
+                comptime if DO_J:
+                    var qj = F64Ptr(unsafe_from_address=aj[unsafe_offset=nblk + x])
+                    qj[unsafe_offset=ri + j0 + j] -= s2 * esj
+                comptime if DO_K:
+                    var qk = F64Ptr(unsafe_from_address=ak[unsafe_offset=nblk + x])
+                    comptime for k in range(NC):
+                        qk[unsafe_offset=rj + k0 + k] -= scale * ebc[unsafe_offset=k]
+                    comptime for l in range(ND):
+                        qk[unsafe_offset=rj + l0 + l] -= scale * ebd[unsafe_offset=l]
+        comptime if DO_K:
+            for x in range(3):
+                var qk = F64Ptr(unsafe_from_address=ak[unsafe_offset=nblk + x])
+                for g in range(ng):
+                    var t = 3 * g + x
+                    var pk = F64Ptr(unsafe_from_address=ak[unsafe_offset=t])
+                    comptime for k in range(NC):
+                        var v = scale * kac[unsafe_offset=t * NC + k]
+                        pk[unsafe_offset=ri + k0 + k] += v
+                        qk[unsafe_offset=ri + k0 + k] -= v
+                    comptime for l in range(ND):
+                        var v = scale * kad[unsafe_offset=t * ND + l]
+                        pk[unsafe_offset=ri + l0 + l] += v
+                        qk[unsafe_offset=ri + l0 + l] -= v
+    comptime if DO_J:
+        for x in range(3):
+            var qj = F64Ptr(unsafe_from_address=aj[unsafe_offset=nblk + x])
+            for g in range(ng):
+                var t = 3 * g + x
+                var pj = F64Ptr(unsafe_from_address=aj[unsafe_offset=t])
+                comptime for k in range(NC):
+                    comptime for l in range(ND):
+                        var v = jcd[unsafe_offset=t * NCD + k * ND + l]
+                        pj[unsafe_offset=(k0 + k) * nao + l0 + l] += v
+                        qj[unsafe_offset=(k0 + k) * nao + l0 + l] -= v
+
+
+def _h1_digest[DO_J: Bool, DO_K: Bool](
+    nblk: Int, bp: IntPtr, bst: IntPtr, aj: IntPtr, ak: IntPtr, na: Int, nb: Int, nc: Int, nd: Int,
+    i0: Int, j0: Int, k0: Int, l0: Int, nao: Int, scale: Float64, dj: F64Ptr, dk: F64Ptr, fb: F64Ptr, ploc: F64Ptr,
+):
+    """``digest_h1`` for kets of s to f shells (spherical, one contraction); otherwise every block and the
+    remaining atom's (formed in ``fb``, 2 nab ncd values) through ``digest_any``."""
+    comptime for KC in range(4):
+        comptime for KD in range(4):
+            if nc == 2 * KC + 1 and nd == 2 * KD + 1:
+                digest_h1[DO_J, DO_K, 2 * KC + 1, 2 * KD + 1](
+                    nblk, bp, bst, aj, ak, na, nb, i0, j0, k0, l0, nao, scale, dj, dk
+                )
+                return
+    var nab = na * nb
+    var ncd = nc * nd
+    var blk = fb
+    var rest = fb.unsafe_offset(nab * ncd)
+    for x in range(3):
+        vfill(rest, nab * ncd, 0.0)
+        for g in range(nblk // 3):
+            var t = 3 * g + x
+            var src = F64Ptr(unsafe_from_address=bp[unsafe_offset=t])
+            var st = bst[unsafe_offset=t]
+            for ij in range(nab):
+                for kl in range(ncd):
+                    var v = src[unsafe_offset=ij * st + kl]
+                    blk[unsafe_offset=ij * ncd + kl] = v
+                    rest[unsafe_offset=ij * ncd + kl] -= v
+            digest_any[DO_J, DO_K](
+                blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dj, F64Ptr(unsafe_from_address=aj[unsafe_offset=t]),
+                dk, F64Ptr(unsafe_from_address=ak[unsafe_offset=t]), ploc,
+            )
+        digest_any[DO_J, DO_K](
+            rest, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dj, F64Ptr(unsafe_from_address=aj[unsafe_offset=nblk + x]),
+            dk, F64Ptr(unsafe_from_address=ak[unsafe_offset=nblk + x]), ploc,
+        )
+
+
+def _set_cen(cen: IntPtr, m: Int, atom: Int, addr: Int, xs: Int, st: Int):
+    """Centre m of ``_h1_quartet``'s list: its atom, the address of its x block, the offset between directions
+    and the stride of rows ij (values)."""
+    cen[unsafe_offset=4 * m] = atom
+    cen[unsafe_offset=4 * m + 1] = addr
+    cen[unsafe_offset=4 * m + 2] = xs
+    cen[unsafe_offset=4 * m + 3] = st
+
+
+def _h1_quartet(
+    basis: Basis, a: Int, b: Int, c: Int, d: Int, same_pair: Bool, ncen: Int, cen: IntPtr, der: Int, scr: F64Ptr,
+    meta: IntPtr, nao: Int, n2: Int, nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, acc: F64Ptr, fb: F64Ptr,
+    ploc: F64Ptr,
+):
+    """Fold the nabla blocks of one quartet into the matrices of the displaced atoms (d/dR = -nabla).
+
+    ``cen`` lists ``ncen`` blocks, each nabla of one centre (``_set_cen``);
+    the centres not listed sit on atom ``der``, which receives minus the sum
+    over the other atoms (``digest_h1``), so blocks of centres on ``der`` are
+    not needed.  Blocks of one atom are summed in ``scr`` (3 x 3 nab ncd
+    values).  ``acc``: matrices [A][x][J sets, then K sets] of nao x nao.
+    """
+    var i0 = basis.ao_loc[a]
+    var na = basis.ao_loc[a + 1] - i0
+    var j0 = basis.ao_loc[b]
+    var nb = basis.ao_loc[b + 1] - j0
+    var k0 = basis.ao_loc[c]
+    var nc = basis.ao_loc[c + 1] - k0
+    var l0 = basis.ao_loc[d]
+    var nd = basis.ao_loc[d + 1] - l0
+    var nab = na * nb
+    var ncd = nc * nd
+    var nabcd = nab * ncd
+    var scale = -1.0
+    if a == b:
+        scale *= 0.5
+    if c == d:
+        scale *= 0.5
+    if same_pair:
+        scale *= 0.5
+    # blocks 3 g + x of the atoms g besides ``der``: views of the integrals, or their sums in ``scr``
+    var bp = meta
+    var bst = meta.unsafe_offset(H1_NBLK)
+    var aj = meta.unsafe_offset(2 * H1_NBLK)
+    var ak = meta.unsafe_offset(3 * H1_NBLK + 3)
+    var gat = meta.unsafe_offset(4 * H1_NBLK + 6)
+    var gsum = meta.unsafe_offset(4 * H1_NBLK + 9)
+    var ng = 0
+    for m in range(ncen):
+        var at = cen[unsafe_offset=4 * m]
+        if at == der:
+            continue
+        var base = cen[unsafe_offset=4 * m + 1]
+        var xs = cen[unsafe_offset=4 * m + 2]
+        var st = cen[unsafe_offset=4 * m + 3]
+        var g = 0
+        while g < ng and gat[unsafe_offset=g] != at:
+            g += 1
+        if g == ng:
+            gat[unsafe_offset=g] = at
+            gsum[unsafe_offset=g] = 0
+            for x in range(3):
+                bp[unsafe_offset=3 * g + x] = base + 8 * x * xs
+                bst[unsafe_offset=3 * g + x] = st
+            ng += 1
+            continue
+        for x in range(3):
+            var s = scr.unsafe_offset((3 * g + x) * nabcd)
+            var add = F64Ptr(unsafe_from_address=base + 8 * x * xs)
+            if gsum[unsafe_offset=g] == 0:
+                var src = F64Ptr(unsafe_from_address=bp[unsafe_offset=3 * g + x])
+                var sst = bst[unsafe_offset=3 * g + x]
+                for ij in range(nab):
+                    for kl in range(ncd):
+                        s[unsafe_offset=ij * ncd + kl] = src[unsafe_offset=ij * sst + kl] + add[unsafe_offset=ij * st + kl]
+                bp[unsafe_offset=3 * g + x] = Int(s)
+                bst[unsafe_offset=3 * g + x] = ncd
+            else:
+                for ij in range(nab):
+                    for kl in range(ncd):
+                        s[unsafe_offset=ij * ncd + kl] += add[unsafe_offset=ij * st + kl]
+        gsum[unsafe_offset=g] = 1
+    if ng == 0:
+        return
+    var nblk = 3 * ng
+    var nacc = nj + nk
+    # density s: J and K together while both have one, then the rest of either
+    for s in range(max(nj, nk)):
+        var sj = min(s, max(nj - 1, 0))
+        var sk = min(s, max(nk - 1, 0))
+        for t in range(nblk + 3):
+            var at = gat[unsafe_offset=t // 3] if t < nblk else der
+            var m0 = (at * 3 + t % 3) * nacc
+            aj[unsafe_offset=t] = Int(acc.unsafe_offset((m0 + sj) * n2))
+            ak[unsafe_offset=t] = Int(acc.unsafe_offset((m0 + nj + sk) * n2))
+        var dj = dmj.unsafe_offset(sj * n2)
+        var dk = dmk.unsafe_offset(sk * n2)
+        if s < nj and s < nk:
+            _h1_digest[True, True](nblk, bp, bst, aj, ak, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dj, dk, fb, ploc)
+        elif s < nj:
+            _h1_digest[True, False](nblk, bp, bst, aj, ak, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dj, dk, fb, ploc)
+        else:
+            _h1_digest[False, True](nblk, bp, bst, aj, ak, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dj, dk, fb, ploc)
+
+
+def _h1_flush(
+    basis: Basis, tab: PairTable, tab3: PairTable, tab6: PairTable, sp: Int, kets: IntPtr, nket: Int,
+    boys: BoysTable, ws: EriWork, mut wb1: EriBatch, mut wb2: EriBatch, cen: IntPtr, scr: F64Ptr, meta: IntPtr,
+    nao: Int, n2: Int, nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, acc: F64Ptr, fb: F64Ptr, ploc: F64Ptr,
+):
+    """``h1_2e_core`` for bra ``sp`` and queued kets through ``eri_batch`` (the kets' primitive pairs as SIMD
+    lanes): (nabla a b|cd) unless a and b share an atom, (ab|nabla c d) and (ab|c nabla d); b from translational
+    invariance."""
+    var a = tab.get(sp, I_A)
+    var b = tab.get(sp, I_B)
+    var nab = tab.get(sp, I_NCOMP)
+    var with_ab = basis.atom[a] != basis.atom[b]
+    var ncd = tab.get(kets[unsafe_offset=0], I_NCOMP)
+    if with_ab:
+        eri_batch(tab3, sp, tab, kets, nket, boys, ws, wb1)
+    eri_batch(tab, sp, tab6, kets, nket, boys, ws, wb2)
+    for k in range(nket):
+        var spk = kets[unsafe_offset=k]
+        var c = tab.get(spk, I_A)
+        var d = tab.get(spk, I_B)
+        var n = 0
+        if with_ab:
+            _set_cen(cen, 0, basis.atom[a], Int(wb1.block(k)), nab * ncd, ncd)
+            n = 1
+        var kb = Int(wb2.block(k))
+        _set_cen(cen, n, basis.atom[c], kb, ncd, 6 * ncd)
+        _set_cen(cen, n + 1, basis.atom[d], kb + 8 * 3 * ncd, ncd, 6 * ncd)
+        _h1_quartet(
+            basis, a, b, c, d, sp == spk, n + 2, cen, basis.atom[b], scr, meta, nao, n2, nj, nk, dmj, dmk, acc, fb,
+            ploc,
+        )
+
+
 def h1_2e_core(
     var basis: Basis, var boys: BoysTable, nj: Int, dmj: F64Ptr, nk: Int, dmk: F64Ptr, tol: Float64, dst: F64Ptr,
     omega: Float64 = 0.0,
@@ -1070,14 +1385,24 @@ def h1_2e_core(
     integrals differentiated at all four centres: the two-electron part of
     the Hessian's first-order Fock matrices (pyscf's ``make_h1``).  The
     densities must be symmetric.  Each unique quartet a >= b, c >= d,
-    ab >= cd is evaluated with the first derivatives of the bra pair (nabla_a,
-    nabla_b) and of the ket's first shell (nabla_c), the fourth centre from
-    translational invariance, and each of the twelve derivative blocks is
-    folded like an integral block (``digest_quartet``: the derivative has the
-    integral's eight-fold symmetry) into the matrices of the displaced atom.
-    A quartet is skipped when its derivative Schwarz bound times the largest
-    density element it meets is below ``tol``.  ``omega`` > 0: the
-    long-range operator erf(omega r12) / r12.
+    ab >= cd is evaluated once, by the task of its pair with more primitive
+    pairs (the bra), with the derivative integrals of ``grad2e_core``'s
+    driver: (nabla a b|cd) and the six-component pair (nabla c, nabla d) of
+    the ket, or the mirror split (nabla a, nabla b on the bra and nabla c)
+    when the ket is the higher pair, a single pass when either pair sits on
+    one atom (only the sum of its two derivatives is needed), and the bra's
+    kets of degree <= LAB_BATCH as SIMD lanes of ``eri_batch``.  The
+    derivative of the last centre follows from translational invariance:
+    the blocks are summed per atom, and the atom of the missing centre
+    receives minus the others' contractions (``digest_h1``: the derivative
+    has the integral's eight-fold symmetry, and all blocks of a quartet are
+    folded in one pass over its functions).  A quartet is skipped when
+    max(q'_ab q_cd, q_ab q'_cd) times the largest density element it meets
+    (as in the direct J/K) is below ``tol``, q' the Schwarz bound of the
+    six-component pair, or when its four centres sit on one atom.
+    ``omega`` > 0: the long-range operator erf(omega r12) / r12 (the plain
+    pair table, one side of every pass, attenuated after the Schwarz bounds
+    are taken).
     """
     var nbas = basis.nbas
     var nao = basis.nao
@@ -1097,7 +1422,6 @@ def h1_2e_core(
     var tab6 = PairTable(basis, basis, sa, sb, ht, 2)
     var q6 = schwarz_bounds(boys, tab6, ht)
     var tab3 = PairTable(basis, basis, sa, sb, ht, 1)
-    var q3 = schwarz_bounds(boys, tab3, ht)
     if omega > 0.0:
         attenuate(tab, omega)
     # largest density element per shell block, over all densities
@@ -1115,21 +1439,45 @@ def h1_2e_core(
     var nfmax = 1
     for a in range(nbas):
         nfmax = max(nfmax, shell_nfunc(basis, a))
+    # ket classes of the lane batches, as in grad2e_core
+    var kcls = List[Int](length=max(npairs, 1), fill=-1)
+    var nclass = batch_classes(tab, kcls)
+    var mck = 1     # largest ket of a batch
+    var mcb = 1     # largest bra of a batch
+    for sp in range(npairs):
+        var lab = tab.get(sp, I_LAB)
+        if lab > LAB_BATCH:
+            kcls[sp] = -1
+        else:
+            mck = max(mck, tab.get(sp, I_NCOMP))
+        if lab <= LAB_BATCH + 1:
+            mcb = max(mcb, tab.get(sp, I_NCOMP))
+    var order = bras_by_nprim(tab)
     var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
     var per = natm * 3 * nacc * n2
     var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
     var pacc = list_ptr(accl)
     var pq = list_ptr(q)
     var pq6 = list_ptr(q6)
-    var pq3 = list_ptr(q3)
+    var pkcls = int_ptr(kcls)
+    var porder = int_ptr(order)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab6, imm tab3, imm pq, imm pq6, imm pq3, imm pcond, imm pacc, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm nacc, imm nj, imm nk, imm dmj, imm dmk, imm tol, imm nfmax, imm per}:
+    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab6, imm tab3, imm pq, imm pq6, imm pcond, imm pacc, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm nj, imm nk, imm dmj, imm dmk, imm tol, imm nfmax, imm per, imm pkcls, imm porder, imm nclass, imm mck, imm mcb}:
         var ws = EriWork(tab6.maxcomp, tab6.maxlab, tab6.maxcomp, tab6.maxlab)
+        var wb1 = EriBatch(3 * mcb, mck)
+        var wb2 = EriBatch(mcb, 6 * mck)
+        var queue = KetQueue(nclass)
         var nf4 = nfmax * nfmax * nfmax * nfmax
-        var dbuf = List[Float64](length=12 * nf4 + 8, fill=0.0)
+        var dbuf = List[Float64](length=6 * nf4 + 8, fill=0.0)     # the first pass of a quartet
         var pd = list_ptr(dbuf)
+        var sbuf = List[Float64](length=11 * nf4 + 8, fill=0.0)    # atom sums (9 blocks), fallback (2)
+        var scr = list_ptr(sbuf)
+        var fb = scr.unsafe_offset(9 * nf4)
+        var ibuf = List[Int](length=16 + 4 * H1_NBLK + 12, fill=0)
+        var cen = int_ptr(ibuf)
+        var meta = cen.unsafe_offset(16)
         var loc = List[Float64](length=6 * nfmax * nfmax + 8, fill=0.0)
         var ploc = list_ptr(loc)
         var acc = pacc.unsafe_offset(w * per)
@@ -1137,66 +1485,110 @@ def h1_2e_core(
             var task = Int(pcount[].fetch_add(1))
             if task >= npairs:
                 break
-            var sp = npairs - 1 - task
+            var sp = porder[unsafe_offset=task]
             var qab = pq[unsafe_offset=sp]
             if qab == 0.0:
                 continue
             var a = tab.get(sp, I_A)
             var b = tab.get(sp, I_B)
-            var na = basis.ao_loc[a + 1] - basis.ao_loc[a]
-            var nb = basis.ao_loc[b + 1] - basis.ao_loc[b]
-            var nab = na * nb
+            var aa = basis.atom[a]
+            var ab = basis.atom[b]
+            var nab = tab.get(sp, I_NCOMP)
+            var npb = tab.get(sp, I_NP)
+            var lab = tab.get(sp, I_LAB)
+            var with_ab = aa != ab
+            var batch_bra = lab <= LAB_BATCH or (lab == LAB_BATCH + 1 and not with_ab)
             var dab = pcond[unsafe_offset=a * nbas + b]
-            for spk in range(sp + 1):
-                var qq = max(pq6[unsafe_offset=sp] * pq[unsafe_offset=spk], qab * pq3[unsafe_offset=spk])
+            for spk in range(npairs):
+                var npk = tab.get(spk, I_NP)
+                if npk > npb or (npk == npb and spk > sp):
+                    continue
+                var qq = max(pq6[unsafe_offset=sp] * pq[unsafe_offset=spk], qab * pq6[unsafe_offset=spk])
                 if qq < tol:
                     continue
                 var c = tab.get(spk, I_A)
                 var d = tab.get(spk, I_B)
+                var ac = basis.atom[c]
+                var ad = basis.atom[d]
+                if not with_ab and ac == aa and ad == aa:
+                    continue
                 var dmax = 4.0 * max(dab, pcond[unsafe_offset=c * nbas + d])
                 dmax = max(dmax, max(pcond[unsafe_offset=a * nbas + c], pcond[unsafe_offset=a * nbas + d]))
                 dmax = max(dmax, max(pcond[unsafe_offset=b * nbas + c], pcond[unsafe_offset=b * nbas + d]))
                 if qq * dmax < tol:
                     continue
-                var nc = basis.ao_loc[c + 1] - basis.ao_loc[c]
-                var nd = basis.ao_loc[d + 1] - basis.ao_loc[d]
-                var ncd = nc * nd
-                var nabcd = nab * ncd
-                # d/dR = -nabla: blocks [centre a, b, c, d][x][ij][kl]
-                if not eri_quartet(tab6, sp, tab, spk, ht, boys, ws):
-                    continue
-                var o6 = list_ptr(ws.out)
-                for x in range(6):
-                    var src = o6.unsafe_offset(x * nabcd)
-                    var dst = pd.unsafe_offset(x * nabcd)
-                    for e in range(nabcd):
-                        dst[unsafe_offset=e] = -src[unsafe_offset=e]
-                _ = eri_quartet(tab, sp, tab3, spk, ht, boys, ws)
-                var o3 = list_ptr(ws.out)
-                for ij in range(nab):
-                    for x in range(3):
-                        var src = o3.unsafe_offset((ij * 3 + x) * ncd)
-                        var dst = pd.unsafe_offset((6 + x) * nabcd + ij * ncd)
-                        for e in range(ncd):
-                            dst[unsafe_offset=e] = -src[unsafe_offset=e]
-                for x in range(3):
-                    var ba = pd.unsafe_offset(x * nabcd)
-                    var bb = pd.unsafe_offset((3 + x) * nabcd)
-                    var bc = pd.unsafe_offset((6 + x) * nabcd)
-                    var bd = pd.unsafe_offset((9 + x) * nabcd)
-                    for e in range(nabcd):
-                        bd[unsafe_offset=e] = -(ba[unsafe_offset=e] + bb[unsafe_offset=e] + bc[unsafe_offset=e])
-                for cen in range(4):
-                    var sh = a if cen == 0 else (b if cen == 1 else (c if cen == 2 else d))
-                    var atm = basis.atom[sh]
-                    for x in range(3):
-                        var aj = acc.unsafe_offset((atm * 3 + x) * nacc * n2)
-                        digest_quartet(
-                            basis, a, b, c, d, sp == spk, pd.unsafe_offset((cen * 3 + x) * nabcd), nao, n2, nj, nk,
-                            dmj, dmk, aj, aj.unsafe_offset(nj * n2), ploc,
+                var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
+                if kc >= 0 and lanes_preferred(tab, sp, tab, spk):
+                    if queue.full(kc, npk):
+                        _h1_flush(
+                            basis, tab, tab3, tab6, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb1, wb2, cen, scr,
+                            meta, nao, n2, nj, nk, dmj, dmk, acc, fb, ploc,
                         )
+                        queue.clear(kc)
+                    queue.push(kc, spk, npk)
+                    continue
+                var with_cd = ac != ad
+                var lcd = tab.get(spk, I_LAB)
+                var ncd = tab.get(spk, I_NCOMP)
+                var nabcd = nab * ncd
+                var ncen = 2
+                var der = aa
+                if with_ab and with_cd:
+                    if lcd > lab:
+                        # (nabla a, nabla b|cd) [6][ij][kl], then (ab|nabla c d) [ij][3][kl]; d by invariance
+                        if not eri_quartet(tab6, sp, tab, spk, ht, boys, ws):
+                            continue
+                        vcopy(pd, list_ptr(ws.out), 6 * nabcd)
+                        _ = eri_quartet(tab, sp, tab3, spk, ht, boys, ws)
+                        _set_cen(cen, 0, aa, Int(pd), nabcd, ncd)
+                        _set_cen(cen, 1, ab, Int(pd) + 8 * 3 * nabcd, nabcd, ncd)
+                        _set_cen(cen, 2, ac, Int(list_ptr(ws.out)), ncd, 3 * ncd)
+                        der = ad
+                    else:
+                        # (nabla a b|cd) [3][ij][kl], then (ab|nabla c d), (ab|c nabla d) [ij][6][kl]; b by invariance
+                        if not eri_quartet(tab3, sp, tab, spk, ht, boys, ws):
+                            continue
+                        vcopy(pd, list_ptr(ws.out), 3 * nabcd)
+                        _ = eri_quartet(tab, sp, tab6, spk, ht, boys, ws)
+                        var o = Int(list_ptr(ws.out))
+                        _set_cen(cen, 0, aa, Int(pd), nabcd, ncd)
+                        _set_cen(cen, 1, ac, o, ncd, 6 * ncd)
+                        _set_cen(cen, 2, ad, o + 8 * 3 * ncd, ncd, 6 * ncd)
+                        der = ab
+                    ncen = 3
+                elif with_ab or (not with_cd and lcd > lab):
+                    # the bra pass alone: c and d share an atom
+                    if not eri_quartet(tab6, sp, tab, spk, ht, boys, ws):
+                        continue
+                    var o = Int(list_ptr(ws.out))
+                    _set_cen(cen, 0, aa, o, nabcd, ncd)
+                    _set_cen(cen, 1, ab, o + 8 * 3 * nabcd, nabcd, ncd)
+                    der = ac
+                else:
+                    # the ket pass alone: a and b share an atom
+                    if not eri_quartet(tab, sp, tab6, spk, ht, boys, ws):
+                        continue
+                    var o = Int(list_ptr(ws.out))
+                    _set_cen(cen, 0, ac, o, ncd, 6 * ncd)
+                    _set_cen(cen, 1, ad, o + 8 * 3 * ncd, ncd, 6 * ncd)
+                _h1_quartet(
+                    basis, a, b, c, d, sp == spk, ncen, cen, der, scr, meta, nao, n2, nj, nk, dmj, dmk, acc, fb, ploc
+                )
+            # the rest of this bra's batches
+            for kc in range(nclass):
+                if queue.cnt[kc] > 0:
+                    _h1_flush(
+                        basis, tab, tab3, tab6, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb1, wb2, cen, scr, meta,
+                        nao, n2, nj, nk, dmj, dmk, acc, fb, ploc,
+                    )
+                    queue.clear(kc)
         _ = ws^
+        _ = wb1^
+        _ = wb2^
+        _ = queue^
         _ = dbuf^
+        _ = sbuf^
+        _ = ibuf^
         _ = loc^
 
     if nworkers == 1:
@@ -1223,13 +1615,14 @@ def h1_2e_core(
                 d[unsafe_offset=i * nao + j] = src[unsafe_offset=i * nao + j] + src[unsafe_offset=j * nao + i]
     _ = accl^
     _ = cond^
+    _ = kcls^
+    _ = order^
     _ = counter^
     _ = tab^
     _ = tab6^
     _ = tab3^
     _ = q^
     _ = q6^
-    _ = q3^
     _ = sa^
     _ = sb^
     _ = ht^

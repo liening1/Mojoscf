@@ -351,15 +351,18 @@ gradients.
   iteration, twice for UHF): with three or more densities the in-core J/K
   now runs them as SIMD lanes (*In-core J/K of many densities* below), 27
   densities of Ni(CO)4 in 0.12 s instead of 0.50 s (pyscf's `dot_eri_dm`
-  1.17 s).  Hessians from the same SCF, 4 cores of a 2.3 GHz Xeon:
+  1.17 s).  The first-order Fock matrices then moved to the gradient
+  driver's integral scheme with the blocks folded per atom (*First-order
+  Fock matrices of Hessians* below).  Hessians from the same SCF, 4 cores
+  of a 2.3 GHz Xeon:
 
-  | system                       | before | `hess2e` | + J/K  | pyscf   |
-  |------------------------------|-------:|---------:|-------:|--------:|
-  | RHF Ni(CO)4 / def2-SVP       | 15.7 s |   8.5 s  |  5.3 s |  72.7 s |
-  | UHF [Fe(H2O)6]2+ / def2-SVP  | 69.8 s |  53.5 s  | 20.9 s | 240.7 s |
+  | system                       | before | `hess2e` | + J/K  | + `h1` | pyscf   |
+  |------------------------------|-------:|---------:|-------:|-------:|--------:|
+  | RHF Ni(CO)4 / def2-SVP       | 15.7 s |   8.5 s  |  5.3 s |  5.0 s |  72.7 s |
+  | UHF [Fe(H2O)6]2+ / def2-SVP  | 69.8 s |  53.5 s  | 20.9 s | 19.8 s | 240.7 s |
 
-  i.e. 4.6x -> 13.7x and 3.4x -> 11.5x pyscf's speed; the Hessians agree
-  with each other to 7e-10 and with pyscf's (from its own SCF) to 1e-8.
+  i.e. 4.6x -> 14.5x and 3.4x -> 12.2x pyscf's speed; the Hessians agree
+  with each other to 9e-10 and with pyscf's (from its own SCF) to 1.4e-8.
 
 ### DF-CASSCF of metal complexes
 
@@ -1427,6 +1430,28 @@ The implementation is built around a few decisions, each measured:
   27 densities of Ni(CO)4 / def2-SVP (143 AOs): 0.50 -> 0.12 s, 114 of
   [Fe(H2O)6]2+ (175 AOs) 0.9 s, pyscf's `dot_eri_dm` 1.17 s for the 27;
   one or two densities keep the previous code.
+* **First-order Fock matrices of Hessians** (`h1_2e_core`).  The
+  derivative J/K matrices of every displacement took, per unique quartet,
+  a six-component pass (nabla a, nabla b) and a three-component one
+  (nabla c) through `eri_quartet`, and twelve digestions of the blocks
+  (four centres, three directions); the three-component pass cost as much
+  as the other, single-primitive kets running in scalar code.  The passes
+  now follow `grad2e_core`'s driver: bras by primitive pairs, nabla a with
+  the ket's six components or the mirror split, a single pass when a pair
+  sits on one atom (only the sum of its derivatives is needed), and the
+  bra's kets of degree <= 3 as SIMD lanes of `eri_batch`.  The blocks are
+  summed per atom and folded together (`digest_h1`): the density elements
+  are read once for all of them, and the atom of the missing centre
+  receives minus the others' sums (translational invariance), so its block
+  is never formed: 3 (k - 1) blocks for k atoms, 6.6 on average for
+  Ni(CO)4, instead of 12.  One J and one K density from the minao guess,
+  4 cores of a 2.3 GHz Xeon: Ni(CO)4 / def2-SVP 1.61 -> 1.15 s,
+  [Fe(H2O)6]2+ / def2-SVP 3.94 -> 2.86 s, Fe-porphine / def2-SVP (37
+  atoms, 427 AOs) 84.2 -> 60.8 s.  Two variants of the digestion did not
+  pay off: one single-primitive ket per SIMD lane (gathering the lanes'
+  Hermite matrices cost more than the vector contractions saved), and the
+  three directions of an atom as one vector (on medium blocks the scalar
+  code already runs at about two FMAs per cycle).
 * Higher degrees use a generic kernel with run-time loops and
   register-tiled SIMD products.  Primitive pairs with `mu |AB|^2 > 60` are
   dropped (libcint's `EXPCUTOFF`), shell quartets are Schwarz-screened
