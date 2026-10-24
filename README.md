@@ -930,17 +930,19 @@ machine and settings as the table above):
 
 | system                                                   | nao | states | TD pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dE\| [eV] |
 |----------------------------------------------------------|----:|---:|-------:|------:|-----:|------:|-----:|--------:|
-| ferrocene / def2-SVP PBE0, TDA, C-PCM                    | 221 | 10 |  856.3 | 112.0 | 7.6x | 210.3 | 33.0 | 1.8e-06 |
-| ferrocene / def2-SVP PBE0, TDDFT, SMD                    | 221 | 10 | 1917.1 | 239.8 | 8.0x | 304.2 | 40.1 | 1.9e-07 |
-| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP, TDA (UKS), C-PCM  | 147 |  8 |  265.1 |  40.8 | 6.5x |  57.0 | 10.3 | 3.3e-11 |
+| ferrocene / def2-SVP PBE0, TDA, C-PCM                    | 221 | 10 |  856.3 |  52.4 | 16.3x | 210.3 | 18.7 | 2.6e-05 |
+| ferrocene / def2-SVP PBE0, TDDFT, SMD                    | 221 | 10 | 1917.1 | 120.3 | 15.9x | 304.2 | 22.4 | 2.1e-07 |
+| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP, TDA (UKS), C-PCM  | 147 |  8 |  265.1 |  17.9 | 14.8x |  57.0 |  5.5 | 3.2e-11 |
 
 pyscf evaluates the solvent's response to every trial vector from
 three-centre integrals over the surface (`int3c2e`); here the potential at
 the surface points and the potential matrices of all vectors of an
-iteration come from one pass each of the Mojo PCM kernels (13 s of the
-112 s of the ferrocene TDA, for 2404 surface points; the rest is the
-gas-phase response).  The ferrocene energies differ by up to 2e-6 eV for
-the reason given above (independently converged SCFs).
+iteration come from one pass each of the Mojo PCM kernels (13 s for the
+2404 surface points of the ferrocene TDA; the rest is the gas-phase
+response).  The rows were re-measured after the changes to the XC kernels
+(XC item above), against the same pyscf runs.  The ferrocene energies
+differ by up to 3e-5 eV for the reason given above (independently converged
+SCFs and Davidson iterations).
 
 With exact integrals (pyscf's default) and the nuclear gradient of the first
 excited state (`td.nuc_grad_method()`, `bench_tddft.py --grad`), on the
@@ -1202,15 +1204,15 @@ the TDDFT table:
 
 | system                                      | nao | Hessian pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dH\| | max \|dfreq\| [cm^-1] |
 |---------------------------------------------|----:|-------:|------:|-----:|------:|-----:|--------:|-----:|
-| benzene / def2-SVP B3LYP                    | 114 |  124.8 |  17.4 | 7.2x |   8.2 |  2.7 | 2.0e-08 | 0.00 |
+| benzene / def2-SVP B3LYP                    | 114 |  143.6 |   8.5 | 17.0x |   8.2 |  1.4 | 1.4e-08 | 0.00 |
 | ferrocene / def2-SVP PBE0                   | 221 | 1129.5 | 173.5 | 6.5x | 179.6 | 39.1 | 3.1e-06 | 0.00 |
-| ferrocene / def2-SVP PBE                    | 221 |  709.0 | 121.1 | 5.9x |  50.7 | 16.8 | 5.8e-07 | 0.00 |
+| ferrocene / def2-SVP PBE                    | 221 |  896.7 |  46.1 | 19.5x |  51.9 |  7.7 | 6.7e-06 | 0.01 |
 | ferrocene / def2-SVP CAM-B3LYP              | 221 | 1552.8 | 225.0 | 6.9x |  90.8 | 40.2 | 1.5e-06 | 0.04 |
-| [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  118.6 |  27.8 | 4.3x |  16.6 |  4.4 | 2.3e-08 | 0.00 |
-| ethylene / def2-SVP ωB97M-V                 |  48 | 1537.4 | 138.4 | 11.1x |  78.7 | 11.4 | 2.8e-09 | 0.00 |
-| [ZnCl4]2- / def2-SVP ωB97M-V                | 103 | 3293.3 | 409.2 | 8.0x | 190.2 | 26.2 | 1.0e-07 | 0.00 |
-| Ni(CO)4 / def2-SVP B3LYP, C-PCM (water)     | 143 |  485.0 |  46.0 | 10.5x |  54.7 | 10.2 | 1.9e-07 | 0.00 |
-| [CuCl4]2- doublet / def2-SVP B3LYP, SMD (water, UKS) | 103 | 278.4 | 41.1 | 6.8x | 32.8 | 5.7 | 2.3e-08 | 0.00 |
+| [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  130.5 |  10.4 | 12.6x |  19.1 |  1.8 | 2.3e-08 | 0.00 |
+| ethylene / def2-SVP ωB97M-V                 |  48 | 1537.4 |  74.8 | 20.5x |  78.7 |  5.6 | 2.8e-09 | 0.00 |
+| [ZnCl4]2- / def2-SVP ωB97M-V                | 103 | 3293.3 | 188.4 | 17.5x | 190.2 | 13.4 | 1.1e-07 | 0.00 |
+| Ni(CO)4 / def2-SVP B3LYP, C-PCM (water)     | 143 |  485.0 |  15.1 | 32.1x |  54.7 |  3.6 | 2.0e-07 | 0.00 |
+| [CuCl4]2- doublet / def2-SVP B3LYP, SMD (water, UKS) | 103 | 278.4 | 13.6 | 20.5x | 32.8 | 2.3 | 2.4e-08 | 0.00 |
 
 In the solvent rows the solvent terms take about 5 s of mojoscf's Ni(CO)4
 Hessian (1460 surface points: the solvent response in the CPHF iterations
@@ -1229,9 +1231,9 @@ tables:
 
 | system                                      | nao | Hessian pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dH\| | max \|dfreq\| [cm^-1] |
 |---------------------------------------------|----:|-------:|------:|-----:|------:|-----:|--------:|-----:|
-| benzene / def2-SVP B3LYP                    | 114 |  125.1 |  15.1 | 8.3x |   7.2 |  2.3 | 4.6e-12 | 0.00 |
-| benzene / def2-SVP CAM-B3LYP                | 114 |  187.2 |  27.5 | 6.8x |  14.1 |  3.6 | 4.0e-12 | 0.00 |
-| [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  101.4 |  17.1 | 5.9x |  14.0 |  3.3 | 1.1e-09 | 0.00 |
+| benzene / def2-SVP B3LYP                    | 114 |  125.1 |   6.9 | 18.2x |   7.2 |  1.4 | 8.6e-12 | 0.00 |
+| benzene / def2-SVP CAM-B3LYP                | 114 |  187.2 |  10.6 | 17.6x |  14.1 |  1.9 | 9.9e-12 | 0.00 |
+| [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  101.4 |   7.5 | 13.5x |  14.0 |  1.7 | 4.1e-09 | 0.00 |
 
 max |dH| is in Eh/bohr^2.  The ferrocene Hessians differ by up to 3e-6
 because the two independently converged SCFs do (conv_tol 1e-10); on the same SCF
