@@ -238,7 +238,9 @@ idealised complexes with def2 basis sets (which carry an f shell on the metal
 already in def2-SVP; Pt with its def2 effective core potential): pyscf
 versus the same object accelerated with `mojoscf.accelerate`, each in its own
 process, 4 cores of a 2.1 GHz Xeon, conv_tol 1e-9.  "DF" uses pyscf's
-default def2 JK-fitting basis, "direct" `max_memory=1`.
+default def2 JK-fitting basis, "direct" `max_memory=1`; "X2C" adds the
+spin-free one-electron X2C Hamiltonian (`mf.x2c()`, all-electron: cisplatin
+there with Pt in dyall-v2z and def2-SVP on the ligands).
 
 | system                                         | nao | cycles | SCF pyscf [s] | mojoscf [s] | x | grad pyscf [s] | mojoscf [s] | x | \|dE\| [Eh] |
 |------------------------------------------------|----:|------:|------:|------:|-----:|------:|------:|-----:|--------:|
@@ -254,6 +256,9 @@ default def2 JK-fitting basis, "direct" `max_memory=1`.
 | [Fe(H2O)6]2+ quintet / def2-SVP (direct, UHF)  | 175 | 28/28 |   58.9 |   19.0 | 3.1x |   14.8 |   3.3 | 4.4x | 1.8e-11 |
 | cisplatin / def2-SVP (direct, Pt ECP)          | 126 | 12/12 |   12.5 |    2.7 | 4.6x |    5.7 |   1.6 | 3.5x | 1.4e-12 |
 | Ni(CO)4 / def2-SVP (in-core)                   | 143 | 14/14 |    6.1 |    1.1 | 5.5x |    6.5 |   1.4 | 4.6x | 1.5e-11 |
+| ferrocene / def2-TZVP (DF, X2C)                | 415 | 16/16 |   31.7 |    8.9 | 3.5x |   63.7 |   7.8 | 8.2x | 1.0e-11 |
+| Fe(II) porphine triplet / def2-SVP (DF, UHF, X2C) | 427 | 35/34 | 277.6 |   72.7 | 3.8x |  207.6 |  14.9 | 13.9x | 9.4e-10 |
+| cisplatin / Pt dyall-v2z (DF, X2C)             | 298 | 12/12 |   19.3 |    4.8 | 4.0x |   22.5 |   2.8 | 8.1x | 3.6e-12 |
 
 Gradients agree to 1e-11 or better except for the direct UHF Fe(II) case
 (8e-9) and Fe(II) porphine (2e-6), where the two independently converged SCF
@@ -289,6 +294,9 @@ gradients.
   pyscf's to 6e-12 (`tests/test_x2c.py` also covers the `atom1e`
   approximation, `xuncontract=False` and a projection basis); the
   ground-state and DF-CASSCF gradients use it (`grad.hcore_deriv_dm`).
+  The X2C rows of the table: whole gradients 8.2x (ferrocene / def2-TZVP,
+  where the X2C term was about 39 of pyscf's 63.7 s), 13.9x (Fe(II)
+  porphine) and 8.1x (all-electron cisplatin) faster than pyscf's.
   pyscf's X2C Hessian (`sfx2c1e_hess`, a second-order response per pair of
   atoms) and TDDFT gradients still form the matrices.
 * **Large density-fitted SCF** (the 463-AO Fe(II) cluster, 56 UHF cycles) is
