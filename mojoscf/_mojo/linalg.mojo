@@ -143,20 +143,68 @@ def vnorm2diff(x: F64Ptr, y: F64Ptr, n: Int) -> Float64:
     return s
 
 
+@always_inline
+def _transpose8(src: F64Ptr, lds: Int, dst: F64Ptr, ldd: Int):
+    """dst[j][i] = src[i][j] for an 8 x 8 tile (row strides ``lds`` and ``ldd``): three rounds of
+    two-vector shuffles (pairs of rows, pairs of pairs, halves)."""
+    comptime V8 = SIMD[DType.float64, 8]
+    var r0 = src.unsafe_load[width=8](0)
+    var r1 = src.unsafe_load[width=8](lds)
+    var r2 = src.unsafe_load[width=8](2 * lds)
+    var r3 = src.unsafe_load[width=8](3 * lds)
+    var r4 = src.unsafe_load[width=8](4 * lds)
+    var r5 = src.unsafe_load[width=8](5 * lds)
+    var r6 = src.unsafe_load[width=8](6 * lds)
+    var r7 = src.unsafe_load[width=8](7 * lds)
+    var t0: V8 = r0.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r1)
+    var t1: V8 = r0.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r1)
+    var t2: V8 = r2.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r3)
+    var t3: V8 = r2.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r3)
+    var t4: V8 = r4.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r5)
+    var t5: V8 = r4.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r5)
+    var t6: V8 = r6.shuffle[0, 8, 2, 10, 4, 12, 6, 14](r7)
+    var t7: V8 = r6.shuffle[1, 9, 3, 11, 5, 13, 7, 15](r7)
+    var u0: V8 = t0.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t2)
+    var u2: V8 = t0.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t2)
+    var u1: V8 = t1.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t3)
+    var u3: V8 = t1.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t3)
+    var u4: V8 = t4.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t6)
+    var u6: V8 = t4.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t6)
+    var u5: V8 = t5.shuffle[0, 1, 8, 9, 4, 5, 12, 13](t7)
+    var u7: V8 = t5.shuffle[2, 3, 10, 11, 6, 7, 14, 15](t7)
+    dst.unsafe_store(0, u0.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u4))
+    dst.unsafe_store(4 * ldd, u0.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u4))
+    dst.unsafe_store(ldd, u1.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u5))
+    dst.unsafe_store(5 * ldd, u1.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u5))
+    dst.unsafe_store(2 * ldd, u2.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u6))
+    dst.unsafe_store(6 * ldd, u2.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u6))
+    dst.unsafe_store(3 * ldd, u3.shuffle[0, 1, 2, 3, 8, 9, 10, 11](u7))
+    dst.unsafe_store(7 * ldd, u3.shuffle[4, 5, 6, 7, 12, 13, 14, 15](u7))
+
+
 def transpose(dst: F64Ptr, src: F64Ptr, nrow: Int, ncol: Int):
-    """dst (ncol x nrow) = src (nrow x ncol)^T, cache-blocked."""
+    """dst (ncol x nrow) = src (nrow x ncol)^T: 8 x 8 tiles in SIMD registers (within blocks of 32
+    rows for the cache), the edges element by element."""
     comptime B = 32
+    var nr8 = nrow // 8 * 8
+    var nc8 = ncol // 8 * 8
     var i0 = 0
-    while i0 < nrow:
-        var i1 = min(i0 + B, nrow)
-        var j0 = 0
-        while j0 < ncol:
-            var j1 = min(j0 + B, ncol)
-            for i in range(i0, i1):
-                for j in range(j0, j1):
-                    dst[unsafe_offset=j * nrow + i] = src[unsafe_offset=i * ncol + j]
-            j0 = j1
+    while i0 < nr8:
+        var i1 = min(i0 + B, nr8)
+        var j = 0
+        while j < nc8:
+            var i = i0
+            while i < i1:
+                _transpose8(src.unsafe_offset(i * ncol + j), ncol, dst.unsafe_offset(j * nrow + i), nrow)
+                i += 8
+            j += 8
         i0 = i1
+    for i in range(nr8):
+        for j in range(nc8, ncol):
+            dst[unsafe_offset=j * nrow + i] = src[unsafe_offset=i * ncol + j]
+    for i in range(nr8, nrow):
+        for j in range(ncol):
+            dst[unsafe_offset=j * nrow + i] = src[unsafe_offset=i * ncol + j]
 
 
 def _trace_prod_rows(a: F64Ptr, b: F64Ptr, n: Int, i0: Int, i1: Int) -> Float64:

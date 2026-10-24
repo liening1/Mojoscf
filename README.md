@@ -673,8 +673,11 @@ paths); on the same SCF solution pyscf's and mojoscf's gradients agree to
   128 points it evaluates only the shells that reach the block's bounding
   sphere (per-shell cutoff radius at 1e-16), values and gradients SIMD over
   the points with an exponential accurate to one ulp, then (1) the density
-  and its gradient and (2) `V += phi Z^T` with `Z = sum_c w_c phi_c`, one
-  GEMM per block into per-thread matrices.  When the density carries
+  and its gradient and (2) `V^T += Z phi^T` with `Z = sum_c w_c phi_c`, one
+  GEMM per block into per-thread matrices, against a transposed copy of the
+  block's values so that it is row-major `A B` (OpenBLAS's small-matrix
+  kernels, see the XC kernel item of the TDDFT section; Fe(II) porphine
+  triplet / def2-SVP, UKS B3LYP: 1.79 -> 1.52 s per `nr_uks`).  When the density carries
   pyscf's `mo_coeff`/`mo_occ` tags (every SCF density does), blocks where it
   is cheaper use the occupied orbitals, `psi = C^T phi`,
   `rho = sum_k n_k psi_k^2`, `grad rho = 2 sum (grad phi)(C n psi)`, as
