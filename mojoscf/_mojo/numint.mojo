@@ -1136,7 +1136,8 @@ def xc_grad_core(
     V_x = sum_p d_x phi(p) Z(p)^T + Y_x(p) phi(p)^T with Z = sum_c w_c phi_c and
     Y_x = w0 d_x phi + sum_i w_i d_i d_x phi.  Meta-GGA (2, wv[s][4] the tau
     weight halved as in pyscf) adds sum_c d_x d_c phi (w_4 d_c phi)^T (pyscf's
-    ``_tau_grad_dot_``).  Overwritten.
+    ``_tau_grad_dot_``).  Overwritten.  The products are row-major A B against
+    transposed copies of Z (per set), phi (per block) and w_4 d_c phi.
     """
     var gga = kind >= 1
     var mgga = kind == 2
@@ -1157,9 +1158,13 @@ def xc_grad_core(
     def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nw, imm gga, imm mgga, imm nset, imm wv, imm pacc, imm ngrid, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * nset * 3 * n2)
-        # meta-GGA: w_4 d_c phi for c = x, y, z (3 x nao x BLK)
-        var tl = List[Float64](length=(3 * nao * BLK if mgga else 0) + 2 * W, fill=0.0)
+        # meta-GGA: w_4 d_c phi for c = x, y, z (3 x nao x BLK); transposed: phi^T, Z^T, (w_4 d_c phi)^T
+        var tl = List[Float64](length=(3 * nao * BLK if mgga else 0) + (5 if mgga else 2) * nao * BLK + 5 * BLK + 4 * W, fill=0.0)
         var tb = F64Ptr(unsafe_from_address=aligned_addr(tl))
+        var phit = tb.unsafe_offset(3 * nao * BLK if mgga else 0)
+        var zt = phit.unsafe_offset(nao * BLK)
+        var tbt = zt.unsafe_offset(nao * BLK)
+        var wloc = tbt.unsafe_offset(3 * nao * BLK if mgga else 0)     # the set's weights on the block
         var it = 0
         while True:
             # static round-robin: every worker sums its blocks in a fixed order (reproducible results)
@@ -1179,35 +1184,37 @@ def xc_grad_core(
             var ao = ws.ao()
             var zb = ws.y()
             var yb = ws.y2(nrow)
+            if gga:
+                transpose(phit, ao, nrow, BLK)
             for s in range(nset):
                 var off = s * nw * ngrid + p0
-                # Z = sum_c w_c phi_c
-                for v in range(NV):
-                    var w0 = _load_w(wv, off, v, npt)
-                    if not gga:
+                for c in range(nw):
+                    for v in range(NV):
+                        wloc.unsafe_store(c * BLK + v * W, _load_w(wv, off + c * ngrid, v, npt))
+                # Z = sum_c w_c phi_c, row by row
+                for i in range(nrow):
+                    for v in range(NV):
+                        var o = i * BLK + v * W
+                        var z = ao.unsafe_load[width=W](o) * wloc.unsafe_load[width=W](v * W)
+                        if gga:
+                            z += ao.unsafe_load[width=W](cs + o) * wloc.unsafe_load[width=W](BLK + v * W)
+                            z += ao.unsafe_load[width=W](2 * cs + o) * wloc.unsafe_load[width=W](2 * BLK + v * W)
+                            z += ao.unsafe_load[width=W](3 * cs + o) * wloc.unsafe_load[width=W](3 * BLK + v * W)
+                        zb.unsafe_store(o, z)
+                transpose(zt, zb, nrow, BLK)
+                if mgga:
+                    for c in range(3):
+                        var src = ao.unsafe_offset((1 + c) * cs)
+                        var dst = tb.unsafe_offset(c * nrow * BLK)
                         for i in range(nrow):
-                            zb.unsafe_store(i * BLK + v * W, ao.unsafe_load[width=W](i * BLK + v * W) * w0)
-                    else:
-                        var w1 = _load_w(wv, off + ngrid, v, npt)
-                        var w2 = _load_w(wv, off + 2 * ngrid, v, npt)
-                        var w3 = _load_w(wv, off + 3 * ngrid, v, npt)
-                        for i in range(nrow):
-                            var o = i * BLK + v * W
-                            var z = ao.unsafe_load[width=W](o) * w0 + ao.unsafe_load[width=W](cs + o) * w1
-                            z += ao.unsafe_load[width=W](2 * cs + o) * w2 + ao.unsafe_load[width=W](3 * cs + o) * w3
-                            zb.unsafe_store(o, z)
-                    if mgga:
-                        var w4 = _load_w(wv, off + 4 * ngrid, v, npt)
-                        for c in range(3):
-                            var src = ao.unsafe_offset((1 + c) * cs)
-                            var dst = tb.unsafe_offset(c * nrow * BLK)
-                            for i in range(nrow):
+                            for v in range(NV):
                                 var o = i * BLK + v * W
-                                dst.unsafe_store(o, src.unsafe_load[width=W](o) * w4)
+                                dst.unsafe_store(o, src.unsafe_load[width=W](o) * wloc.unsafe_load[width=W](4 * BLK + v * W))
+                        transpose(tbt.unsafe_offset(c * nrow * BLK), dst, nrow, BLK)
                 for x in range(3):
                     var dx_ao = ao.unsafe_offset((1 + x) * cs)
                     try:
-                        blas.gemm_small(False, True, nrow, nrow, BLK, 1.0, dx_ao, zb, 0.0, ws.dsub())
+                        blas.gemm_small(False, False, nrow, nrow, BLK, 1.0, dx_ao, zt, 0.0, ws.dsub())
                     except:
                         pass
                     if gga:
@@ -1215,25 +1222,23 @@ def xc_grad_core(
                         var c1 = 4 + x
                         var c2 = 5 if x == 0 else (7 if x == 1 else 8)
                         var c3 = 6 if x == 0 else (8 if x == 1 else 9)
-                        for v in range(NV):
-                            var w0 = _load_w(wv, off, v, npt)
-                            var w1 = _load_w(wv, off + ngrid, v, npt)
-                            var w2 = _load_w(wv, off + 2 * ngrid, v, npt)
-                            var w3 = _load_w(wv, off + 3 * ngrid, v, npt)
-                            for i in range(nrow):
+                        for i in range(nrow):
+                            for v in range(NV):
                                 var o = i * BLK + v * W
-                                var y = dx_ao.unsafe_load[width=W](o) * w0 + ao.unsafe_load[width=W](c1 * cs + o) * w1
-                                y += ao.unsafe_load[width=W](c2 * cs + o) * w2 + ao.unsafe_load[width=W](c3 * cs + o) * w3
+                                var y = dx_ao.unsafe_load[width=W](o) * wloc.unsafe_load[width=W](v * W)
+                                y += ao.unsafe_load[width=W](c1 * cs + o) * wloc.unsafe_load[width=W](BLK + v * W)
+                                y += ao.unsafe_load[width=W](c2 * cs + o) * wloc.unsafe_load[width=W](2 * BLK + v * W)
+                                y += ao.unsafe_load[width=W](c3 * cs + o) * wloc.unsafe_load[width=W](3 * BLK + v * W)
                                 yb.unsafe_store(o, y)
                         try:
-                            blas.gemm_small(False, True, nrow, nrow, BLK, 1.0, yb, ao, 1.0, ws.dsub())
+                            blas.gemm_small(False, False, nrow, nrow, BLK, 1.0, yb, phit, 1.0, ws.dsub())
                         except:
                             pass
                     if mgga:
                         for c in range(3):
                             try:
-                                blas.gemm_small(False, True, nrow, nrow, BLK, 1.0, ao.unsafe_offset(_d2c(x, c) * cs),
-                                          tb.unsafe_offset(c * nrow * BLK), 1.0, ws.dsub())
+                                blas.gemm_small(False, False, nrow, nrow, BLK, 1.0, ao.unsafe_offset(_d2c(x, c) * cs),
+                                                tbt.unsafe_offset(c * nrow * BLK), 1.0, ws.dsub())
                             except:
                                 pass
                     scatter_add_block(acc.unsafe_offset((s * 3 + x) * n2), nao, nrow, ws)
