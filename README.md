@@ -1205,7 +1205,7 @@ the TDDFT table:
 | system                                      | nao | Hessian pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dH\| | max \|dfreq\| [cm^-1] |
 |---------------------------------------------|----:|-------:|------:|-----:|------:|-----:|--------:|-----:|
 | benzene / def2-SVP B3LYP                    | 114 |  143.6 |   8.5 | 17.0x |   8.2 |  1.4 | 1.4e-08 | 0.00 |
-| ferrocene / def2-SVP PBE0                   | 221 | 1129.5 | 173.5 | 6.5x | 179.6 | 39.1 | 3.1e-06 | 0.00 |
+| ferrocene / def2-SVP PBE0                   | 221 | 1525.5 |  71.6 | 21.3x | 238.5 | 32.2 | 4.8e-06 | 0.01 |
 | ferrocene / def2-SVP PBE                    | 221 |  896.7 |  46.1 | 19.5x |  51.9 |  7.7 | 6.7e-06 | 0.01 |
 | ferrocene / def2-SVP CAM-B3LYP              | 221 | 1552.8 | 225.0 | 6.9x |  90.8 | 40.2 | 1.5e-06 | 0.04 |
 | [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  130.5 |  10.4 | 12.6x |  19.1 |  1.8 | 2.3e-08 | 0.00 |
@@ -1214,7 +1214,10 @@ the TDDFT table:
 | Ni(CO)4 / def2-SVP B3LYP, C-PCM (water)     | 143 |  485.0 |  15.1 | 32.1x |  54.7 |  3.6 | 2.0e-07 | 0.00 |
 | [CuCl4]2- doublet / def2-SVP B3LYP, SMD (water, UKS) | 103 | 278.4 | 13.6 | 20.5x | 32.8 | 2.3 | 2.4e-08 | 0.00 |
 
-In the solvent rows the solvent terms take about 5 s of mojoscf's Ni(CO)4
+The rows were re-measured after the changes to the XC kernels (XC kernel
+item of the TDDFT section), each mojoscf run against pyscf's on the same
+machine (pyscf's own times vary by up to a third between runs on this
+virtual machine).  In the solvent rows the solvent terms take about 5 s of mojoscf's Ni(CO)4
 Hessian (1460 surface points: the solvent response in the CPHF iterations
 2.4 s, the solvent Fock derivatives 1.5 s, the solvent's second derivatives
 under 1 s); the rest is the Kohn-Sham Hessian of the solute.
@@ -1235,7 +1238,7 @@ tables:
 | benzene / def2-SVP CAM-B3LYP                | 114 |  187.2 |  10.6 | 17.6x |  14.1 |  1.9 | 9.9e-12 | 0.00 |
 | [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  101.4 |   7.5 | 13.5x |  14.0 |  1.7 | 4.1e-09 | 0.00 |
 
-max |dH| is in Eh/bohr^2.  The ferrocene Hessians differ by up to 3e-6
+max |dH| is in Eh/bohr^2.  The ferrocene Hessians differ by up to 7e-6
 because the two independently converged SCFs do (conv_tol 1e-10); on the same SCF
 solution the ferrocene PBE0 Hessians agree to 1.6e-7 (the coupled-perturbed
 equations of both are converged to pyscf's tolerance, `conv_tol_cpscf` per
