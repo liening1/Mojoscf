@@ -1313,7 +1313,8 @@ class _MojoHessMixin:
         from pyscf import lib
         from pyscf.hessian import rhf as rhf_hess
         from pyscf.hessian import uhf as uhf_hess
-        from pyscf.scf import cphf, ucphf
+
+        from . import cphf as mojo_cphf
 
         mf = self.base
         mol = self.mol
@@ -1332,12 +1333,13 @@ class _MojoHessMixin:
             h1vo = [np.vstack([h[ia] for ia in atoms]) for h in hmo]
             s1vo = [np.vstack([sm[ia] for ia in atoms]) for sm in smo]
             tol = mf.conv_tol_cpscf * (a1 - a0)
+            # pyscf's cphf.solve / ucphf.solve with the Krylov steps as matrix products
             if unrestricted:
-                mo1, e1 = ucphf.solve(fx, mo_energy, mo_occ, tuple(h1vo), tuple(s1vo), max_cycle=self.max_cycle,
-                                      level_shift=self.level_shift, tol=tol)
+                mo1, e1 = mojo_cphf.solve(fx, mo_energy, mo_occ, tuple(h1vo), tuple(s1vo), max_cycle=self.max_cycle,
+                                          level_shift=self.level_shift, tol=tol, verbose=log)
             else:
-                mo1, e1 = cphf.solve(fx, mo_energy, mo_occ, h1vo[0], s1vo[0], max_cycle=self.max_cycle,
-                                     level_shift=self.level_shift, tol=tol)
+                mo1, e1 = mojo_cphf.solve(fx, mo_energy, mo_occ, h1vo[0], s1vo[0], max_cycle=self.max_cycle,
+                                          level_shift=self.level_shift, tol=tol, verbose=log)
                 mo1, e1 = (mo1,), (e1,)
             for s in range(len(hmo)):
                 m = np.asarray(mo1[s]).reshape(len(atoms), 3, nmo, -1)

@@ -353,21 +353,27 @@ gradients.
   densities of Ni(CO)4 in 0.12 s instead of 0.50 s (pyscf's `dot_eri_dm`
   1.17 s).  The first-order Fock matrices then moved to the gradient
   driver's integral scheme with the blocks folded per atom (*First-order
-  Fock matrices of Hessians* below), and the UHF CPHF operator takes J of
-  the spin sums only, with K per spin, in the same call
-  (`dft.exact_jk_sets`; it had J of every spin density and added them).
+  Fock matrices of Hessians* below; [Fe(H2O)6]2+ 20.9 -> 19.8 s), the UHF
+  CPHF operator takes J of the spin sums only, with K per spin, in the same
+  call (`dft.exact_jk_sets`; it had J of every spin density and added them:
+  18.7 s), and the CPHF equations are solved by `mojoscf.cphf`, pyscf's
+  Krylov solver with its steps as matrix products: `lib.krylov` runs the
+  Gram-Schmidt projections, the QR of each block of new vectors and the
+  subspace matrix as Python loops over single vectors (a `dot` and a
+  full-size temporary per pair; 2.7 s of the [Fe(H2O)6]2+ Hessian, 513
+  trial vectors of 14700 elements, growing quadratically with the system).
   Hessians from the same SCF, 4 cores of a 2.3 GHz Xeon:
 
-  | system                       | before | `hess2e` | + J/K  | + `h1` | + spin-sum J | pyscf   |
-  |------------------------------|-------:|---------:|-------:|-------:|-------------:|--------:|
-  | RHF Ni(CO)4 / def2-SVP       | 15.7 s |   8.5 s  |  5.3 s |  5.0 s |        5.0 s |  72.7 s |
-  | UHF [Fe(H2O)6]2+ / def2-SVP  | 69.8 s |  53.5 s  | 20.9 s | 19.8 s |       18.7 s | 240.7 s |
+  | system                       | before | `hess2e` | + J/K  | + `h1`, CPHF | pyscf   |
+  |------------------------------|-------:|---------:|-------:|-------------:|--------:|
+  | RHF Ni(CO)4 / def2-SVP       | 15.7 s |   8.5 s  |  5.3 s |        5.0 s |  72.7 s |
+  | UHF [Fe(H2O)6]2+ / def2-SVP  | 69.8 s |  53.5 s  | 20.9 s |       16.4 s | 240.7 s |
 
-  i.e. 4.6x -> 14.5x and 3.4x -> 12.9x pyscf's speed; the Hessians agree
+  i.e. 4.6x -> 14.5x and 3.4x -> 14.7x pyscf's speed; the Hessians agree
   with each other to 9e-10 and with pyscf's (from its own SCF) to 1.4e-8.
   Without the ERIs in core (integral-direct CPHF J/K, *Integral-direct J/K
-  of many densities* below) the UHF Hessian of [Fe(H2O)6]2+ takes 25.4 s
-  (81.4 s before).
+  of many densities* below) the UHF Hessian of [Fe(H2O)6]2+ took 81.4 s
+  and takes 25.4 s before the Krylov solver.
 
 ### DF-CASSCF of metal complexes
 
@@ -1907,6 +1913,7 @@ mojoscf/
   stability.py         SCF stability analysis (pyscf.scf.stability) with the occupied-virtual response
   soscf.py             second-order SCF (pyscf.soscf.newton_ah) with the occupied-virtual orbital Hessian
   hessian.py           analytical Hessians (pyscf.hessian): XC terms, DF and exact Coulomb/exchange terms, MO-basis CPHF
+  cphf.py              pyscf's CPHF solvers (scf.cphf, scf.ucphf) on a Krylov solver in matrix products
   qmmm.py              QM/MM (pyscf.qmmm) hooks: MM-charge Hamiltonian and gradient terms from the engine
   guess.py             broken-symmetry start densities (HOMO/LUMO mix, AFM atoms, spin flip)
 tests/                 kernels vs NumPy/pyscf references; full SCF vs pyscf; integrals vs libcint; gradients vs pyscf
