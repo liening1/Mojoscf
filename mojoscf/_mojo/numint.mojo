@@ -228,7 +228,10 @@ struct AOWork(Movable):
 
 
 def select_shells(basis: Basis, grid: Grid, blk: Int, rcut: List[Float64], mut ws: AOWork) -> Tuple[Int, Int]:
-    """Shells significant on block ``blk`` into ``ws.shells`` and their AO rows into ``ws.rows``.
+    """Shells significant on block ``blk`` into ``ws.shells`` and their AO rows into ``ws.rows``: those
+    within their cutoff radius of a point of the block (the block's bounding sphere first; the points
+    themselves when the sphere reaches past the radius, which drops about a quarter of the rows the
+    sphere alone keeps on a metalloporphyrin, all of them negligible on the block).
 
     Returns (number of shells, number of AO rows).
     """
@@ -236,16 +239,31 @@ def select_shells(basis: Basis, grid: Grid, blk: Int, rcut: List[Float64], mut w
     var cy = grid.centre[3 * blk + 1]
     var cz = grid.centre[3 * blk + 2]
     var rad = grid.radius[blk]
+    var p0 = blk * BLK
     var ns = 0
     var nrow = 0
     var nrun = 0
     for b in range(basis.nbas):
-        var dx = basis.shell_coord(b, 0) - cx
-        var dy = basis.shell_coord(b, 1) - cy
-        var dz = basis.shell_coord(b, 2) - cz
-        var d = sqrt(dx * dx + dy * dy + dz * dz) - rad
-        if d > rcut[b]:
+        var ax = basis.shell_coord(b, 0)
+        var ay = basis.shell_coord(b, 1)
+        var az = basis.shell_coord(b, 2)
+        var dx = ax - cx
+        var dy = ay - cy
+        var dz = az - cz
+        var dc = sqrt(dx * dx + dy * dy + dz * dz)
+        if dc - rad > rcut[b]:
             continue
+        if dc + rad > rcut[b]:
+            # the sphere reaches beyond the cutoff: test the block's points themselves
+            var mn = F64V(1.0e300)
+            for v in range(NV):
+                var o = p0 + v * W
+                var px = grid.x().unsafe_load[width=W](o) - ax
+                var py = grid.y().unsafe_load[width=W](o) - ay
+                var pz = grid.z().unsafe_load[width=W](o) - az
+                mn = min(mn, px * px + py * py + pz * pz)
+            if mn.reduce_min() > rcut[b] * rcut[b]:
+                continue
         ws.shells[ns] = b
         ns += 1
         var i0 = basis.ao_loc[b]
@@ -292,7 +310,14 @@ def eval_block(basis: Basis, grid: Grid, blk: Int, nderiv: Int, nshell: Int, nro
         var nf = basis.nf[l]
         var coff = basis.cart_off[l]
         var scal = basis.c2s_scale[l]
-        var c2s = list_ptr(basis.c2s).unsafe_offset(basis.c2s_off[l])
+        var nzs = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.c2s_nzs.unsafe_ptr())).unsafe_offset(basis.c2s_nzs_off[l])
+        var nzc = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.c2s_nzc.unsafe_ptr()))
+        var nzv = list_ptr(basis.c2s_nzv)
+        var pcx = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.cx.unsafe_ptr())).unsafe_offset(coff)
+        var pcy = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.cy.unsafe_ptr())).unsafe_offset(coff)
+        var pcz = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.cz.unsafe_ptr())).unsafe_offset(coff)
+        var pexp = list_ptr(basis.env).unsafe_offset(basis.pexp[b])
+        var pcoef = list_ptr(basis.env).unsafe_offset(basis.pcoef[b])
         var ax = basis.shell_coord(b, 0)
         var ay = basis.shell_coord(b, 1)
         var az = basis.shell_coord(b, 2)
@@ -313,10 +338,10 @@ def eval_block(basis: Basis, grid: Grid, blk: Int, nderiv: Int, nshell: Int, nro
                 ss.unsafe_store(c * W, F64V(0.0))
                 ts.unsafe_store(c * W, F64V(0.0))
             for p in range(np):
-                var a = basis.env[basis.pexp[b] + p]
+                var a = pexp[unsafe_offset=p]
                 var e = vexp(r2 * (-a))
                 for c in range(nc):
-                    var cf = basis.env[basis.pcoef[b] + c * np + p]
+                    var cf = pcoef[unsafe_offset=c * np + p]
                     rs.unsafe_store(c * W, rs.unsafe_load[width=W](c * W) + e * cf)
                     if nderiv > 0:
                         ss.unsafe_store(c * W, ss.unsafe_load[width=W](c * W) + e * (-2.0 * a * cf))
@@ -337,9 +362,9 @@ def eval_block(basis: Basis, grid: Grid, blk: Int, nderiv: Int, nshell: Int, nro
                 var sv = ss.unsafe_load[width=W](c * W)
                 var tv = ts.unsafe_load[width=W](c * W)
                 for cc in range(nca):
-                    var i = basis.cx[coff + cc]
-                    var j = basis.cy[coff + cc]
-                    var k = basis.cz[coff + cc]
+                    var i = pcx[unsafe_offset=cc]
+                    var j = pcy[unsafe_offset=cc]
+                    var k = pcz[unsafe_offset=cc]
                     var xi = xp.unsafe_load[width=W](i * W)
                     var yj = yp.unsafe_load[width=W](j * W)
                     var zk = zp.unsafe_load[width=W](k * W)
@@ -397,10 +422,8 @@ def eval_block(basis: Basis, grid: Grid, blk: Int, nderiv: Int, nshell: Int, nro
                     else:
                         for m in range(nf):
                             var acc = F64V(0.0)
-                            for cc in range(nca):
-                                var t = c2s[unsafe_offset=cc * nf + m]
-                                if t != 0.0:
-                                    acc += cb.unsafe_load[width=W](cc * W) * t
+                            for q in range(nzs[unsafe_offset=m], nzs[unsafe_offset=m + 1]):
+                                acc += cb.unsafe_load[width=W](nzc[unsafe_offset=q] * W) * nzv[unsafe_offset=q]
                             dst.unsafe_store(m * BLK, acc)
         row += nc * nf
 
@@ -508,7 +531,14 @@ def _eval_block3(basis: Basis, grid: Grid, blk: Int, nshell: Int, nrow: Int, mut
         var nf = basis.nf[l]
         var coff = basis.cart_off[l]
         var scal = basis.c2s_scale[l]
-        var c2s = list_ptr(basis.c2s).unsafe_offset(basis.c2s_off[l])
+        var nzs = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.c2s_nzs.unsafe_ptr())).unsafe_offset(basis.c2s_nzs_off[l])
+        var nzc = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.c2s_nzc.unsafe_ptr()))
+        var nzv = list_ptr(basis.c2s_nzv)
+        var pcx = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.cx.unsafe_ptr())).unsafe_offset(coff)
+        var pcy = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.cy.unsafe_ptr())).unsafe_offset(coff)
+        var pcz = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(basis.cz.unsafe_ptr())).unsafe_offset(coff)
+        var pexp = list_ptr(basis.env).unsafe_offset(basis.pexp[b])
+        var pcoef = list_ptr(basis.env).unsafe_offset(basis.pcoef[b])
         var ax = basis.shell_coord(b, 0)
         var ay = basis.shell_coord(b, 1)
         var az = basis.shell_coord(b, 2)
@@ -526,10 +556,10 @@ def _eval_block3(basis: Basis, grid: Grid, blk: Int, nshell: Int, nrow: Int, mut
                 for n in range(4):
                     fs.unsafe_store((c * 4 + n) * W, F64V(0.0))
             for p in range(np):
-                var a = basis.env[basis.pexp[b] + p]
+                var a = pexp[unsafe_offset=p]
                 var e = vexp(r2 * (-a))
                 for c in range(nc):
-                    var t = e * basis.env[basis.pcoef[b] + c * np + p]
+                    var t = e * pcoef[unsafe_offset=c * np + p]
                     for n in range(4):
                         fs.unsafe_store((c * 4 + n) * W, fs.unsafe_load[width=W]((c * 4 + n) * W) + t)
                         t *= -2.0 * a
@@ -546,9 +576,9 @@ def _eval_block3(basis: Basis, grid: Grid, blk: Int, nshell: Int, nrow: Int, mut
             for c in range(nc):
                 var f = fs.unsafe_offset(c * 4 * W)
                 for cc in range(nca):
-                    var ii = basis.cx[coff + cc]
-                    var jj = basis.cy[coff + cc]
-                    var kk = basis.cz[coff + cc]
+                    var ii = pcx[unsafe_offset=cc]
+                    var jj = pcy[unsafe_offset=cc]
+                    var kk = pcz[unsafe_offset=cc]
                     # 1D factors of each axis: slot p (p + 1) / 2 + n
                     for p in range(4):
                         for n in range(p + 1):
@@ -591,10 +621,8 @@ def _eval_block3(basis: Basis, grid: Grid, blk: Int, nshell: Int, nrow: Int, mut
                     else:
                         for m in range(nf):
                             var acc = F64V(0.0)
-                            for cc in range(nca):
-                                var t = c2s[unsafe_offset=cc * nf + m]
-                                if t != 0.0:
-                                    acc += cb.unsafe_load[width=W](cc * W) * t
+                            for q in range(nzs[unsafe_offset=m], nzs[unsafe_offset=m + 1]):
+                                acc += cb.unsafe_load[width=W](nzc[unsafe_offset=q] * W) * nzv[unsafe_offset=q]
                             dst.unsafe_store(m * BLK, acc)
         row += nc * nf
     _ = fac^
@@ -607,26 +635,32 @@ def prune_rows(nrow: Int, ncomp: Int, mut ws: AOWork) -> Int:
     """Drop the AO rows whose values and derivatives (``ncomp`` components) stay below AO_CUT at every
     point of the block, after ``eval_block``; returns the number of rows kept.
 
-    ``select_shells`` bounds whole shells over the block's bounding sphere,
-    which keeps many functions negligible everywhere on the block (a quarter
-    of the rows of a metalloporphyrin, whose blocks are 4 bohr across).  The
-    AO values ([comp][row][BLK]) are compacted in place, ``ws.rows`` and the
+    ``select_shells`` bounds whole shells by a radius over all their
+    functions and derivatives, which keeps some functions negligible
+    everywhere on the block (3% of the rows of a metalloporphyrin).  A row
+    is kept at its first vector of points at or above the cut.  The AO
+    values ([comp][row][BLK]) are compacted in place, ``ws.rows`` and the
     runs of consecutive AO indices rebuilt.
     """
     var ao = ws.ao()
     var cs = nrow * BLK
     var nk = 0
     for r in range(nrow):
-        var m = F64V(0.0)
+        # kept at the first vector of points with a value (or derivative) at AO_CUT or above
+        var keep = False
         for c in range(ncomp):
             var row = ao.unsafe_offset(c * cs + r * BLK)
-            for v in range(NV):
-                m = max(m, abs(row.unsafe_load[width=W](v * W)))
-        if m.reduce_max() >= AO_CUT:
-            ws.flags[r] = 1
-            nk += 1
-        else:
-            ws.flags[r] = 0
+            var v = 0
+            while v < NV:
+                var m = max(abs(row.unsafe_load[width=W](v * W)), abs(row.unsafe_load[width=W](v * W + W)))
+                if m.reduce_max() >= AO_CUT:
+                    keep = True
+                    break
+                v += 2
+            if keep:
+                break
+        ws.flags[r] = 1 if keep else 0
+        nk += 1 if keep else 0
     if nk == nrow:
         return nrow
     # in place: every destination lies at or before its source, components in order

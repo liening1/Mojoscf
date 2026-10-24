@@ -134,6 +134,10 @@ struct Basis(Movable):
     var c2s: List[Float64]
     var c2s_off: List[Int]         # per l
     var c2s_scale: List[Float64]   # per l: w when c2s = w I (then no transform is needed), else 0
+    var c2s_nzs: List[Int]         # per l (from c2s_nzs_off[l]) and spherical m: first nonzero of column m
+    var c2s_nzs_off: List[Int]     # per l: nf[l] + 1 entries in c2s_nzs
+    var c2s_nzc: List[Int]         # Cartesian index of each nonzero
+    var c2s_nzv: List[Float64]     # and its coefficient
     var ao_loc: List[Int]          # nbas + 1
     var cx: List[Int]              # Cartesian exponents per l, offset cart_off[l]
     var cy: List[Int]
@@ -201,6 +205,22 @@ struct Basis(Movable):
                         scalar = False
             if scalar:
                 self.c2s_scale[l] = w
+        # the nonzeros of each column (spherical function) of the transforms
+        self.c2s_nzs = List[Int]()
+        self.c2s_nzs_off = List[Int](length=nl, fill=0)
+        self.c2s_nzc = List[Int]()
+        self.c2s_nzv = List[Float64]()
+        for l in range(nl):
+            self.c2s_nzs_off[l] = len(self.c2s_nzs)
+            var off = self.c2s_off[l]
+            for m in range(self.nf[l]):
+                self.c2s_nzs.append(len(self.c2s_nzc))
+                for cc in range(ncart(l)):
+                    var v = self.c2s[off + cc * self.nf[l] + m]
+                    if v != 0.0:
+                        self.c2s_nzc.append(cc)
+                        self.c2s_nzv.append(v)
+            self.c2s_nzs.append(len(self.c2s_nzc))
         self.ao_loc = List[Int](length=nbas + 1, fill=0)
         self.dmax = 1
         for b in range(nbas):
