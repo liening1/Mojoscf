@@ -17,7 +17,10 @@ def test_krylov_matches_pyscf(rng, nset):
     n = 120
     a = rng.standard_normal((n, n)) * 0.05
     b = rng.standard_normal((nset, n))
-    aop = lambda x: np.asarray(x) @ a.T
+
+    def aop(x):
+        return np.asarray(x) @ a.T
+
     ref = linalg_helper.krylov(aop, b, tol=1e-12, max_cycle=60)
     x = mojo_cphf.krylov(aop, b, tol=1e-12, max_cycle=60)
     assert abs(x - ref).max() < 1e-10
@@ -32,7 +35,10 @@ def test_krylov_dependent_right_hand_sides(rng):
     a = rng.standard_normal((n, n)) * 0.05
     b = rng.standard_normal((3, n))
     b = np.vstack([b, b[0] + 2 * b[1]])
-    aop = lambda x: np.asarray(x) @ a.T
+
+    def aop(x):
+        return np.asarray(x) @ a.T
+
     x = mojo_cphf.krylov(aop, b, tol=1e-12, max_cycle=60)
     ref = linalg_helper.krylov(aop, b, tol=1e-12, max_cycle=60)
     assert abs(x - ref).max() < 1e-10
