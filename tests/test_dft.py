@@ -296,6 +296,30 @@ def test_accelerate_qmmm_dft():
     assert abs(g.kernel() - ref.nuc_grad_method().kernel()).max() < 1e-7
 
 
+@pytest.mark.parametrize("kind", ["rks", "uks"])
+def test_dft_plus_u_gradients(kind):
+    """DFT+U (pyscf's RKSpU/UKSpU): the Mojo Kohn-Sham gradient with pyscf's Hubbard term."""
+    if kind == "rks":
+        mol = gto.M(atom="Cu 0 0 0; Cl 0 0 2.05", basis="def2-svp", verbose=0)
+        cls = mojoscf.grad.KSpUGradients
+
+        def make():
+            return dft.RKSpU(mol, xc="pbe", U_idx=["Cu 3d"], U_val=[4.0])
+    else:
+        mol = gto.M(atom="Fe 0 0 0; O 0 0 1.62; H 0 0.8 2.15", basis="def2-svp", charge=1, spin=4, verbose=0)
+        cls = mojoscf.grad.UKSpUGradients
+
+        def make():
+            return dft.UKSpU(mol, xc="pbe", U_idx=["Fe 3d"], U_val=[4.0])
+
+    ref = make().run(conv_tol=1e-11)
+    mf = mdft.accelerate(make()).run(conv_tol=1e-11)
+    assert ref.converged and mf.converged and abs(mf.e_tot - ref.e_tot) < 1e-9
+    g = mf.nuc_grad_method()
+    assert type(g) is cls and g._direct_2e()
+    assert abs(g.kernel() - ref.nuc_grad_method().kernel()).max() < 1e-7
+
+
 def test_diis_choice():
     from pyscf.scf import diis as scf_diis
 

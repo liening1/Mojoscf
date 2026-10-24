@@ -44,7 +44,10 @@ iteration then runs without touching Python or pyscf's C code at all.
   derivative integrals from the Mojo engine; the
   two-electron term is evaluated directly from the derivative integrals,
   3.3 to 7.1x faster than `pyscf.grad` (exact) and 2.9 to 6.0x faster than
-  `pyscf.df.grad` (DF) with the same gradients to about 1e-13.
+  `pyscf.df.grad` (DF) with the same gradients to about 1e-13.  With
+  spin-free X2C the derivative of the X2C Hamiltonian, which pyscf forms
+  atom by atom, is contracted with the density in one backward pass
+  (Fe(II) porphine: 4 s instead of about two minutes).
 * **Kohn-Sham DFT** (`mojoscf.dft`): `mojoscf.dft.accelerate(mf)` gives a
   pyscf RKS/UKS object the Mojo exchange-correlation integration (LDA, GGA
   and meta-GGA such as r2SCAN), J/K (including the long-range exchange of
@@ -266,6 +269,28 @@ gradients.
   direct J/K and the gradient's two-electron term; in the gradients only the
   ECP derivative integrals come from pyscf.  Before this, cisplatin ran on
   libcint and pyscf's code throughout.
+* **Scalar-relativistic X2C** (`mf.x2c()`, spin-free, all-electron).  The
+  gradient's one-electron term is then the derivative of the X2C Hamiltonian
+  `h_FW = c_FW^T h c_FW`, `c_FW = [R; X R]`, formed in the uncontracted
+  basis.  pyscf (`x2c.sfx2c1e_grad`) builds it as a matrix for every atom
+  and coordinate from the first-order solution of the 2n x 2n modified Dirac
+  equation (`c1 = (C^T h1 C - e C^T s1 C) / (e_q - e_p)`), of `X` and of `R`
+  (JCP 135, 084114 (2011)): dozens of (2n)^3 products per coordinate, 3.3 s
+  per atom for Fe(II) porphine / def2-SVP (733 uncontracted functions), about
+  two minutes for the molecule, more than the rest of its gradient.  A
+  gradient only needs `sum_ij D_ij dh_ij`, and every step from the derivative
+  integrals to `dh` is linear in them, so `mojoscf.x2c` takes the density
+  backwards through the chain once (each product transposed, the adjoint)
+  and contracts the effective densities that come out with the derivative
+  integrals of all atoms: the basis-function derivatives (`int1e_ipovlp`,
+  `ipkin`, `ipnuc`, `ippnucp`) once, the nuclear-attraction operator
+  derivatives in one Mojo pass and `int1e_ipprinvp` per nucleus.  For Fe(II)
+  porphine the term takes 4.0 s instead of about 125 s and agrees with
+  pyscf's to 6e-12 (`tests/test_x2c.py` also covers the `atom1e`
+  approximation, `xuncontract=False` and a projection basis); the
+  ground-state and DF-CASSCF gradients use it (`grad.hcore_deriv_dm`).
+  pyscf's X2C Hessian (`sfx2c1e_hess`, a second-order response per pair of
+  atoms) and TDDFT gradients still form the matrices.
 * **Large density-fitted SCF** (the 463-AO Fe(II) cluster, 56 UHF cycles) is
   dominated by the DF exchange build, `K = sum_Q (C^T E_Q)^T (C^T E_Q)`.
   mojoscf and pyscf do the same GEMMs, but pyscf's C transform calls the
@@ -632,6 +657,9 @@ charge: the exchange-correlation integration (`mojoscf.dft.NumInt`; LDA,
 GGA and meta-GGA functionals), J/K (from the DF tensor, from in-core ERIs
 built by the engine, or integral-direct), the eigensolver and DIIS, and the
 nuclear gradients (`mojoscf.grad.KSGradients` and its UKS and DF variants).
+DFT+U objects (`dft.RKSpU`, `dft.UKSpU`) keep pyscf's Hubbard potential and
+energy on top of these, and their gradients are the Mojo ones plus pyscf's
+Hubbard term (`grad.KSpUGradients`, `UKSpUGradients`).
 `benchmarks/bench_dft.py`: pyscf versus the same object accelerated, each in
 its own process, pyscf's default grids (level 3), conv_tol 1e-9, 4 cores of
 a 2.1 GHz Xeon.
@@ -1643,8 +1671,10 @@ engine.  The classes also take plain pyscf objects,
   a Mojo SCF and pyscf code calling `get_jk` (also with the non-symmetric
   densities of TDHF, which go to pyscf) keep working.  With effective core
   potentials only the ECP derivative integrals (`ECPscalar_ipnuc`,
-  `ECPscalar_iprinv`) come from pyscf; X2C objects take all one-electron
-  pieces from pyscf, and short-range-only operators (omega < 0) use pyscf's
+  `ECPscalar_iprinv`) come from pyscf; for spin-free X2C objects the
+  derivative of the X2C Hamiltonian is contracted with the density in one
+  backward pass (`mojoscf.x2c`, see *Transition-metal complexes*), and
+  short-range-only operators (omega < 0) use pyscf's
   gradient code (the long-range exchange of range-separated functionals is
   native, with or without density fitting).
 * **Density fitting.**  For DF objects (`mojoscf.RHF(mol).density_fit()`,
@@ -1883,6 +1913,7 @@ but slow for more than a few dozen orbitals.
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |
 | Kohn-Sham XC (`NumInt.nr_rks`/`nr_uks`, LDA/GGA/meta-GGA), with `mojoscf.dft.accelerate` | Python loop over blocks: C AO values, NumPy/C GEMMs, libxc per block | Mojo (`_mojo/numint.mojo`): two passes over the grid (densities; potential matrix) around one libxc call; screened shells per block of 128 points, SIMD AO values, per-block GEMMs; pyscf's grids and libxc |
 | Kohn-Sham gradients (`grad.rks`/`uks`, DF or not) | pyscf `get_vxc` (C AO second derivatives, NumPy contractions) + J/K derivative matrices | Mojo: XC term contracted with the density inside one pass over AO second derivatives; Coulomb/exact-exchange term from `grad2e`/`grad2e_df` |
+| spin-free X2C one-electron gradient term (`x2c.sfx2c1e_grad.hcore_grad_generator`) | NumPy: per atom and coordinate the first-order X2C response in the uncontracted basis (2n x 2n eigenvector response, `X1`, `R1`, `h_FW1`) | NumPy (`mojoscf/x2c.py`): the density taken backwards through that chain once, the effective densities contracted with the derivative integrals of all atoms (nuclear-attraction operator term in one Mojo pass) |
 | VV10 non-local correlation (`numint._vv10nlc` in `nr_nlc_vxc` and the NLC gradient) | C double loop over all ordered pairs of grid points (OpenMP), scalar; densities and potential by the Python block loop | Mojo (`_mojo/nlc.mojo`): SIMD over cached tiles, each unordered pair once (symmetric denominators), one division per four vectors of pairs; densities, potential matrix and gradient contraction from the XC kernels |
 | VV10 terms of the analytical Hessian (`pyscf.hessian.rks`: `_get_enlc_deriv2`, `_get_vnlc_deriv1`, `get_vnlc_resp` in every CPHF iteration) | C double loops over all ordered pairs of NLC grid points, three divisions per pair, the pair terms evaluated again for every six trial densities (`f_t`) or every grid-weight derivative | Mojo (`_mojo/nlc.mojo`, `mojoscf.nlchess`): the symmetric sums once per unordered pair, the trial and weight-derivative sums as GEMMs of tiles of pair coefficients, the grid-response sums per atom; the CPHF response from the XC kernels with the ground-state sums once |
 | XC response kernels (`cache_xc_kernel`, `nr_rks_fxc`, `nr_uks_fxc`: TDDFT, CPHF) | Python loop over blocks per density: C AO values, NumPy GEMMs and `einsum` | Mojo (`xc_fxc_core`): one fused pass, response densities, kernel contraction and potential per block; for transition densities from their occupied-virtual factors |
@@ -1930,6 +1961,7 @@ mojoscf/
   diis.py              CDIIS drop-in class
   scf.py               RHF/UHF classes, kernel(), accelerate()
   grad.py              RHF/UHF and RKS/UKS nuclear gradient classes, exact and DF (nuc_grad_method)
+  x2c.py               spin-free X2C: the gradient of the one-electron Hamiltonian contracted with densities
   dft.py               Kohn-Sham: NumInt (XC integration), XC and VV10 gradient terms, accelerate() for pyscf RKS/UKS objects
   nlchess.py           the VV10 pair sums of pyscf's analytical Hessian and the native VV10 CPHF response
   casscf.py            DF-CASSCF integrals, orbital Hessian, gradients and DF-NEVPT2 integrals (pyscf.mcscf, pyscf.mrpt)

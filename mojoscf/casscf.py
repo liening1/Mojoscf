@@ -381,6 +381,8 @@ def lci_dot_dgci_dx(Lci, weights, mc, mo_coeff=None, ci=None, atmlst=None, mf_gr
     (:func:`mojoscf.integrals.grad2e_df_terms`); the generalized Fock and one-electron terms as pyscf's."""
     from pyscf.df.grad import rhf as dfrhf_grad
 
+    from . import grad
+
     if mo_coeff is None:
         mo_coeff = mc.mo_coeff
     if ci is None:
@@ -423,12 +425,12 @@ def lci_dot_dgci_dx(Lci, weights, mc, mo_coeff=None, ci=None, atmlst=None, mf_gr
     if atmlst is None:
         atmlst = range(mol.natm)
     aoslices = mol.aoslice_by_atom()
-    hcore_deriv = mf_grad.hcore_generator(mol)
     s1 = mf_grad.get_ovlp(mol)
+    de1 = grad.hcore_deriv_dm(mf_grad, mol, dm_cas, atmlst)
     de = np.zeros((len(atmlst), 3))
     for k, ia in enumerate(atmlst):
         p0, p1 = aoslices[ia, 2:]
-        de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm_cas)
+        de[k] += de1[ia]
         de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0[p0:p1]) * 2
         de[k] += de2[ia]
     return de
@@ -446,6 +448,8 @@ def lorb_dot_dgorb_dx(Lorb, mc, mo_coeff=None, ci=None, atmlst=None, mf_grad=Non
     (:func:`mojoscf.integrals.grad2e_df_terms`); the generalized Fock and
     one-electron terms as pyscf's."""
     from pyscf.df.grad import rhf as dfrhf_grad
+
+    from . import grad
 
     if mo_coeff is None:
         mo_coeff = mc.mo_coeff
@@ -521,12 +525,12 @@ def lorb_dot_dgorb_dx(Lorb, mc, mo_coeff=None, ci=None, atmlst=None, mf_grad=Non
     if atmlst is None:
         atmlst = range(mol.natm)
     aoslices = mol.aoslice_by_atom()
-    hcore_deriv = mf_grad.hcore_generator(mol)
     s1 = mf_grad.get_ovlp(mol)
+    de1 = grad.hcore_deriv_dm(mf_grad, mol, dm1L, atmlst)
     de = np.zeros((len(atmlst), 3))
     for k, ia in enumerate(atmlst):
         p0, p1 = aoslices[ia, 2:]
-        de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm1L)
+        de[k] += de1[ia]
         de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0[p0:p1]) * 2
         de[k] += de2[ia]
     return de
@@ -539,6 +543,8 @@ def lagrange_terms(Lorb, Lci, weights, mc, mo_coeff=None, ci=None, atmlst=None, 
     [C_core, C_act, CL_core, CL_act], its Coulomb-exchange term merged with the orbital term's on the
     same core density) and one loop over the atoms' one-electron derivative integrals."""
     from pyscf.df.grad import rhf as dfrhf_grad
+
+    from . import grad
 
     if mo_coeff is None:
         mo_coeff = mc.mo_coeff
@@ -626,13 +632,13 @@ def lagrange_terms(Lorb, Lci, weights, mc, mo_coeff=None, ci=None, atmlst=None, 
     if atmlst is None:
         atmlst = range(mol.natm)
     aoslices = mol.aoslice_by_atom()
-    hcore_deriv = mf_grad.hcore_generator(mol)
     s1 = mf_grad.get_ovlp(mol)
     dm1 = dm1L + dm_tcas
+    de1 = grad.hcore_deriv_dm(mf_grad, mol, dm1, atmlst)
     de = np.zeros((len(atmlst), 3))
     for k, ia in enumerate(atmlst):
         p0, p1 = aoslices[ia, 2:]
-        de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm1)
+        de[k] += de1[ia]
         de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0[p0:p1]) * 2
         de[k] += de2[ia]
     return de
@@ -728,13 +734,13 @@ def _grad_class():
                                              max_memory=max_memory, tol=grad.grad_tol)
 
             # one-electron part
-            hcore_deriv = self.hcore_generator(mol)
             s1 = self.get_ovlp(mol)
             aoslices = mol.aoslice_by_atom()
+            de1 = grad.hcore_deriv_dm(self, mol, dm1, atmlst)
             de = np.zeros((len(atmlst), 3))
             for k, ia in enumerate(atmlst):
                 p0, p1 = aoslices[ia, 2:]
-                de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm1)
+                de[k] += de1[ia]
                 de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0[p0:p1]) * 2
                 de[k] += de2[ia]
             log.timer("CASSCF nuclear gradients (mojoscf)", *t0)

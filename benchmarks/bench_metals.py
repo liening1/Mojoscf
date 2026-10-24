@@ -7,7 +7,10 @@ def2 basis sets (an f shell on the metal already in def2-SVP).  "DF" runs use
 pyscf's default def2 JK-fitting basis ("DF on disk": with pyscf's default
 ``max_memory`` of 4000 MB, too little for the tensor, which pyscf then keeps
 in a file), "direct" runs ``max_memory=1`` (the 4-index integrals are
-recomputed every cycle), "in-core" stores them.  For
+recomputed every cycle), "in-core" stores them; "X2C" rows add the spin-free
+one-electron X2C Hamiltonian (``mf.x2c()``, pyscf's default: the X2C
+transformation in the uncontracted basis), cisplatin there all-electron with
+Pt in dyall-v2z.  For
 each (system, driver) pair the script converges the SCF (conv_tol 1e-9; the
 same pyscf object, accelerated with ``mojoscf.accelerate`` for mojoscf) and
 then computes the gradient with ``nuc_grad_method()``.  Usage:
@@ -47,6 +50,13 @@ CASES = {
     # max_cycle = 100, so it compares the time per cycle
     "fep-tz-disk": ("Fe(II) porphine triplet / def2-TZVP (DF on disk, UHF)", 'porphyrin_atoms("Fe")', "def2-tzvp",
                     None, 0, 2, "uhf", "df-disk"),
+    # scalar-relativistic X2C (all-electron): the gradient's one-electron term is the derivative of the X2C
+    # transformation (pyscf: a first-order response per atom and coordinate)
+    "fc-tz-x2c": ("ferrocene / def2-TZVP (DF, X2C)", "ferrocene_atoms()", "def2-tzvp", None, 0, 0, "rhf", "df-x2c"),
+    "fep-svp-x2c": ("Fe(II) porphine triplet / def2-SVP (DF, UHF, X2C)", 'porphyrin_atoms("Fe")', "def2-svp", None,
+                    0, 2, "uhf", "df-x2c"),
+    "cpt-ae-x2c": ("cisplatin / Pt dyall-v2z (DF, X2C)", CPT, {"Pt": "dyall-v2z", "default": "def2-svp"}, None, 0, 0,
+                   "rhf", "df-x2c"),
 }
 HEAVY = {"fep-tz-disk"}
 
@@ -67,7 +77,9 @@ else:   # the reference must be plain pyscf: mojoscf patches some pyscf function
     assert "mojoscf" not in sys.modules
 cls = scf.RHF if %(kind)r == "rhf" else scf.UHF
 mf = cls(mol)
-if %(mode)r in ("df", "df-disk"):
+if %(mode)r.endswith("x2c"):
+    mf = mf.x2c()
+if %(mode)r in ("df", "df-disk", "df-x2c"):
     mf = mf.density_fit()
     if %(mode)r == "df-disk":
         mf.with_df.max_memory = 4000

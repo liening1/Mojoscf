@@ -30,9 +30,12 @@ gradients are:
 Results agree with ``pyscf.grad`` / ``pyscf.df.grad`` to the precision of the
 integrals.  With effective core potentials only the ECP derivative integrals
 come from pyscf (``ECPscalar_iprinv`` once per ECP centre; their sum stands for
-``ECPscalar_ipnuc``, which pyscf evaluates in addition); with X2C or finite
-nuclei all one-electron pieces do, the
-two-electron part still from the engine.  Range-separated operators and
+``ECPscalar_ipnuc``, which pyscf evaluates in addition); with finite nuclei
+all one-electron pieces do, the two-electron part still from the engine.  With
+pyscf's spin-free X2C the one-electron term is :func:`mojoscf.x2c.hcore_grad_dm`
+(the density taken back through the X2C transformation once instead of
+pyscf's response of it per atom and coordinate; ``hcore_deriv_dm``).
+Range-separated operators and
 functionals, non-local correlation, ``grid_response``, ``only_dfj``,
 ``auxbasis_response = False`` and subclasses that override ``get_veff`` or
 ``get_jk`` use pyscf's own implementation.
@@ -58,7 +61,7 @@ from pyscf.grad import uhf as uhf_grad
 from pyscf.grad import uks as uks_grad
 from pyscf.lib import logger
 
-from . import integrals
+from . import integrals, x2c
 
 __all__ = [
     "Gradients", "UGradients", "DFGradients", "DFUGradients",
@@ -211,11 +214,6 @@ class _MojoGrad1eMixin:
             mo_coeff = mf.mo_coeff
         log = logger.Logger(self.stdout, self.verbose)
 
-        # sum_ij D_ij hcore_deriv(A)_ij for all atoms from one pass over the integrals when
-        # hcore_generator is ours: 2 (sum_{i in A} h1_ij D_ij - Z_A sum_ij D_ij <nabla i|1/r_A|j>)
-        fast_h1 = type(self).hcore_generator is _MojoGrad1eMixin.hcore_generator and self._mojo_ok()
-        if not fast_h1:
-            hcore_deriv = self.hcore_generator(mol)
         s1 = self.get_ovlp(mol)
         dm0 = self._tag_rdm1(np.asarray(mf.make_rdm1(mo_coeff, mo_occ)), mo_coeff, mo_occ)
         dme0 = np.asarray(self.make_rdm1e(mo_energy, mo_coeff, mo_occ))
@@ -225,29 +223,20 @@ class _MojoGrad1eMixin:
         else:
             dm0_sf, dme0_sf = dm0, dme0
 
-        if fast_h1:
-            h1 = self.get_hcore(mol)
-            rinv = integrals.int1e_iprinv_dm(mol, dm0_sf)
-            charges = mol.atom_charges()
-            ecp_ip = self._ecp_ip(mol)[0] if mol.has_ecp() else {}
+        if atmlst is None:
+            atmlst = range(mol.natm)
+        de1 = hcore_deriv_dm(self, mol, dm0_sf, atmlst)
 
         t0 = (logger.process_clock(), logger.perf_counter())
         log.debug("Computing Gradients of the Coulomb repulsion (Mojo)")
         de2 = self.grad_2e(dm0, mol)
         log.timer("gradients of 2e part", *t0)
 
-        if atmlst is None:
-            atmlst = range(mol.natm)
         aoslices = mol.aoslice_by_atom()
         de = np.zeros((len(atmlst), 3))
         for k, ia in enumerate(atmlst):
             p0, p1 = aoslices[ia, 2:]
-            if fast_h1:
-                de[k] += 2 * (np.einsum("xij,ij->x", h1[:, p0:p1], dm0_sf[p0:p1]) - charges[ia] * rinv[ia])
-                if ia in ecp_ip:
-                    de[k] += 2 * np.einsum("xij,ij->x", ecp_ip[ia], dm0_sf)
-            else:
-                de[k] += np.einsum("xij,ij->x", hcore_deriv(ia), dm0_sf)
+            de[k] += de1[ia]
             de[k] += de2[ia]
             de[k] -= np.einsum("xij,ij->x", s1[:, p0:p1], dme0_sf[p0:p1]) * 2
             de[k] += self._extra_force(ia, locals())
@@ -256,6 +245,42 @@ class _MojoGrad1eMixin:
             log.debug("gradients of electronic part")
             rhf_grad._write(log, mol, de, atmlst)
         return de
+
+
+def hcore_deriv_dm(mf_grad, mol, dm, atmlst=None):
+    """``sum_ij D_ij hcore_deriv(A)_ij`` for the atoms of ``atmlst`` (all by default; rows of the (natm, 3)
+    result), ``hcore_deriv = mf_grad.hcore_generator(mol)``, of the symmetric part of ``dm``.
+
+    With this module's generator: one pass over the nuclear-attraction derivative integrals,
+    ``2 (sum_{i in A} h1_ij D_ij - Z_A sum_ij D_ij <nabla i|1/r_A|j>)`` plus the ECP terms; with pyscf's
+    spin-free X2C one: :func:`mojoscf.x2c.hcore_grad_dm` (no per-atom X2C response); else atom by atom.
+    """
+    dm = np.asarray(dm, dtype=np.float64)
+    dm = (dm + dm.T) * 0.5
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    gen_type = type(mf_grad).hcore_generator
+    mine = gen_type is _MojoGrad1eMixin.hcore_generator
+    de = np.zeros((mol.natm, 3))
+    if mine and mf_grad._mojo_ok(mol):
+        h1 = mf_grad.get_hcore(mol)
+        rinv = integrals.int1e_iprinv_dm(mol, dm)
+        charges = mol.atom_charges()
+        ecp_ip = mf_grad._ecp_ip(mol)[0] if mol.has_ecp() else {}
+        aoslices = mol.aoslice_by_atom()
+        for ia in atmlst:
+            p0, p1 = aoslices[ia, 2:]
+            de[ia] = 2 * (np.einsum("xij,ij->x", h1[:, p0:p1], dm[p0:p1]) - charges[ia] * rinv[ia])
+            if ia in ecp_ip:
+                de[ia] += 2 * np.einsum("xij,ij->x", ecp_ip[ia], dm)
+        return de
+    x2cobj = getattr(mf_grad.base, "with_x2c", None)
+    if (mine or gen_type is rhf_grad.GradientsBase.hcore_generator) and x2cobj is not None and x2c.grad_ok(x2cobj):
+        return x2c.hcore_grad_dm(x2cobj, mol, dm)
+    hcore_deriv = mf_grad.hcore_generator(mol)
+    for ia in atmlst:
+        de[ia] = np.einsum("xij,ij->x", hcore_deriv(ia), dm)
+    return de
 
 
 def _jk_ip1(mol, dm, with_j=True, with_k=True, omega=None):
@@ -570,6 +595,23 @@ class DFROKSGradients(_ROMixin, DFUKSGradients):
     _pyscf_grad = df_roks_grad.Gradients
 
 
+class _HubbardUMixin:
+    """pyscf's DFT+U gradients (``grad.rkspu``/``grad.ukspu``: the Kohn-Sham gradient and the derivative of the
+    Hubbard energy, ``_hubbard_U_deriv1``, added per atom in ``extra_force``) on the Mojo Kohn-Sham classes."""
+
+    _hubbard_deriv = None
+
+    def grad_elec(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
+        mf = self.base
+        mo_coeff = mf.mo_coeff if mo_coeff is None else mo_coeff
+        mo_occ = mf.mo_occ if mo_occ is None else mo_occ
+        self._dE_U = type(self)._hubbard_deriv(mf, mf.make_rdm1(mo_coeff, mo_occ))
+        return super().grad_elec(mo_energy, mo_coeff, mo_occ, atmlst)
+
+    def extra_force(self, atom_id, envs):
+        return super().extra_force(atom_id, envs) + self._dE_U[atom_id]
+
+
 _KS_GRADIENTS = {
     rks_grad.Gradients: KSGradients,
     uks_grad.Gradients: UKSGradients,
@@ -580,6 +622,26 @@ _KS_GRADIENTS = {
     roks_grad.Gradients: ROKSGradients,
     df_roks_grad.Gradients: DFROKSGradients,
 }
+
+try:        # DFT+U gradients (pyscf >= 2.9)
+    from pyscf.grad import rkspu as rkspu_grad
+    from pyscf.grad import ukspu as ukspu_grad
+except ImportError:     # pragma: no cover
+    rkspu_grad = ukspu_grad = None
+else:
+
+    class KSpUGradients(_HubbardUMixin, KSGradients):
+        """RKS+U (``dft.RKSpU``) nuclear gradients: the Mojo RKS gradient and pyscf's Hubbard term."""
+
+        _hubbard_deriv = staticmethod(rkspu_grad._hubbard_U_deriv1)
+
+    class UKSpUGradients(_HubbardUMixin, UKSGradients):
+        """UKS+U (``dft.UKSpU``) nuclear gradients: the Mojo UKS gradient and pyscf's Hubbard term."""
+
+        _hubbard_deriv = staticmethod(ukspu_grad._hubbard_U_deriv1)
+
+    _KS_GRADIENTS[rkspu_grad.Gradients] = KSpUGradients
+    _KS_GRADIENTS[ukspu_grad.Gradients] = UKSpUGradients
 
 
 def ks_gradients(g):

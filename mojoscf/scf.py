@@ -490,6 +490,10 @@ def _mojo_grad_method(mf, after):
     for cls in mro[mro.index(after) + 1:]:
         if "nuc_grad_method" in cls.__dict__:
             nxt = cls.__dict__["nuc_grad_method"]
+            # pyscf's DFT+U classes implement ``Gradients`` and let ``nuc_grad_method`` return
+            # ``self.Gradients()``, which would come back here: their ``Gradients`` instead
+            if getattr(getattr(nxt, "__code__", None), "co_names", None) == ("Gradients",) and "Gradients" in cls.__dict__:
+                nxt = cls.__dict__["Gradients"]
             break
     uhf = isinstance(mf, pyscf_uhf.UHF)
     if _is_hf(mf):          # Hartree-Fock (no ROHF); Kohn-Sham below
