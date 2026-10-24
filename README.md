@@ -343,16 +343,23 @@ gradients.
   1.6 -> 1.2 s (7.3 s), i.e. 4.5x, 6.5x and 6.1x.
 * **Exact-integral Hessians.**  The two-electron second-derivative term
   (`hess2e_core`) was over half of mojoscf's Hartree-Fock Hessian of
-  Ni(CO)4 / def2-SVP (14.5 of 26.2 s).  With translational invariance, the
-  derivative components contracted inside the kernel and the quartets of a
-  derivative pair summed in one call (*Hessian two-electron term* below)
-  it takes 2.8 s: the RHF Hessian 26.2 -> 13.3 s (pyscf 117.6 s, 4.5x ->
-  8.8x), the UHF Hessian of [Fe(H2O)6]2+ / def2-SVP 126.8 -> 97.7 s (pyscf
-  416.5 s, 3.3x -> 4.3x), same SCF, 4 cores of a 2.8 GHz Xeon.  The
-  Hessians agree with the previous ones to 5e-10 and with pyscf's (from its
-  own SCF) to 1e-8.  Most of the remaining time is now the CPHF J/K over
-  the in-core integrals (3N first-order densities per iteration, twice for
-  UHF) and the first-order Fock matrices (`h1_2e_core`).
+  Ni(CO)4 / def2-SVP (14.5 of 26.2 s on the 2.8 GHz machine).  With
+  translational invariance, the derivative components contracted inside
+  the kernel and the quartets of a derivative pair summed in one call
+  (*Hessian two-electron term* below) it takes 2.8 s.  That left the CPHF
+  J/K over the in-core integrals in front (3N first-order densities per
+  iteration, twice for UHF): with three or more densities the in-core J/K
+  now runs them as SIMD lanes (*In-core J/K of many densities* below), 27
+  densities of Ni(CO)4 in 0.15 s instead of 0.50 s (pyscf's `dot_eri_dm`
+  1.17 s).  Hessians from the same SCF, 4 cores of a 2.3 GHz Xeon:
+
+  | system                       | before | `hess2e` | + J/K  | pyscf   |
+  |------------------------------|-------:|---------:|-------:|--------:|
+  | RHF Ni(CO)4 / def2-SVP       | 15.7 s |   8.5 s  |  5.7 s |  72.7 s |
+  | UHF [Fe(H2O)6]2+ / def2-SVP  | 69.8 s |  53.5 s  | 23.5 s | 240.7 s |
+
+  i.e. 4.6x -> 12.7x and 3.4x -> 10.3x pyscf's speed; the Hessians agree
+  with each other to 7e-10 and with pyscf's (from its own SCF) to 1e-8.
 
 ### DF-CASSCF of metal complexes
 
@@ -1401,6 +1408,22 @@ The implementation is built around a few decisions, each measured:
   From the minao density, 4 cores of a 2.8 GHz Xeon: Ni(CO)4 / def2-SVP
   14.5 -> 2.8 s, [Fe(H2O)6]2+ / def2-SVP 31.2 -> 6.5 s (invariance alone
   gave 7.5 and 16.1 s, the fused contraction then 5.3 s for Ni(CO)4).
+* **In-core J/K of many densities** (`jk_s8_core`).  With the 8-fold
+  packed integrals, the J/K of several densities looped over the densities
+  inside every row segment of the integrals: short dot products and AXPYs,
+  each with its overheads, and the K rows of all densities streamed through
+  the cache per row.  From three densities on (CPHF: three per atom) they
+  are interleaved as the SIMD lanes, D[a][b][s] for eight densities s at a
+  time, so that every integral updates all of them with vector FMAs.  J
+  takes eight consecutive rows side by side (each element of D + D^T and J'
+  loaded once per eight rows; per row, as first written, J was bound by that
+  traffic); K takes the segments of four consecutive k of a row together,
+  so that K'_il and K'_jl receive their four contributions in one update and
+  the D_jl, D_il loads serve all four (single-thread, in cache: 9-10 cycles
+  per integral for eight densities one segment at a time, 6-7 grouped).
+  27 densities of Ni(CO)4 / def2-SVP (143 AOs): 0.50 -> 0.15 s (J 0.20 ->
+  0.04 s, K 0.28 -> 0.10 s), pyscf's `dot_eri_dm` 1.17 s; one or two
+  densities keep the previous code.
 * Higher degrees use a generic kernel with run-time loops and
   register-tiled SIMD products.  Primitive pairs with `mu |AB|^2 > 60` are
   dropped (libcint's `EXPCUTOFF`), shell quartets are Schwarz-screened
@@ -1762,7 +1785,7 @@ but slow for more than a few dozen orbitals.
 | `get_occ`, `make_rdm1`, `energy_elec`, `get_grad`, norms | NumPy          | Mojo (+ BLAS `dgemm`)                |
 | convergence test, bookkeeping, logging       | Python                    | Mojo (log lines via one callback)    |
 | J/K, density fitting (`df_jk.get_jk`)       | Python loop over blocks, C transform, NumPy matmul | Mojo (`_mojo/dfjk.mojo`): streaming J passes, per-Q GEMMs in worker threads (one BLAS thread each), `dsyrk` updates; a tensor on disk memory-mapped or streamed block by block |
-| J/K, in-core 8-fold ERIs (`_vhf.incore`)    | C (`libcvhf`, OpenMP)     | Mojo (`_mojo/erijk.mojo`), 1.6-1.8x faster |
+| J/K, in-core 8-fold ERIs (`_vhf.incore`)    | C (`libcvhf`, OpenMP)     | Mojo (`_mojo/erijk.mojo`), 1.6-1.8x faster; three or more densities (CPHF, response) as SIMD lanes, 7.9x for 27 |
 | J/K, direct SCF (integrals every cycle)     | C (libcint + `libcvhf`)   | Mojo (`_mojo/directjk.mojo`): Mojo integrals, libcvhf's screening, incremental build |
 | J/K outside the SCF loop (`mf.get_jk`/`get_j`/`get_k`, hence `get_veff`, `get_fock`: CASSCF core Fock, `pyscf.prop` response equations, `newton()`) | as in the loop, pyscf's | the same Mojo kernels as in the loop (DF tensor, in-core ERIs, integral-direct) for the objects mojoscf accelerates (also ROHF/ROKS and symmetry-adapted ones); a `get_jk` of a subclass is kept |
 | two-electron integrals (3-index DF tensor in memory or on disk, 4-index ERIs), once | C (libcint) | Mojo engine (`_mojo/integrals.mojo`); libcint for unsupported molecules |
