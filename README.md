@@ -57,7 +57,8 @@ iteration then runs without touching Python or pyscf's C code at all.
   space (Coulomb and exchange through MO-basis DF tensors or exact
   integrals, the XC kernel in one fused pass): 3.3 to 8.6x faster than
   pyscf's operators for benzene, ferrocene and Cu(II) complexes, with the
-  same excitation energies (6.5 to 8x in implicit solvent: PCM, SMD);
+  same excitation energies (15 to 16x in implicit solvent, PCM and SMD, as
+  re-measured with the current XC response kernel);
   excited-state gradients 3.9 to 4.5x faster,
   the SCF stability analysis on the same operators 8 to 24x, and
   second-order SCF (`mf.newton()`, also ROKS and with solvent models)
@@ -67,8 +68,9 @@ iteration then runs without touching Python or pyscf's C code at all.
   Hartree-Fock classes keeps pyscf's driver and computes the XC terms, the
   Coulomb/exchange second derivatives (DF or exact integrals) and the
   coupled-perturbed equations with Mojo kernels in the MO basis:
-  4.3 to 8.3x faster than pyscf for benzene, ferrocene and Cu(II) complexes,
-  with the same Hessians to about 1e-8.
+  13 to 21x faster than pyscf for benzene, ferrocene and Cu(II) complexes
+  (17 to 32x with VV10 or a solvent model), with the same Hessians to about
+  1e-8.
 * **DF-CASSCF** (`mojoscf.casscf`): pyscf's `mcscf.CASSCF` of an
   accelerated density-fitted reference builds its integrals and the J/K of
   its orbital-Hessian steps with Mojo kernels in the MO basis:
@@ -1207,7 +1209,7 @@ the TDDFT table:
 | benzene / def2-SVP B3LYP                    | 114 |  143.6 |   8.5 | 17.0x |   8.2 |  1.4 | 1.4e-08 | 0.00 |
 | ferrocene / def2-SVP PBE0                   | 221 | 1525.5 |  71.6 | 21.3x | 238.5 | 32.2 | 4.8e-06 | 0.01 |
 | ferrocene / def2-SVP PBE                    | 221 |  896.7 |  46.1 | 19.5x |  51.9 |  7.7 | 6.7e-06 | 0.01 |
-| ferrocene / def2-SVP CAM-B3LYP              | 221 | 1552.8 | 225.0 | 6.9x |  90.8 | 40.2 | 1.5e-06 | 0.04 |
+| ferrocene / def2-SVP CAM-B3LYP              | 221 | 2054.1 | 123.0 | 16.7x | 119.7 | 22.8 | 1.6e-06 | 0.01 |
 | [CuCl4]2- doublet / def2-SVP B3LYP (UKS)    | 103 |  130.5 |  10.4 | 12.6x |  19.1 |  1.8 | 2.3e-08 | 0.00 |
 | ethylene / def2-SVP ωB97M-V                 |  48 | 1537.4 |  74.8 | 20.5x |  78.7 |  5.6 | 2.8e-09 | 0.00 |
 | [ZnCl4]2- / def2-SVP ωB97M-V                | 103 | 3293.3 | 188.4 | 17.5x | 190.2 | 13.4 | 1.1e-07 | 0.00 |
