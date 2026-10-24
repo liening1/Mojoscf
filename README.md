@@ -376,6 +376,21 @@ gradients.
   moved to the ket side and batched as well (*Gradient two-electron term*
   below): 12.2 -> 9.3 s (pyscf 41.9 s), 3.8 -> 2.7 s (17.5 s) and
   1.6 -> 1.2 s (7.3 s), i.e. 4.5x, 6.5x and 6.1x.
+* **Larger clusters.**  One direct J/K build from the minao density,
+  pyscf against mojoscf: benzene / cc-pVDZ 0.67 s against 0.11 s (5.9x),
+  (H2O)20 / cc-pVDZ 15.1 s against 7.5 s (2.0x), C40H82 / 6-31G 18.8 s
+  against 9.3 s (2.0x), [Fe(H2O)6]2+ 12H2O / def2-SVP 13.0 s against 7.5 s
+  (1.7x).  Stack samples of the (H2O)20 build put about 40% of the
+  workers' time in the single-primitive ket batches (`flush_batch1`: the
+  lane kernel and the per-lane gathers and scattered additions into rows
+  of nao elements) and 20% in the bra's ket loop.  Two changes measured no
+  gain and were dropped: the kets of each primitive-pair class sorted by
+  Schwarz bound, so that a bra's loop stops at its first ket below
+  `tol / (q_ab min(1, 4 max|D|))` (10-20% slower with the minao density,
+  the digestion losing the shell order of the kets; within 8% either way
+  with a density scaled by 1e-5, as in late incremental cycles), and the
+  Boys function from the asymptotic form alone when no lane of a vector is
+  within the table (no change).
 * **Exact-integral Hessians.**  The two-electron second-derivative term
   (`hess2e_core`) was over half of mojoscf's Hartree-Fock Hessian of
   Ni(CO)4 / def2-SVP (14.5 of 26.2 s on the 2.8 GHz machine).  With
