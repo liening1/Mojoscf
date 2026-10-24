@@ -28,7 +28,9 @@ vectorised.  Kets of one primitive pair and two shells of degree lc + ld
 and stay one per lane after the kernel: their integrals and all six J/K
 contractions are vector operations over the lanes (``lanes_digest1``).
 Kets beyond the lane kernels' degrees go through ``eri_quartet`` one at a
-time.
+time.  From JK_LANES_MIN densities on the densities are the SIMD lanes
+instead (``DirectJK._jk_lanes``): each integral updates eight of them with
+vector FMAs, and every batched ket goes through ``eri_batch``.
 
 With ``omega`` > 0 the integrals are those of the long-range operator
 erf(omega r12) / r12: the bra side of every quartet comes from a second,
@@ -585,30 +587,306 @@ def flush_batch1(
                 return
 
 
-def flush_batch(
+comptime JK_LANES_MIN = 3   # densities from which ``DirectJK.jk`` digests them as SIMD lanes
+comptime LANES_BUDGET = 1536 * 1024 * 1024    # bytes of the workers' lane accumulators in one pass
+
+
+def digest_lanes[DO_J: Bool, DO_K: Bool, NC: Int, ND: Int](
+    blk: F64Ptr, na: Int, nb: Int, i0: Int, j0: Int, k0: Int, l0: Int, nao: Int, scale: Float64,
+    dj: F64Ptr, aj: F64Ptr, dk: F64Ptr, ak: F64Ptr,
+):
+    """``digest_cd`` for W densities at once.
+
+    ``dj``, ``dk`` and the accumulators ``aj``, ``ak`` are lane arrays:
+    element (r, c) of density t of the group at (r nao + c) W + t.  Every
+    integral is broadcast and updates the W densities with vector FMAs.
+    """
+    comptime NCD = NC * ND
+    comptime V = SIMD[DType.float64, W]
+    var s2 = 2.0 * scale
+    var dcd = stack_allocation[NCD * W, Float64, alignment=64]()    # D_cd (J)
+    var jcd = stack_allocation[NCD * W, Float64, alignment=64]()    # 2 s sum_ij (ij|cd) D_ij (J)
+    var dad = stack_allocation[ND * W, Float64, alignment=64]()     # D_il, D_ik of the current bra row i (K)
+    var dac = stack_allocation[NC * W, Float64, alignment=64]()
+    var dbd = stack_allocation[ND * W, Float64, alignment=64]()     # D_jl, D_jk of the current j (K)
+    var dbc = stack_allocation[NC * W, Float64, alignment=64]()
+    var kad = stack_allocation[ND * W, Float64, alignment=64]()     # K_il over j, k; K_ik over j, l (row i)
+    var kac = stack_allocation[NC * W, Float64, alignment=64]()
+    var kbd = stack_allocation[ND * W, Float64, alignment=64]()     # K_jl over k (one (i, j))
+    comptime if DO_J:
+        comptime for k in range(NC):
+            comptime for l in range(ND):
+                dcd.unsafe_store((k * ND + l) * W, dj.unsafe_load[width=W](((k0 + k) * nao + l0 + l) * W))
+                jcd.unsafe_store((k * ND + l) * W, V(0.0))
+    for i in range(na):
+        var ri = (i0 + i) * nao
+        comptime if DO_K:
+            comptime for l in range(ND):
+                dad.unsafe_store(l * W, dk.unsafe_load[width=W]((ri + l0 + l) * W))
+                kad.unsafe_store(l * W, V(0.0))
+            comptime for k in range(NC):
+                dac.unsafe_store(k * W, dk.unsafe_load[width=W]((ri + k0 + k) * W))
+                kac.unsafe_store(k * W, V(0.0))
+        for j in range(nb):
+            var rj = (j0 + j) * nao
+            var g = blk.unsafe_offset((i * nb + j) * NCD)
+            var dij = V(0.0)
+            comptime if DO_J:
+                dij = dj.unsafe_load[width=W]((ri + j0 + j) * W) * s2
+            comptime if DO_K:
+                comptime for l in range(ND):
+                    dbd.unsafe_store(l * W, dk.unsafe_load[width=W]((rj + l0 + l) * W))
+                    kbd.unsafe_store(l * W, V(0.0))
+                comptime for k in range(NC):
+                    dbc.unsafe_store(k * W, dk.unsafe_load[width=W]((rj + k0 + k) * W))
+            var sj = V(0.0)
+            comptime for k in range(NC):
+                var sac = V(0.0)
+                var sbc = V(0.0)
+                comptime for l in range(ND):
+                    var v = g[unsafe_offset=k * ND + l]
+                    comptime if DO_J:
+                        sj += v * dcd.unsafe_load[width=W]((k * ND + l) * W)
+                        jcd.unsafe_store((k * ND + l) * W, jcd.unsafe_load[width=W]((k * ND + l) * W) + v * dij)
+                    comptime if DO_K:
+                        sac += v * dbd.unsafe_load[width=W](l * W)
+                        sbc += v * dad.unsafe_load[width=W](l * W)
+                        kad.unsafe_store(l * W, kad.unsafe_load[width=W](l * W) + v * dbc.unsafe_load[width=W](k * W))
+                        kbd.unsafe_store(l * W, kbd.unsafe_load[width=W](l * W) + v * dac.unsafe_load[width=W](k * W))
+                comptime if DO_K:
+                    kac.unsafe_store(k * W, kac.unsafe_load[width=W](k * W) + sac)
+                    var o = (rj + k0 + k) * W
+                    ak.unsafe_store(o, ak.unsafe_load[width=W](o) + sbc * scale)
+            comptime if DO_J:
+                var o = (ri + j0 + j) * W
+                aj.unsafe_store(o, aj.unsafe_load[width=W](o) + sj * s2)
+            comptime if DO_K:
+                comptime for l in range(ND):
+                    var o = (rj + l0 + l) * W
+                    ak.unsafe_store(o, ak.unsafe_load[width=W](o) + kbd.unsafe_load[width=W](l * W) * scale)
+        comptime if DO_K:
+            comptime for k in range(NC):
+                var o = (ri + k0 + k) * W
+                ak.unsafe_store(o, ak.unsafe_load[width=W](o) + kac.unsafe_load[width=W](k * W) * scale)
+            comptime for l in range(ND):
+                var o = (ri + l0 + l) * W
+                ak.unsafe_store(o, ak.unsafe_load[width=W](o) + kad.unsafe_load[width=W](l * W) * scale)
+    comptime if DO_J:
+        comptime for k in range(NC):
+            comptime for l in range(ND):
+                var o = ((k0 + k) * nao + l0 + l) * W
+                aj.unsafe_store(o, aj.unsafe_load[width=W](o) + jcd.unsafe_load[width=W]((k * ND + l) * W))
+
+
+def digest_lanes_gen[DO_J: Bool, DO_K: Bool](
+    blk: F64Ptr, na: Int, nb: Int, nc: Int, nd: Int, i0: Int, j0: Int, k0: Int, l0: Int, nao: Int, scale: Float64,
+    dj: F64Ptr, aj: F64Ptr, dk: F64Ptr, ak: F64Ptr, loc: F64Ptr,
+):
+    """``digest_lanes`` for any ket (run-time loops; ``loc``: 2 nc nd + 3 nd + 4 nc vectors of scratch)."""
+    comptime V = SIMD[DType.float64, W]
+    var ncd = nc * nd
+    var s2 = 2.0 * scale
+    var dcd = loc
+    var jcd = dcd.unsafe_offset(ncd * W)
+    var dad = jcd.unsafe_offset(ncd * W)
+    var dac = dad.unsafe_offset(nd * W)
+    var dbd = dac.unsafe_offset(nc * W)
+    var dbc = dbd.unsafe_offset(nd * W)
+    var kad = dbc.unsafe_offset(nc * W)
+    var kac = kad.unsafe_offset(nd * W)
+    var kbd = kac.unsafe_offset(nc * W)
+    comptime if DO_J:
+        for k in range(nc):
+            for l in range(nd):
+                dcd.unsafe_store((k * nd + l) * W, dj.unsafe_load[width=W](((k0 + k) * nao + l0 + l) * W))
+                jcd.unsafe_store((k * nd + l) * W, V(0.0))
+    for i in range(na):
+        var ri = (i0 + i) * nao
+        comptime if DO_K:
+            for l in range(nd):
+                dad.unsafe_store(l * W, dk.unsafe_load[width=W]((ri + l0 + l) * W))
+                kad.unsafe_store(l * W, V(0.0))
+            for k in range(nc):
+                dac.unsafe_store(k * W, dk.unsafe_load[width=W]((ri + k0 + k) * W))
+                kac.unsafe_store(k * W, V(0.0))
+        for j in range(nb):
+            var rj = (j0 + j) * nao
+            var g = blk.unsafe_offset((i * nb + j) * ncd)
+            var dij = V(0.0)
+            comptime if DO_J:
+                dij = dj.unsafe_load[width=W]((ri + j0 + j) * W) * s2
+            comptime if DO_K:
+                for l in range(nd):
+                    dbd.unsafe_store(l * W, dk.unsafe_load[width=W]((rj + l0 + l) * W))
+                    kbd.unsafe_store(l * W, V(0.0))
+                for k in range(nc):
+                    dbc.unsafe_store(k * W, dk.unsafe_load[width=W]((rj + k0 + k) * W))
+            var sj = V(0.0)
+            for k in range(nc):
+                var sac = V(0.0)
+                var sbc = V(0.0)
+                var dbck = dbc.unsafe_load[width=W](k * W)
+                var dack = dac.unsafe_load[width=W](k * W)
+                for l in range(nd):
+                    var v = g[unsafe_offset=k * nd + l]
+                    comptime if DO_J:
+                        sj += v * dcd.unsafe_load[width=W]((k * nd + l) * W)
+                        jcd.unsafe_store((k * nd + l) * W, jcd.unsafe_load[width=W]((k * nd + l) * W) + v * dij)
+                    comptime if DO_K:
+                        sac += v * dbd.unsafe_load[width=W](l * W)
+                        sbc += v * dad.unsafe_load[width=W](l * W)
+                        kad.unsafe_store(l * W, kad.unsafe_load[width=W](l * W) + v * dbck)
+                        kbd.unsafe_store(l * W, kbd.unsafe_load[width=W](l * W) + v * dack)
+                comptime if DO_K:
+                    kac.unsafe_store(k * W, kac.unsafe_load[width=W](k * W) + sac)
+                    var o = (rj + k0 + k) * W
+                    ak.unsafe_store(o, ak.unsafe_load[width=W](o) + sbc * scale)
+            comptime if DO_J:
+                var o = (ri + j0 + j) * W
+                aj.unsafe_store(o, aj.unsafe_load[width=W](o) + sj * s2)
+            comptime if DO_K:
+                for l in range(nd):
+                    var o = (rj + l0 + l) * W
+                    ak.unsafe_store(o, ak.unsafe_load[width=W](o) + kbd.unsafe_load[width=W](l * W) * scale)
+        comptime if DO_K:
+            for k in range(nc):
+                var o = (ri + k0 + k) * W
+                ak.unsafe_store(o, ak.unsafe_load[width=W](o) + kac.unsafe_load[width=W](k * W) * scale)
+            for l in range(nd):
+                var o = (ri + l0 + l) * W
+                ak.unsafe_store(o, ak.unsafe_load[width=W](o) + kad.unsafe_load[width=W](l * W) * scale)
+    comptime if DO_J:
+        for k in range(nc):
+            for l in range(nd):
+                var o = ((k0 + k) * nao + l0 + l) * W
+                aj.unsafe_store(o, aj.unsafe_load[width=W](o) + jcd.unsafe_load[width=W]((k * nd + l) * W))
+
+
+def _digest_lanes_any[DO_J: Bool, DO_K: Bool](
+    blk: F64Ptr, na: Int, nb: Int, nc: Int, nd: Int, i0: Int, j0: Int, k0: Int, l0: Int, nao: Int, scale: Float64,
+    dj: F64Ptr, aj: F64Ptr, dk: F64Ptr, ak: F64Ptr, loc: F64Ptr,
+):
+    """``digest_lanes`` for kets of s to f shells (spherical, one contraction), else ``digest_lanes_gen``."""
+    comptime for KC in range(4):
+        comptime for KD in range(4):
+            if nc == 2 * KC + 1 and nd == 2 * KD + 1:
+                digest_lanes[DO_J, DO_K, 2 * KC + 1, 2 * KD + 1](blk, na, nb, i0, j0, k0, l0, nao, scale, dj, aj, dk, ak)
+                return
+    digest_lanes_gen[DO_J, DO_K](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, dj, aj, dk, ak, loc)
+
+
+comptime QBUF_WORDS = 1 << 17    # integrals of one bra's quartets kept for ``QuartetBuffer.digest``, at most
+
+
+struct QuartetBuffer(Movable):
+    """The integral blocks of one bra's quartets in ``_jk_bra`` with lanes, digested group by group.
+
+    Digesting every quartet for all groups of densities in turn reads, per
+    quartet, a few rows of every group's lane arrays (megabytes apart) and
+    missed the caches; group by group, the bra's rows of one group stay in
+    cache for all its quartets.
+    """
+
+    var blocks: List[Float64]
+    var meta: List[Int]         # per quartet: c, d, same pair, offset of its block
+    var used: Int
+    var cap: Int
+
+    def __init__(out self, cap: Int):
+        self.cap = cap
+        self.blocks = List[Float64](length=max(cap, 1) + 8, fill=0.0)
+        self.meta = List[Int]()
+        self.used = 0
+
+    def room(self, n: Int) -> Bool:
+        return self.used + n <= self.cap
+
+    def push(mut self, c: Int, d: Int, same: Bool, src: F64Ptr, n: Int):
+        var dst = list_ptr(self.blocks).unsafe_offset(self.used)
+        for e in range(n):
+            dst[unsafe_offset=e] = src[unsafe_offset=e]
+        self.meta.append(c)
+        self.meta.append(d)
+        self.meta.append(1 if same else 0)
+        self.meta.append(self.used)
+        self.used += n
+
+    def digest(
+        mut self, basis: Basis, a: Int, b: Int, nao: Int, gst: Int, ngj: Int, ngk: Int, dlj: F64Ptr, dlk: F64Ptr,
+        aj: F64Ptr, ak: F64Ptr, loc: F64Ptr,
+    ):
+        """Fold the buffered quartets of bra (a, b) into the lane accumulators, group by group
+        (``digest_lanes``), and empty the buffer."""
+        var nq = len(self.meta) // 4
+        var pb = list_ptr(self.blocks)
+        var i0 = basis.ao_loc[a]
+        var na = basis.ao_loc[a + 1] - i0
+        var j0 = basis.ao_loc[b]
+        var nb = basis.ao_loc[b + 1] - j0
+        var sab = 0.5 if a == b else 1.0
+        for g in range(max(ngj, ngk)):
+            var pj = dlj.unsafe_offset(min(g, max(ngj - 1, 0)) * gst)
+            var qj = aj.unsafe_offset(min(g, max(ngj - 1, 0)) * gst)
+            var pk = dlk.unsafe_offset(min(g, max(ngk - 1, 0)) * gst)
+            var qk = ak.unsafe_offset(min(g, max(ngk - 1, 0)) * gst)
+            for q in range(nq):
+                var c = self.meta[4 * q]
+                var d = self.meta[4 * q + 1]
+                var blk = pb.unsafe_offset(self.meta[4 * q + 3])
+                var k0 = basis.ao_loc[c]
+                var nc = basis.ao_loc[c + 1] - k0
+                var l0 = basis.ao_loc[d]
+                var nd = basis.ao_loc[d + 1] - l0
+                var scale = sab
+                if c == d:
+                    scale *= 0.5
+                if self.meta[4 * q + 2] != 0:
+                    scale *= 0.5
+                if g < ngj and g < ngk:
+                    _digest_lanes_any[True, True](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, pj, qj, pk, qk, loc)
+                elif g < ngj:
+                    _digest_lanes_any[True, False](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, pj, qj, pj, qk, loc)
+                else:
+                    _digest_lanes_any[False, True](blk, na, nb, nc, nd, i0, j0, k0, l0, nao, scale, pj, qj, pk, qk, loc)
+        self.meta.clear()
+        self.used = 0
+
+
+def flush_batch[LANES: Bool](
     jk: DirectJK, tb: PairTable, sp: Int, kets: IntPtr, nket: Int, mut ws: EriWork, mut wb: EriBatch, n2: Int,
-    nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, ploc: F64Ptr,
+    nj: Int, nk: Int, dmj: F64Ptr, dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, ploc: F64Ptr, mut qb: QuartetBuffer,
 ):
     """Integrals of bra ``sp`` (of ``tb``: ``jk.tab`` or its attenuated copy) with the queued kets
-    (``eri_batch``) folded into the J/K accumulators."""
+    (``eri_batch``) folded into the J/K accumulators (LANES: into ``qb``, as in ``_jk_bra``)."""
     eri_batch(tb, sp, jk.tab, kets, nket, jk.boys, ws, wb)
     var a = jk.tab.get(sp, I_A)
     var b = jk.tab.get(sp, I_B)
+    var nab = jk.tab.get(sp, I_NCOMP)
     for k in range(nket):
         var sk = kets[unsafe_offset=k]
-        digest_quartet(
-            jk.basis, a, b, jk.tab.get(sk, I_A), jk.tab.get(sk, I_B), sk == sp, wb.block(k),
-            jk.nao, n2, nj, nk, dmj, dmk, aj, ak, ploc,
-        )
+        comptime if LANES:
+            var n = nab * jk.tab.get(sk, I_NCOMP)
+            if not qb.room(n):
+                qb.digest(jk.basis, a, b, jk.nao, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+            qb.push(jk.tab.get(sk, I_A), jk.tab.get(sk, I_B), sk == sp, wb.block(k), n)
+        else:
+            digest_quartet(
+                jk.basis, a, b, jk.tab.get(sk, I_A), jk.tab.get(sk, I_B), sk == sp, wb.block(k),
+                jk.nao, n2, nj, nk, dmj, dmk, aj, ak, ploc,
+            )
 
 
-def _jk_bra(
+def _jk_bra[LANES: Bool](
     self: DirectJK, tb: PairTable, sp: Int, mut ws: EriWork, mut wb: EriBatch, mut queue: KetQueue, ploc: F64Ptr,
     pcond: F64Ptr, pq: F64Ptr, npairs: Int, nbas: Int, nao: Int, n2: Int, nj: Int, nk: Int, dmj: F64Ptr,
-    dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, tol: Float64, lscr: F64Ptr,
+    dmk: F64Ptr, aj: F64Ptr, ak: F64Ptr, tol: Float64, lscr: F64Ptr, mut qb: QuartetBuffer,
 ):
     """The quartets of bra pair ``sp`` folded into a worker's J/K accumulators (``DirectJK.jk``); ``tb`` is the
-    bra-side pair table (``self.tab``, or its attenuated copy for the long-range operator)."""
+    bra-side pair table (``self.tab``, or its attenuated copy for the long-range operator).  With LANES the
+    densities are SIMD lanes (``digest_lanes``): ``nj``, ``nk`` count groups of W, ``dmj``, ``dmk``,
+    ``aj``, ``ak`` are lane arrays of ``n2`` (= nao^2 W) values per group, ``ploc`` is that kernel's
+    scratch, the kets of one primitive pair go through ``eri_batch`` with the others, and the integral
+    blocks are collected in ``qb`` and digested group by group."""
     var qab = pq[unsafe_offset=sp]
     if qab == 0.0:
         return
@@ -637,38 +915,54 @@ def _jk_bra(
             continue
         var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
         if kc >= 0 and lanes_preferred(self.tab, sp, self.tab, spk):
-            var k1 = pkone[unsafe_offset=spk]
-            if k1 >= 0:
-                var q1 = self.nclass + k1
-                if queue.full(q1, 1):
-                    flush_batch1(
-                        self, tb, sp, queue.kets(q1), queue.cnt[q1], k1, ws, wb, lscr, self.nfmax, n2, nj, nk, dmj,
-                        dmk, aj, ak,
-                    )
-                    queue.clear(q1)
-                queue.push(q1, spk, 1)
-                continue
+            comptime if not LANES:
+                var k1 = pkone[unsafe_offset=spk]
+                if k1 >= 0:
+                    var q1 = self.nclass + k1
+                    if queue.full(q1, 1):
+                        flush_batch1(
+                            self, tb, sp, queue.kets(q1), queue.cnt[q1], k1, ws, wb, lscr, self.nfmax, n2, nj, nk,
+                            dmj, dmk, aj, ak,
+                        )
+                        queue.clear(q1)
+                    queue.push(q1, spk, 1)
+                    continue
             if queue.full(kc, npk):
-                flush_batch(self, tb, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+                flush_batch[LANES](
+                    self, tb, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc, qb
+                )
                 queue.clear(kc)
             queue.push(kc, spk, npk)
             continue
         if not eri_quartet(tb, sp, self.tab, spk, self.ht, self.boys, ws):
             continue
-        digest_quartet(self.basis, a, b, c, d, sp == spk, list_ptr(ws.out), nao, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+        comptime if LANES:
+            var n = self.tab.get(sp, I_NCOMP) * self.tab.get(spk, I_NCOMP)
+            if not qb.room(n):
+                qb.digest(self.basis, a, b, nao, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+            qb.push(c, d, sp == spk, list_ptr(ws.out), n)
+        else:
+            digest_quartet(
+                self.basis, a, b, c, d, sp == spk, list_ptr(ws.out), nao, n2, nj, nk, dmj, dmk, aj, ak, ploc
+            )
     # the rest of this bra's batches
     for kc in range(self.nclass):
         if queue.cnt[kc] > 0:
-            flush_batch(self, tb, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc)
-            queue.clear(kc)
-    for k1 in range(NCLASS1):
-        var q1 = self.nclass + k1
-        if queue.cnt[q1] > 0:
-            flush_batch1(
-                self, tb, sp, queue.kets(q1), queue.cnt[q1], k1, ws, wb, lscr, self.nfmax, n2, nj, nk, dmj, dmk,
-                aj, ak,
+            flush_batch[LANES](
+                self, tb, sp, queue.kets(kc), queue.cnt[kc], ws, wb, n2, nj, nk, dmj, dmk, aj, ak, ploc, qb
             )
-            queue.clear(q1)
+            queue.clear(kc)
+    comptime if LANES:
+        qb.digest(self.basis, a, b, nao, n2, nj, nk, dmj, dmk, aj, ak, ploc)
+    else:
+        for k1 in range(NCLASS1):
+            var q1 = self.nclass + k1
+            if queue.cnt[q1] > 0:
+                flush_batch1(
+                    self, tb, sp, queue.kets(q1), queue.cnt[q1], k1, ws, wb, lscr, self.nfmax, n2, nj, nk, dmj, dmk,
+                    aj, ak,
+                )
+                queue.clear(q1)
 
 
 struct DirectJK(Movable):
@@ -776,6 +1070,156 @@ struct DirectJK(Movable):
         _ = sa^
         _ = sb^
 
+    def _cond(self, nj: Int, dmj: F64Ptr, nk: Int, dmk: F64Ptr) -> List[Float64]:
+        """The largest density element of every shell block (a nbas + b), over all densities."""
+        var nao = self.nao
+        var n2 = nao * nao
+        var nbas = self.nbas
+        var cond = List[Float64](length=max(nbas * nbas, 1), fill=0.0)
+        for a in range(nbas):
+            var i0 = self.basis.ao_loc[a]
+            var i1 = self.basis.ao_loc[a + 1]
+            for b in range(nbas):
+                var j0 = self.basis.ao_loc[b]
+                var j1 = self.basis.ao_loc[b + 1]
+                var m = 0.0
+                for s in range(nj + nk):
+                    var d = dmj.unsafe_offset(s * n2) if s < nj else dmk.unsafe_offset((s - nj) * n2)
+                    for i in range(i0, i1):
+                        for j in range(j0, j1):
+                            var v = abs(d[unsafe_offset=i * nao + j])
+                            if v > m:
+                                m = v
+                cond[a * nbas + b] = m
+        return cond^
+
+    def _jk_lanes(
+        self, nj: Int, dmj: F64Ptr, vj: F64Ptr, nk: Int, dmk: F64Ptr, vk: F64Ptr, tol: Float64, nanti: Int
+    ):
+        """``jk`` with the densities as SIMD lanes.
+
+        Groups of W densities (density g W + t in lane t of group g) are
+        interleaved into lane arrays of nao^2 W values, element (r, c) at
+        (r nao + c) W + t, and every quartet is digested for all of them with
+        vector FMAs (``digest_lanes``) instead of once per density.
+        A pass over the integrals takes as many groups as keep the workers'
+        accumulators within LANES_BUDGET bytes.  When ``dmj`` and ``dmk`` are
+        the same array (J of its first nj densities, K of all nk) the lanes
+        are shared.
+        """
+        var nao = self.nao
+        var n2 = nao * nao
+        var gst = n2 * W
+        var nbas = self.nbas
+        var npairs = nbas * (nbas + 1) // 2
+        var cond = self._cond(nj, dmj, nk, dmk)
+        var pcond = list_ptr(cond)
+        var ngj_all = (nj + W - 1) // W
+        var ngk_all = (nk + W - 1) // W
+        var shared = Int(dmj) == Int(dmk) and nj <= nk
+        var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
+        var gmax = max(1, LANES_BUDGET // (nworkers * 2 * gst * 8))
+        var pq = list_ptr(self.q)
+        var nfmax = self.nfmax
+        var attenuated = self.omega > 0.0
+        var g0 = 0
+        while g0 < max(ngj_all, ngk_all):
+            var ngj = min(gmax, max(ngj_all - g0, 0))     # groups of this pass
+            var ngk = min(gmax, max(ngk_all - g0, 0))
+            var s0 = g0 * W
+            var mj = min(ngj * W, max(nj - s0, 0))         # densities of this pass
+            var mk = min(ngk * W, max(nk - s0, 0))
+            var nl = ngk if shared else ngj + ngk
+            var dl = List[Float64](length=max(nl, 1) * gst + 2 * W, fill=0.0)    # lanes past the densities: zero
+            var pdl = F64Ptr(unsafe_from_address=aligned_addr(dl))
+            var dlk = pdl
+            var dlj = pdl if shared else pdl.unsafe_offset(ngk * gst)
+            for t in range(mk):
+                var d = dmk.unsafe_offset((s0 + t) * n2)
+                var dst = dlk.unsafe_offset((t // W) * gst + t % W)
+                for e in range(n2):
+                    dst[unsafe_offset=e * W] = d[unsafe_offset=e]
+            if not shared:
+                for t in range(mj):
+                    var d = dmj.unsafe_offset((s0 + t) * n2)
+                    var dst = dlj.unsafe_offset((t // W) * gst + t % W)
+                    for e in range(n2):
+                        dst[unsafe_offset=e * W] = d[unsafe_offset=e]
+            var per = (ngj + ngk) * gst
+            var acc = List[Float64](length=nworkers * per + 2 * W, fill=0.0)
+            var pacc = F64Ptr(unsafe_from_address=aligned_addr(acc))
+            var counter = Atomic[Int64](0)
+            var pcount = Pointer(to=counter)
+
+            def work(w: Int) {imm self, imm pacc, imm pcond, imm pq, imm pcount, imm npairs, imm nbas, imm nao, imm gst, imm per, imm ngj, imm ngk, imm dlj, imm dlk, imm tol, imm nfmax, imm attenuated}:
+                var ws = EriWork(self.tab.maxcomp, self.tab.maxlab, self.tab.maxcomp, self.tab.maxlab)
+                var wb = EriBatch(self.tab.maxcomp, self.tab.maxcomp)
+                var loc = List[Float64](length=(2 * nfmax * nfmax + 7 * nfmax) * W + 2 * W, fill=0.0)
+                var ploc = F64Ptr(unsafe_from_address=aligned_addr(loc))
+                var aj = pacc.unsafe_offset(w * per)
+                var ak = aj.unsafe_offset(ngj * gst)
+                var queue = KetQueue(self.nclass + NCLASS1)
+                var qb = QuartetBuffer(max(QBUF_WORDS, self.tab.maxcomp * self.tab.maxcomp))
+                while True:
+                    var task = Int(pcount[].fetch_add(1))
+                    if task >= npairs:
+                        break
+                    var sp = self.order[task]
+                    if attenuated:
+                        _jk_bra[True](
+                            self, self.tabw, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, gst, ngj, ngk, dlj,
+                            dlk, aj, ak, tol, ploc, qb,
+                        )
+                    else:
+                        _jk_bra[True](
+                            self, self.tab, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, gst, ngj, ngk, dlj,
+                            dlk, aj, ak, tol, ploc, qb,
+                        )
+                _ = wb^
+                _ = queue^
+                _ = ws^
+                _ = loc^
+                _ = qb^
+
+            if nworkers == 1:
+                work(0)
+            else:
+                parallelize(work, nworkers)
+            if nworkers > 1:
+                var nchunk = min(64, max(1, per // 65536))
+
+                def reduce(cidx: Int) {imm pacc, imm per, imm nchunk, imm nworkers}:
+                    var lo = per * cidx // nchunk
+                    var hi = per * (cidx + 1) // nchunk
+                    for w2 in range(1, nworkers):
+                        vaxpy(pacc.unsafe_offset(lo), hi - lo, 1.0, pacc.unsafe_offset(w2 * per + lo))
+
+                if nchunk == 1:
+                    reduce(0)
+                else:
+                    parallelize(reduce, nchunk)
+            # out of the lanes: J = A + A^T, K = A + A^T (A - A^T for the antisymmetric densities)
+            var nout = mj + mk
+
+            def unpack(t2: Int) {imm pacc, imm gst, imm ngj, imm mj, imm s0, imm nao, imm n2, imm vj, imm vk, imm nk, imm nanti}:
+                var t = t2 if t2 < mj else t2 - mj
+                var src = pacc.unsafe_offset(((t // W) if t2 < mj else ngj + t // W) * gst + t % W)
+                var dst = vj.unsafe_offset((s0 + t) * n2) if t2 < mj else vk.unsafe_offset((s0 + t) * n2)
+                var sgn = -1.0 if t2 >= mj and s0 + t >= nk - nanti else 1.0
+                for a in range(nao):
+                    for b in range(nao):
+                        dst[unsafe_offset=a * nao + b] = (
+                            src[unsafe_offset=(a * nao + b) * W] + sgn * src[unsafe_offset=(b * nao + a) * W]
+                        )
+
+            if nout > 0:
+                parallelize(unpack, nout)
+            _ = dl^
+            _ = acc^
+            _ = counter^
+            g0 += gmax
+        _ = cond^
+
     def jk(
         self, nj: Int, dmj: F64Ptr, vj: F64Ptr, nk: Int, dmk: F64Ptr, vk: F64Ptr, tol: Float64, nanti: Int = 0
     ):
@@ -784,7 +1228,8 @@ struct DirectJK(Movable):
         The densities are symmetric (nao x nao, row-major), except the last
         ``nanti`` exchange densities, which are antisymmetric: the four index
         orderings the digestion adds are then minus the transpose of the
-        other four, K = A - A^T.
+        other four, K = A - A^T.  From JK_LANES_MIN densities on they are
+        digested as SIMD lanes (``_jk_lanes``).
         """
         var nao = self.nao
         var n2 = nao * nao
@@ -793,24 +1238,11 @@ struct DirectJK(Movable):
         var nacc = nj + nk
         if nacc == 0:
             return
-        # largest density element per shell block, over all densities
-        var cond = List[Float64](length=max(nbas * nbas, 1), fill=0.0)
+        if max(nj, nk) >= JK_LANES_MIN:
+            self._jk_lanes(nj, dmj, vj, nk, dmk, vk, tol, nanti)
+            return
+        var cond = self._cond(nj, dmj, nk, dmk)
         var pcond = list_ptr(cond)
-        for a in range(nbas):
-            var i0 = self.basis.ao_loc[a]
-            var i1 = self.basis.ao_loc[a + 1]
-            for b in range(nbas):
-                var j0 = self.basis.ao_loc[b]
-                var j1 = self.basis.ao_loc[b + 1]
-                var m = 0.0
-                for s in range(nacc):
-                    var d = dmj.unsafe_offset(s * n2) if s < nj else dmk.unsafe_offset((s - nj) * n2)
-                    for i in range(i0, i1):
-                        for j in range(j0, j1):
-                            var v = abs(d[unsafe_offset=i * nao + j])
-                            if v > m:
-                                m = v
-                pcond[unsafe_offset=a * nbas + b] = m
         var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
         var acc = List[Float64](length=nworkers * nacc * n2, fill=0.0)
         var pacc = list_ptr(acc)
@@ -831,20 +1263,22 @@ struct DirectJK(Movable):
             var queue = KetQueue(self.nclass + NCLASS1)    # kets of the current bra waiting for a batch
             var lsl = List[Float64](length=lanes1_scratch(nfmax, max(nj, nk)) + W, fill=0.0)
             var lscr = F64Ptr(unsafe_from_address=aligned_addr(lsl))
+            var qb = QuartetBuffer(0)
             while True:
                 var task = Int(pcount[].fetch_add(1))
                 if task >= npairs:
                     break
                 var sp = self.order[task]
                 if attenuated:
-                    _jk_bra(self, self.tabw, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol, lscr)
+                    _jk_bra[False](self, self.tabw, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol, lscr, qb)
                 else:
-                    _jk_bra(self, self.tab, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol, lscr)
+                    _jk_bra[False](self, self.tab, sp, ws, wb, queue, ploc, pcond, pq, npairs, nbas, nao, n2, nj, nk, dmj, dmk, aj, ak, tol, lscr, qb)
             _ = wb^
             _ = queue^
             _ = ws^
             _ = loc^
             _ = lsl^
+            _ = qb^
 
         if nworkers == 1:
             work(0)

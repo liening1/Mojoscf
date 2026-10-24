@@ -315,6 +315,35 @@ def test_direct_get_jk_segmented_and_general(atom, basis, rng):
     assert abs(vk - rk).max() < 1e-10 * max(1.0, abs(rk).max())
 
 
+@pytest.mark.parametrize("atom, basis, cart", [
+    ("Cu 0 0 0; H 0 0 1.5", "def2-svp", False),                 # f shell, batched and single kets
+    ("C 0 0 0; O 0 0 1.13", "cc-pvtz", False),                  # general contraction: generic lane kernel
+    ("O 0 0 0; H 0 0.76 0.59; H 0 -0.76 0.59", "cc-pvdz", True),  # Cartesian d
+])
+def test_direct_get_jk_many_densities(atom, basis, cart, rng):
+    """Densities as SIMD lanes (from three on): a full and a partial group of eight, symmetric and not,
+    J or K alone, the long-range operator."""
+    mol = gto.M(atom=atom, basis=basis, cart=cart, spin=None, verbose=0)
+    n = mol.nao_nr()
+    a = rng.standard_normal((11, n, n))
+    sym = a + a.transpose(0, 2, 1)
+    vj, vk = mojoscf.integrals.get_jk(mol, sym, direct_scf_tol=0.0)
+    rj, rk = scf.hf.get_jk(mol, sym)
+    tol = 1e-10 * max(1.0, abs(rk).max())
+    assert abs(vj - rj).max() < tol and abs(vk - rk).max() < tol
+    vj1, none = mojoscf.integrals.get_jk(mol, sym[:4], with_k=False, direct_scf_tol=0.0)
+    assert none is None and abs(vj1 - rj[:4]).max() < tol
+    none, vk1 = mojoscf.integrals.get_jk(mol, sym[:5], with_j=False, direct_scf_tol=0.0)
+    assert none is None and abs(vk1 - rk[:5]).max() < tol
+    a[3] = a[3] - a[3].T
+    rj, rk = scf.hf.get_jk(mol, a[:6], hermi=0)
+    vj, vk = mojoscf.integrals.get_jk(mol, a[:6], direct_scf_tol=0.0, hermi=0)
+    assert abs(vj - rj).max() < tol and abs(vk - rk).max() < tol
+    rj, rk = scf.hf.get_jk(mol, sym[:9], omega=0.4)
+    vj, vk = mojoscf.integrals.get_jk(mol, sym[:9], direct_scf_tol=0.0, omega=0.4)
+    assert abs(vj - rj).max() < tol and abs(vk - rk).max() < tol
+
+
 def test_incore_eris_and_df_tensor_from_mojo_engine(h2o_dz):
     mf = mojoscf.RHF(h2o_dz)
     mode, eri, _ = mojoscf.native_veff(mf)

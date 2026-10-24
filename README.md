@@ -1452,6 +1452,26 @@ The implementation is built around a few decisions, each measured:
   Hermite matrices cost more than the vector contractions saved), and the
   three directions of an atom as one vector (on medium blocks the scalar
   code already runs at about two FMAs per cycle).
+* **Integral-direct J/K of many densities** (`DirectJK.jk`).  The direct
+  J/K evaluates every quartet once for all densities but digested its
+  block once per density: 114 CPHF densities of [Fe(H2O)6]2+ / def2-SVP
+  took 11.7 s against 0.44 s for one, every CPHF iteration of a Hessian
+  whose ERIs do not fit in core paying for 100+ digestions per quartet.
+  From three densities on they are now SIMD lanes, as in the in-core J/K:
+  groups of eight interleaved as D[a][b][s], each integral broadcast into
+  vector FMAs for the eight (`digest_lanes`), and the kets of one primitive
+  pair batched with the others.  A bra's integral blocks are collected and
+  digested group by group (`QuartetBuffer`), so that its rows of one
+  group's arrays stay in cache for all its kets (digesting every group per
+  quartet missed the caches on rows megabytes apart: 20% slower); the
+  Coulomb ket-side rows, different for every quartet, still miss, so J
+  costs more than K.  A pass over the integrals takes as many groups as
+  keep the workers' accumulators within 1.5 GB.  4 cores of a 2.3 GHz
+  Xeon: 114 densities of [Fe(H2O)6]2+ 11.7 -> 2.7 s, 11 densities 1.04 ->
+  0.67 s; Fe-porphine / def2-SVP (427 AOs) 8 densities 13.6 -> 8.4 s, 111
+  in 53.5 s (about 1.1 s per density before).  The UHF Hessian of
+  [Fe(H2O)6]2+ with integral-direct J/K (ERIs not in core) takes 28.7 s
+  instead of 81.4 s, its CPHF J/K 16.0 s instead of 68.8 s.
 * Higher degrees use a generic kernel with run-time loops and
   register-tiled SIMD products.  Primitive pairs with `mu |AB|^2 > 60` are
   dropped (libcint's `EXPCUTOFF`), shell quartets are Schwarz-screened
