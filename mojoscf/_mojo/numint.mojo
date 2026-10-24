@@ -1207,7 +1207,7 @@ def xc_grad_core(
                 for x in range(3):
                     var dx_ao = ao.unsafe_offset((1 + x) * cs)
                     try:
-                        blas.gemm(False, True, nrow, nrow, BLK, 1.0, dx_ao, zb, 0.0, ws.dsub())
+                        blas.gemm_small(False, True, nrow, nrow, BLK, 1.0, dx_ao, zb, 0.0, ws.dsub())
                     except:
                         pass
                     if gga:
@@ -1226,13 +1226,13 @@ def xc_grad_core(
                                 y += ao.unsafe_load[width=W](c2 * cs + o) * w2 + ao.unsafe_load[width=W](c3 * cs + o) * w3
                                 yb.unsafe_store(o, y)
                         try:
-                            blas.gemm(False, True, nrow, nrow, BLK, 1.0, yb, ao, 1.0, ws.dsub())
+                            blas.gemm_small(False, True, nrow, nrow, BLK, 1.0, yb, ao, 1.0, ws.dsub())
                         except:
                             pass
                     if mgga:
                         for c in range(3):
                             try:
-                                blas.gemm(False, True, nrow, nrow, BLK, 1.0, ao.unsafe_offset(_d2c(x, c) * cs),
+                                blas.gemm_small(False, True, nrow, nrow, BLK, 1.0, ao.unsafe_offset(_d2c(x, c) * cs),
                                           tb.unsafe_offset(c * nrow * BLK), 1.0, ws.dsub())
                             except:
                                 pass
@@ -1261,7 +1261,7 @@ def xc_grad_core(
 def _orb_apply(blas: Blas, nrow: Int, norb: Int, nk: F64Ptr, src: F64Ptr, tmp: F64Ptr, dst: F64Ptr, ws: AOWork):
     """dst = C_sub diag(n) C_sub^T src (nrow x BLK) with C_sub in ws.dsub (nrow x norb); tmp holds norb x BLK."""
     try:
-        blas.gemm(True, False, norb, BLK, nrow, 1.0, ws.dsub(), src, 0.0, tmp)
+        blas.gemm_small(True, False, norb, BLK, nrow, 1.0, ws.dsub(), src, 0.0, tmp)
     except:
         pass
     for k in range(norb):
@@ -1269,7 +1269,7 @@ def _orb_apply(blas: Blas, nrow: Int, norb: Int, nk: F64Ptr, src: F64Ptr, tmp: F
         for v in range(NV):
             tmp.unsafe_store(k * BLK + v * W, tmp.unsafe_load[width=W](k * BLK + v * W) * f)
     try:
-        blas.gemm(False, False, nrow, BLK, norb, 1.0, ws.dsub(), tmp, 0.0, dst)
+        blas.gemm_small(False, False, nrow, BLK, norb, 1.0, ws.dsub(), tmp, 0.0, dst)
     except:
         pass
 
@@ -1357,7 +1357,7 @@ def xc_grad_dm_core(
                 else:
                     gather_block(dms.unsafe_offset(s * n2), nao, nrow, ws)
                     try:
-                        blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao, 0.0, g0)
+                        blas.gemm_small(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao, 0.0, g0)
                     except:
                         pass
                 if not gga:
@@ -1389,7 +1389,7 @@ def xc_grad_dm_core(
                     _orb_apply(blas, nrow, norb, nk, zb, tmp, g1, ws)
                 else:
                     try:
-                        blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), zb, 0.0, g1)
+                        blas.gemm_small(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), zb, 0.0, g1)
                     except:
                         pass
                 # second derivatives: xx 4, xy 5, xz 6, yy 7, yz 8, zz 9
@@ -1429,7 +1429,7 @@ def xc_grad_dm_core(
                             _orb_apply(blas, nrow, norb, nk, ac, tmp, g1, ws)
                         else:
                             try:
-                                blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ac, 0.0, g1)
+                                blas.gemm_small(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ac, 0.0, g1)
                             except:
                                 pass
                         var kx = 3 + c
@@ -2001,7 +2001,7 @@ def xc_hess_core(
                 gather_block(dms.unsafe_offset(s * n2), nao, nrow, ws)
                 for c in range(ncy):
                     try:
-                        blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao.unsafe_offset(c * cs), 0.0, ys.unsafe_offset(c * nrow * BLK))
+                        blas.gemm_small(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao.unsafe_offset(c * cs), 0.0, ys.unsafe_offset(c * nrow * BLK))
                     except:
                         pass
                 var y0 = ys
@@ -2092,7 +2092,7 @@ def xc_hess_core(
                     var nb = a1l[ib] - b0
                     # Z (nrow x ngb BLK) = D_sub[:, B] [G | d phi]_B  (D symmetric: rows B of D_sub, transposed)
                     try:
-                        blas.gemm(True, False, nrow, ngb * BLK, nb, 1.0, ws.dsub().unsafe_offset(b0 * nrow), gbuf.unsafe_offset(b0 * ngb * BLK), 0.0, zbuf)
+                        blas.gemm_small(True, False, nrow, ngb * BLK, nb, 1.0, ws.dsub().unsafe_offset(b0 * nrow), gbuf.unsafe_offset(b0 * ngb * BLK), 0.0, zbuf)
                     except:
                         pass
                     for ia in range(na):
@@ -2131,7 +2131,7 @@ def xc_hess_core(
                             t += _load_w(fxc, (i * nv2 + j) * ngrid + p0, v, npt) * rk.unsafe_load[width=W](i * BLK + q)
                         uk.unsafe_store(j * BLK + q, t * _load_w(weights, p0, v, npt))
             try:
-                blas.gemm(False, True, na * 3, na * 3, nv2 * BLK, 1.0, r1, ub, 0.0, mm)
+                blas.gemm_small(False, True, na * 3, na * 3, nv2 * BLK, 1.0, r1, ub, 0.0, mm)
             except:
                 pass
             for ia in range(na):
@@ -2192,7 +2192,10 @@ def xc_h1_core(
     matrix): with Phi_c = C_sub^T d_c phi, shared by all perturbations, it is
     Z_m B^T + Phi_0 Z_o^T, Z_m = sum_c u_c Phi_c and Z_o, B its occupied rows
     (the orbitals are ordered occupied first): two GEMMs over all
-    perturbations of a block instead of one nao x nao GEMM each.
+    perturbations of a block instead of one nao x nao GEMM each, both
+    row-major A B against transposed copies of Phi (the second one, Z_o Phi_0^T,
+    summed into a transposed accumulator that the final reduction transposes
+    back).
 
     dms: nspin x nao x nao; fxc: (nspin nvar) x (nspin nvar) x ngrid (unweighted);
     cmo: nspin x nao x nmo (occupied first); h1_out: nspin x natm x 3 x nmo x nocc
@@ -2217,7 +2220,8 @@ def xc_h1_core(
     var nblk = grid.nblk
     var nworkers = max(1, min(parallelism_level(), nblk))
     var nh = nspin * natm * 3 * nmo * nocc
-    var accl = List[Float64](length=nworkers * nh + 1, fill=0.0)
+    # per worker: C^T F C_o terms (nmo x nocc per perturbation), then the Z_o Phi_0^T terms transposed
+    var accl = List[Float64](length=nworkers * 2 * nh + 1, fill=0.0)
     var pacc = list_ptr(accl)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
@@ -2230,7 +2234,8 @@ def xc_h1_core(
 
     def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm gga, imm mgga, imm nvar, imm nphi, imm nv2, imm ncy, imm nspin, imm dms, imm fxc, imm weights, imm aoatm, imm natm, imm cmo, imm nmo, imm nocc, imm pacc, imm nh, imm ngrid, imm pd2, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
-        var acc = pacc.unsafe_offset(w * nh)
+        var acc = pacc.unsafe_offset(w * 2 * nh)
+        var acct = acc.unsafe_offset(nh)
         var kmax = 3 * natm
         var n_y = nspin * ncy * nao * BLK
         var n_r1 = kmax * nv2 * BLK
@@ -2238,7 +2243,9 @@ def xc_h1_core(
         var n_z = kmax * nmo * BLK
         var n_zo = kmax * nocc * BLK
         var n_o1 = kmax * nmo * nocc
-        var scratch = List[Float64](length=n_y + 2 * n_r1 + nao * nmo + n_phi + n_z + n_zo + 2 * n_o1 + 10 * W, fill=0.0)
+        var nphio = 4 if mgga else 1               # components of Phi_o^T kept
+        var n_pt = BLK * nmo + nphio * BLK * nocc
+        var scratch = List[Float64](length=n_y + 2 * n_r1 + nao * nmo + n_phi + n_z + n_zo + 2 * n_o1 + n_pt + 12 * W, fill=0.0)
         var ybuf = F64Ptr(unsafe_from_address=aligned_addr(scratch))
         var r1 = ybuf.unsafe_offset(n_y)
         var ub = r1.unsafe_offset(n_r1)
@@ -2247,7 +2254,9 @@ def xc_h1_core(
         var zb = phi.unsafe_offset(n_phi)
         var zo = zb.unsafe_offset(n_z)
         var o1 = zo.unsafe_offset(n_zo)
-        var o2 = o1.unsafe_offset(n_o1)
+        var o2 = o1.unsafe_offset(n_o1)                             # (Z_o Phi_0^T)^T: [k nocc + i][m]
+        var phit = o2.unsafe_offset((n_o1 + W - 1) // W * W)       # Phi_0^T: BLK x nmo
+        var phito = phit.unsafe_offset(BLK * nmo)                   # Phi_c,o^T: [c][BLK][nocc]
         var alist = List[Int](length=natm + 1, fill=0)
         var a0l = List[Int](length=natm + 1, fill=0)
         var a1l = List[Int](length=natm + 1, fill=0)
@@ -2284,7 +2293,7 @@ def xc_h1_core(
                 gather_block(dms.unsafe_offset(s * n2), nao, nrow, ws)
                 for c in range(ncy):
                     try:
-                        blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao.unsafe_offset(c * cs), 0.0, ys.unsafe_offset(c * nrow * BLK))
+                        blas.gemm_small(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ao.unsafe_offset(c * cs), 0.0, ys.unsafe_offset(c * nrow * BLK))
                     except:
                         pass
                 for ia in range(na):
@@ -2326,9 +2335,12 @@ def xc_h1_core(
                 gather_rows_to(cmo.unsafe_offset(t * nao * nmo), nmo, ws, csub)
                 for c in range(nphi):
                     try:
-                        blas.gemm(True, False, nmo, BLK, nrow, 1.0, csub, ao.unsafe_offset(c * cs), 0.0, phi.unsafe_offset(c * nmo * BLK))
+                        blas.gemm_small(True, False, nmo, BLK, nrow, 1.0, csub, ao.unsafe_offset(c * cs), 0.0, phi.unsafe_offset(c * nmo * BLK))
                     except:
                         pass
+                transpose(phit, phi, nmo, BLK)
+                for c in range(nphio):
+                    transpose(phito.unsafe_offset(c * BLK * nocc), phi.unsafe_offset(c * nmo * BLK), nocc, BLK)
                 for k in range(nk):
                     var uk = ub.unsafe_offset((k * nv2 + t * nvar) * BLK)
                     var zk = zb.unsafe_offset(k * nmo * BLK)
@@ -2342,9 +2354,9 @@ def xc_h1_core(
                             zk.unsafe_store(m * BLK + q, z)
                     vcopy(zo.unsafe_offset(k * nocc * BLK), zk, nocc * BLK)
                 try:
-                    # o1 = Z_m B^T (all perturbations), o2 = Phi_0 Z_o^T
-                    blas.gemm(False, True, nk * nmo, nocc, BLK, 1.0, zb, phi, 0.0, o1)
-                    blas.gemm(False, True, nmo, nk * nocc, BLK, 1.0, phi, zo, 0.0, o2)
+                    # o1 = Z_m B^T (all perturbations), o2 = (Phi_0 Z_o^T)^T = Z_o Phi_0^T
+                    blas.gemm_small(False, False, nk * nmo, nocc, BLK, 1.0, zb, phito, 0.0, o1)
+                    blas.gemm_small(False, False, nk * nocc, nmo, BLK, 1.0, zo, phit, 0.0, o2)
                 except:
                     pass
                 if mgga:
@@ -2359,16 +2371,15 @@ def xc_h1_core(
                                     var q = v * W
                                     zk.unsafe_store(m * BLK + q, u4.unsafe_load[width=W](q) * pc.unsafe_load[width=W](m * BLK + q) * 0.5)
                         try:
-                            blas.gemm(False, True, nk * nmo, nocc, BLK, 1.0, zb, pc, 1.0, o1)
+                            blas.gemm_small(False, False, nk * nmo, nocc, BLK, 1.0, zb, phito.unsafe_offset(c * BLK * nocc), 1.0, o1)
                         except:
                             pass
                 for ia in range(na):
                     for x in range(3):
                         var k = ia * 3 + x
-                        var dst = acc.unsafe_offset((((t * natm + alist[ia]) * 3 + x) * nmo) * nocc)
-                        vaxpy(dst, nmo * nocc, 1.0, o1.unsafe_offset(k * nmo * nocc))
-                        for m in range(nmo):
-                            vaxpy(dst.unsafe_offset(m * nocc), nocc, 1.0, o2.unsafe_offset(m * nk * nocc + k * nocc))
+                        var off = (((t * natm + alist[ia]) * 3 + x) * nmo) * nocc
+                        vaxpy(acc.unsafe_offset(off), nmo * nocc, 1.0, o1.unsafe_offset(k * nmo * nocc))
+                        vaxpy(acct.unsafe_offset(off), nocc * nmo, 1.0, o2.unsafe_offset(k * nocc * nmo))
         _ = ws^
         _ = scratch^
         _ = alist^
@@ -2384,8 +2395,20 @@ def xc_h1_core(
     for i in range(nh):
         var v = 0.0
         for w2 in range(nworkers):
-            v += pacc[unsafe_offset=w2 * nh + i]
+            v += pacc[unsafe_offset=w2 * 2 * nh + i]
         h1_out[unsafe_offset=i] = v
+    # + the transposed Z_o Phi_0^T sums, nocc x nmo per perturbation
+    var nb = nmo * nocc
+    var tl = List[Float64](length=2 * nb + 1, fill=0.0)
+    var tsum = list_ptr(tl)
+    var tt = tsum.unsafe_offset(nb)
+    for q in range(nspin * natm * 3):
+        vfill(tsum, nb, 0.0)
+        for w2 in range(nworkers):
+            vaxpy(tsum, nb, 1.0, pacc.unsafe_offset(w2 * 2 * nh + nh + q * nb))
+        transpose(tt, tsum, nocc, nmo)
+        vaxpy(h1_out.unsafe_offset(q * nb), nb, 1.0, tt)
+    _ = tl^
     _ = accl^
     _ = counter^
     _ = grid^
