@@ -715,7 +715,8 @@ struct Blas(Movable):
         kernels (``small_mnk``) a larger product is issued in pieces within that size: blocks of rows of
         C, or of K when op(A) is stored transposed and K is the longer side.  Row-major A B^T (whose
         column-major form those kernels do not take) and shapes that would need very thin pieces are
-        issued whole."""
+        issued whole.  Fed to the per-Q DF transforms (C^T E_Q, m x nao x nao) it gains 1.6x at
+        nao = 175, while from about nao = 400 the blocked path is as fast as any split."""
         var lim = self.small_mnk
         if lim == 0 or m * n * k <= lim or (transb and not transa):
             self.gemm(transa, transb, m, n, k, alpha, a, b, beta, c)
@@ -723,8 +724,10 @@ struct Blas(Movable):
         var lda = m if transa else k
         var ldb = k if transb else n
         if transa and k > m:
+            # K pieces shorter than ~48 cost more in passes over C than they gain (94 x 427 x 427: 18
+            # pieces of 24 run below the blocked path)
             var kmax = lim // (m * n)
-            if kmax >= 16:
+            if kmax >= 48:
                 var npc = (k + kmax - 1) // kmax
                 var kb = (k + npc - 1) // npc
                 var k0 = 0

@@ -460,7 +460,8 @@ def _grad2e_driver(var basis: Basis, var boys: BoysTable, spec: GSpec, tol: Floa
     var order = bras_by_nprim(tab)
     var nworkers = min(parallelism_level(), npairs) if npairs >= 16 else 1
     var per = 3 * natm
-    var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
+    var nchunk = max(1, min(npairs, NCHUNK))
+    var accl = List[Float64](length=max(nchunk * per, 1), fill=0.0)
     var pacc = list_ptr(accl)
     var pq = list_ptr(q)
     var pq2 = list_ptr(q2)
@@ -469,7 +470,7 @@ def _grad2e_driver(var basis: Basis, var boys: BoysTable, spec: GSpec, tol: Floa
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab1, imm tab2, imm pq, imm pq2, imm spec, imm pacc, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm per, imm tol, imm nfmax, imm pkcls, imm porder, imm nclass, imm mck, imm mcb}:
+    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab1, imm tab2, imm pq, imm pq2, imm spec, imm pacc, imm pcount, imm npairs, imm nbas, imm nao, imm n2, imm per, imm tol, imm nfmax, imm pkcls, imm porder, imm nclass, imm mck, imm mcb, imm nchunk}:
         var ws = EriWork(tab2.maxcomp, tab2.maxlab, tab2.maxcomp, tab2.maxlab)
         var wb1 = EriBatch(3 * mcb, mck)
         var wb2 = EriBatch(mcb, 6 * mck)
@@ -481,86 +482,89 @@ def _grad2e_driver(var basis: Basis, var boys: BoysTable, spec: GSpec, tol: Floa
         var gq = list_ptr(gqbuf)
         var gabuf = List[Float64](length=9 * BATCH_LANES + 16, fill=0.0)
         var ga = list_ptr(gabuf)
-        var acc = pacc.unsafe_offset(w * per)
         while True:
-            var task = Int(pcount[].fetch_add(1))
-            if task >= npairs:
+            var chunk = Int(pcount[].fetch_add(1))
+            if chunk >= nchunk:
                 break
-            var sp = porder[unsafe_offset=task]
-            var qab = pq[unsafe_offset=sp]
-            var q2ab = pq2[unsafe_offset=sp]
-            if qab == 0.0:
-                continue
-            var a = tab.get(sp, I_A)
-            var b = tab.get(sp, I_B)
-            var i0 = basis.ao_loc[a]
-            var na = basis.ao_loc[a + 1] - i0
-            var j0 = basis.ao_loc[b]
-            var nb = basis.ao_loc[b + 1] - j0
-            var nab = na * nb
-            var npb = tab.get(sp, I_NP)
-            var with_a = basis.atom[a] != basis.atom[b]
-            var lab = tab.get(sp, I_LAB)
-            var batch_bra = lab <= LAB_BATCH or (lab == LAB_BATCH + 1 and not with_a)
-            for spk in range(npairs):
-                var npk = tab.get(spk, I_NP)
-                if npk > npb or (npk == npb and spk > sp):
+            # a fixed set of tasks per chunk (every nchunk-th of the cost-ordered list), summed into
+            # the chunk's own accumulator: the result does not depend on which worker takes which chunk
+            var acc = pacc.unsafe_offset(chunk * per)
+            for task in range(chunk, npairs, nchunk):
+                var sp = porder[unsafe_offset=task]
+                var qab = pq[unsafe_offset=sp]
+                var q2ab = pq2[unsafe_offset=sp]
+                if qab == 0.0:
                     continue
-                var qcd = pq[unsafe_offset=spk]
-                var qq = max(q2ab * qcd, qab * pq2[unsafe_offset=spk])
-                if qq < tol:
-                    continue
-                var c = tab.get(spk, I_A)
-                var d = tab.get(spk, I_B)
-                if qq * spec.gmax(a, b, c, d) < tol:
-                    continue
-                var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
-                if kc >= 0 and lanes_preferred(tab, sp, tab, spk):
-                    if queue.full(kc, npk):
+                var a = tab.get(sp, I_A)
+                var b = tab.get(sp, I_B)
+                var i0 = basis.ao_loc[a]
+                var na = basis.ao_loc[a + 1] - i0
+                var j0 = basis.ao_loc[b]
+                var nb = basis.ao_loc[b + 1] - j0
+                var nab = na * nb
+                var npb = tab.get(sp, I_NP)
+                var with_a = basis.atom[a] != basis.atom[b]
+                var lab = tab.get(sp, I_LAB)
+                var batch_bra = lab <= LAB_BATCH or (lab == LAB_BATCH + 1 and not with_a)
+                for spk in range(npairs):
+                    var npk = tab.get(spk, I_NP)
+                    if npk > npb or (npk == npb and spk > sp):
+                        continue
+                    var qcd = pq[unsafe_offset=spk]
+                    var qq = max(q2ab * qcd, qab * pq2[unsafe_offset=spk])
+                    if qq < tol:
+                        continue
+                    var c = tab.get(spk, I_A)
+                    var d = tab.get(spk, I_B)
+                    if qq * spec.gmax(a, b, c, d) < tol:
+                        continue
+                    var kc = pkcls[unsafe_offset=spk] if batch_bra else -1
+                    if kc >= 0 and lanes_preferred(tab, sp, tab, spk):
+                        if queue.full(kc, npk):
+                            _grad2e_flush(
+                                basis, tab, tab1, tab2, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb1, wb2, gq,
+                                mcb * padded(mck), ga, spec, acc,
+                            )
+                            queue.clear(kc)
+                        queue.push(kc, spk, npk)
+                        continue
+                    var k0 = basis.ao_loc[c]
+                    var nc = basis.ao_loc[c + 1] - k0
+                    var l0 = basis.ao_loc[d]
+                    var nd = basis.ao_loc[d + 1] - l0
+                    var ncd = nc * nd
+                    spec.fill(g, i0, na, j0, nb, k0, nc, l0, nd, ncd)
+                    var wgt = _quartet_weight(a, b, c, d, sp, spk)
+                    if tab.get(spk, I_LAB) > lab:
+                        # the ket is the higher pair: (nabla a b|cd), (a nabla b|cd) [6][ij][kl] and, unless c and d
+                        # share an atom, (ab|nabla c d) [ij][3][kl]; d from translational invariance
+                        var with_c = basis.atom[c] != basis.atom[d]
+                        if not eri_quartet(tab2, sp, tab, spk, ht, boys, ws):
+                            continue
+                        _contract_bra(list_ptr(ws.out), g, nab * ncd, 6, ga.unsafe_offset(3))
+                        if with_c:
+                            _ = eri_quartet(tab, sp, tab1, spk, ht, boys, ws)
+                            _contract_ket(list_ptr(ws.out), g, nab, ncd, 3, ga)
+                        _grad_add(basis, acc, c, a, b, d, wgt, ga, with_c)
+                        continue
+                    if with_a:
+                        # (nabla a b|cd): layout [3][ij][kl]
+                        if not eri_quartet(tab1, sp, tab, spk, ht, boys, ws):
+                            continue
+                        _contract_bra(list_ptr(ws.out), g, nab * ncd, 3, ga)
+                    # (ab|nabla c d) and (ab|c nabla d): layout [ij][6][kl]
+                    if not eri_quartet(tab, sp, tab2, spk, ht, boys, ws):
+                        continue
+                    _contract_ket(list_ptr(ws.out), g, nab, ncd, 6, ga.unsafe_offset(3))
+                    _grad_add(basis, acc, a, c, d, b, wgt, ga, with_a)
+                # the rest of this bra's batches
+                for kc in range(nclass):
+                    if queue.cnt[kc] > 0:
                         _grad2e_flush(
                             basis, tab, tab1, tab2, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb1, wb2, gq,
                             mcb * padded(mck), ga, spec, acc,
                         )
                         queue.clear(kc)
-                    queue.push(kc, spk, npk)
-                    continue
-                var k0 = basis.ao_loc[c]
-                var nc = basis.ao_loc[c + 1] - k0
-                var l0 = basis.ao_loc[d]
-                var nd = basis.ao_loc[d + 1] - l0
-                var ncd = nc * nd
-                spec.fill(g, i0, na, j0, nb, k0, nc, l0, nd, ncd)
-                var wgt = _quartet_weight(a, b, c, d, sp, spk)
-                if tab.get(spk, I_LAB) > lab:
-                    # the ket is the higher pair: (nabla a b|cd), (a nabla b|cd) [6][ij][kl] and, unless c and d
-                    # share an atom, (ab|nabla c d) [ij][3][kl]; d from translational invariance
-                    var with_c = basis.atom[c] != basis.atom[d]
-                    if not eri_quartet(tab2, sp, tab, spk, ht, boys, ws):
-                        continue
-                    _contract_bra(list_ptr(ws.out), g, nab * ncd, 6, ga.unsafe_offset(3))
-                    if with_c:
-                        _ = eri_quartet(tab, sp, tab1, spk, ht, boys, ws)
-                        _contract_ket(list_ptr(ws.out), g, nab, ncd, 3, ga)
-                    _grad_add(basis, acc, c, a, b, d, wgt, ga, with_c)
-                    continue
-                if with_a:
-                    # (nabla a b|cd): layout [3][ij][kl]
-                    if not eri_quartet(tab1, sp, tab, spk, ht, boys, ws):
-                        continue
-                    _contract_bra(list_ptr(ws.out), g, nab * ncd, 3, ga)
-                # (ab|nabla c d) and (ab|c nabla d): layout [ij][6][kl]
-                if not eri_quartet(tab, sp, tab2, spk, ht, boys, ws):
-                    continue
-                _contract_ket(list_ptr(ws.out), g, nab, ncd, 6, ga.unsafe_offset(3))
-                _grad_add(basis, acc, a, c, d, b, wgt, ga, with_a)
-            # the rest of this bra's batches
-            for kc in range(nclass):
-                if queue.cnt[kc] > 0:
-                    _grad2e_flush(
-                        basis, tab, tab1, tab2, sp, queue.kets(kc), queue.cnt[kc], boys, ws, wb1, wb2, gq,
-                        mcb * padded(mck), ga, spec, acc,
-                    )
-                    queue.clear(kc)
         _ = ws^
         _ = wb1^
         _ = wb2^
@@ -575,8 +579,8 @@ def _grad2e_driver(var basis: Basis, var boys: BoysTable, spec: GSpec, tol: Floa
         parallelize(work, nworkers)
     for i in range(per):
         var v = 0.0
-        for w2 in range(nworkers):
-            v += pacc[unsafe_offset=w2 * per + i]
+        for c in range(nchunk):
+            v += pacc[unsafe_offset=c * per + i]
         de[unsafe_offset=i] = v
     _ = accl^
     _ = kcls^
@@ -846,6 +850,7 @@ def _order_by_key(keys: List[Int], nkey: Int) -> List[Int]:
     return out^
 
 
+comptime NCHUNK = 64            # task chunks of the dynamically scheduled sums (one accumulator each)
 comptime GROUP_PRIMS = 128      # primitive pairs of the inner pairs of one grouped kernel call, at most
 comptime GROUP_Y = 1 << 17      # values of their G-contracted Hermite matrices, at most
 comptime KET_BLOCK = 4          # kets of one task of hess2e_core's ket sweep
@@ -1044,7 +1049,8 @@ def hess2e_core(
     var ntask = nkblk + len(obras)
     var nworkers = min(parallelism_level(), ntask) if ntask >= 16 else 1
     var per = natm * natm * 9
-    var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
+    var nchunk = max(1, min(ntask, NCHUNK))
+    var accl = List[Float64](length=max(nchunk * per, 1), fill=0.0)
     var pacc = list_ptr(accl)
     var pq = list_ptr(q)
     var pq21 = list_ptr(q21)
@@ -1060,7 +1066,7 @@ def hess2e_core(
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab1, imm tab2, imm tab21, imm tabaa, imm pq, imm pq21, imm pq6, imm spec, imm pacc, imm pcount, imm ntask, imm nkblk, imm nkets, imm pokets, imm pobras, imm pobra, imm poket3, imm poket2, imm nbra, imm nket3, imm nket2, imm natm, imm per, imm tol, imm nfmax, imm maxnp, imm maxny}:
+    def work(w: Int) {imm basis, imm boys, imm ht, imm tab, imm tab1, imm tab2, imm tab21, imm tabaa, imm pq, imm pq21, imm pq6, imm spec, imm pacc, imm pcount, imm ntask, imm nkblk, imm nkets, imm pokets, imm pobras, imm pobra, imm poket3, imm poket2, imm nbra, imm nket3, imm nket2, imm natm, imm per, imm tol, imm nfmax, imm maxnp, imm maxny, imm nchunk}:
         var ws = EriWork(tab21.maxcomp, tab21.maxlab, tab21.maxcomp, tab21.maxlab)
         var nfp = padded(nfmax * nfmax)
         var gbuf = List[Float64](length=nfmax * nfmax * nfp + W, fill=0.0)
@@ -1070,154 +1076,157 @@ def hess2e_core(
         var hbuf = List[Float64](length=21 + 18 + 144 + 8, fill=0.0)
         var hx = list_ptr(hbuf)                 # the components of a grouped pass
         var hq = hx.unsafe_offset(21 + 18)      # the 4 x 4 centre blocks
-        var acc = pacc.unsafe_offset(w * per)
         # the kets of a block: pair, atoms, function offsets and counts, bounds
         var kbuf = List[Int](length=10 * KET_BLOCK, fill=0)
         var ki = int_ptr(kbuf)
         var qbuf = List[Float64](length=3 * KET_BLOCK, fill=0.0)
         var kq = list_ptr(qbuf)
         while True:
-            var it = Int(pcount[].fetch_add(1))
-            if it >= ntask:
+            var chunk = Int(pcount[].fetch_add(1))
+            if chunk >= nchunk:
                 break
-            if it < nkblk:
-                # ket sweep: the ket pass of every bra and the mixed pass of the two-centre bras of a block of kets
-                var nblk = min(KET_BLOCK, nkets - it * KET_BLOCK)
-                for j in range(nblk):
-                    var spk = pokets[unsafe_offset=it * KET_BLOCK + j]
-                    var c = tab.get(spk, I_A)
-                    var d = tab.get(spk, I_B)
-                    var o = ki.unsafe_offset(10 * j)
-                    o[unsafe_offset=0] = spk
-                    o[unsafe_offset=1] = tab.get(spk, I_NP)
-                    o[unsafe_offset=2] = c
-                    o[unsafe_offset=3] = d
-                    o[unsafe_offset=4] = basis.atom[c]
-                    o[unsafe_offset=5] = basis.atom[d]
-                    o[unsafe_offset=6] = basis.ao_loc[c]
-                    o[unsafe_offset=7] = basis.ao_loc[c + 1] - basis.ao_loc[c]
-                    o[unsafe_offset=8] = basis.ao_loc[d]
-                    o[unsafe_offset=9] = basis.ao_loc[d + 1] - basis.ao_loc[d]
-                    kq[unsafe_offset=3 * j] = pq[unsafe_offset=spk]
-                    kq[unsafe_offset=3 * j + 1] = pq21[unsafe_offset=spk]
-                    kq[unsafe_offset=3 * j + 2] = pq6[unsafe_offset=spk]
-                for ib in range(nbra):
-                    var sp = pobra[unsafe_offset=ib]
-                    var npb = tab.get(sp, I_NP)
-                    var a = tab.get(sp, I_A)
-                    var b = tab.get(sp, I_B)
-                    var ta = basis.atom[a]
-                    var tb = basis.atom[b]
-                    var one_ab = ta == tb
-                    var qab = pq[unsafe_offset=sp]
-                    var q21ab = pq21[unsafe_offset=sp]
-                    var q6ab = pq6[unsafe_offset=sp]
-                    var i0 = basis.ao_loc[a]
-                    var na = basis.ao_loc[a + 1] - i0
-                    var j0 = basis.ao_loc[b]
-                    var nb = basis.ao_loc[b + 1] - j0
-                    var nab = na * nb
-                    var lab = tab.get(sp, I_LAB)
+            # a fixed set of tasks per chunk (every nchunk-th of the cost-ordered list), summed into
+            # the chunk's own accumulator: the result does not depend on which worker takes which chunk
+            var acc = pacc.unsafe_offset(chunk * per)
+            for it in range(chunk, ntask, nchunk):
+                if it < nkblk:
+                    # ket sweep: the ket pass of every bra and the mixed pass of the two-centre bras of a block of kets
+                    var nblk = min(KET_BLOCK, nkets - it * KET_BLOCK)
+                    for j in range(nblk):
+                        var spk = pokets[unsafe_offset=it * KET_BLOCK + j]
+                        var c = tab.get(spk, I_A)
+                        var d = tab.get(spk, I_B)
+                        var o = ki.unsafe_offset(10 * j)
+                        o[unsafe_offset=0] = spk
+                        o[unsafe_offset=1] = tab.get(spk, I_NP)
+                        o[unsafe_offset=2] = c
+                        o[unsafe_offset=3] = d
+                        o[unsafe_offset=4] = basis.atom[c]
+                        o[unsafe_offset=5] = basis.atom[d]
+                        o[unsafe_offset=6] = basis.ao_loc[c]
+                        o[unsafe_offset=7] = basis.ao_loc[c + 1] - basis.ao_loc[c]
+                        o[unsafe_offset=8] = basis.ao_loc[d]
+                        o[unsafe_offset=9] = basis.ao_loc[d + 1] - basis.ao_loc[d]
+                        kq[unsafe_offset=3 * j] = pq[unsafe_offset=spk]
+                        kq[unsafe_offset=3 * j + 1] = pq21[unsafe_offset=spk]
+                        kq[unsafe_offset=3 * j + 2] = pq6[unsafe_offset=spk]
+                    for ib in range(nbra):
+                        var sp = pobra[unsafe_offset=ib]
+                        var npb = tab.get(sp, I_NP)
+                        var a = tab.get(sp, I_A)
+                        var b = tab.get(sp, I_B)
+                        var ta = basis.atom[a]
+                        var tb = basis.atom[b]
+                        var one_ab = ta == tb
+                        var qab = pq[unsafe_offset=sp]
+                        var q21ab = pq21[unsafe_offset=sp]
+                        var q6ab = pq6[unsafe_offset=sp]
+                        var i0 = basis.ao_loc[a]
+                        var na = basis.ao_loc[a + 1] - i0
+                        var j0 = basis.ao_loc[b]
+                        var nb = basis.ao_loc[b + 1] - j0
+                        var nab = na * nb
+                        var lab = tab.get(sp, I_LAB)
+                        for j in range(nblk):
+                            var o = ki.unsafe_offset(10 * j)
+                            var spk = o[unsafe_offset=0]
+                            var npk = o[unsafe_offset=1]
+                            if npb < npk or (npb == npk and sp < spk):
+                                continue
+                            var c = o[unsafe_offset=2]
+                            var d = o[unsafe_offset=3]
+                            var tc = o[unsafe_offset=4]
+                            var td = o[unsafe_offset=5]
+                            if tc == td and (not one_ab or ta == tc):
+                                continue
+                            var qq = qab * kq[unsafe_offset=3 * j + 1]
+                            if not one_ab:
+                                qq = max(max(qq, q21ab * kq[unsafe_offset=3 * j]), q6ab * kq[unsafe_offset=3 * j + 2])
+                            if qq < tol or qq * spec.gmax(a, b, c, d) < tol:
+                                continue
+                            var nc = o[unsafe_offset=7]
+                            var nd = o[unsafe_offset=9]
+                            var gs = padded(nc * nd)
+                            spec.fill(g, i0, na, j0, nb, o[unsafe_offset=6], nc, o[unsafe_offset=8], nd, gs)
+                            var wgt = _quartet_weight(a, b, c, d, sp, spk)
+                            # the ket pass, grouped by (atom of b, degree)
+                            var key = tb * 64 + lab
+                            var ny = npb * nherm(lab) * gs
+                            if ga.np[j] > 0 and (ga.key[j] != key or not ga.fits(j, npb, ny)):
+                                _hess_flush_ket(tab21, spk, ga, j, ht, boys, ws, hx, hq, acc, natm, tc, td)
+                            _fused_y(tab, sp, g, nab, gs, ga.ytail(j), 1, wgt)
+                            ga.add(j, tab, sp, ny)
+                            ga.key[j] = key
+                            ga.t1[j] = tb
+                            if one_ab:
+                                continue
+                            # the mixed pass, grouped by (atom of a, atom of b, degree)
+                            var keym = (ta * natm + tb) * 64 + lab
+                            var nym = npb * nherm(lab + 1) * 3 * gs
+                            if gb.np[j] > 0 and (gb.key[j] != keym or not gb.fits(j, npb, nym)):
+                                _hess_flush_mixed(tab2, spk, gb, j, ht, boys, ws, hx, hq, acc, natm, tc, td)
+                            _fused_y(tab1, sp, g, nab, gs, gb.ytail(j), 3, wgt)
+                            gb.add(j, tab1, sp, nym)
+                            gb.key[j] = keym
+                            gb.t0[j] = ta
+                            gb.t1[j] = tb
                     for j in range(nblk):
                         var o = ki.unsafe_offset(10 * j)
-                        var spk = o[unsafe_offset=0]
-                        var npk = o[unsafe_offset=1]
-                        if npb < npk or (npb == npk and sp < spk):
+                        if ga.np[j] > 0:
+                            _hess_flush_ket(tab21, o[unsafe_offset=0], ga, j, ht, boys, ws, hx, hq, acc, natm, o[unsafe_offset=4], o[unsafe_offset=5])
+                        if gb.np[j] > 0:
+                            _hess_flush_mixed(tab2, o[unsafe_offset=0], gb, j, ht, boys, ws, hx, hq, acc, natm, o[unsafe_offset=4], o[unsafe_offset=5])
+                    continue
+                # bra sweep: the nabla_a nabla_a pass and the one-centre kets of a two-centre bra
+                var sp = pobras[unsafe_offset=it - nkblk]
+                var npb = tab.get(sp, I_NP)
+                var a = tab.get(sp, I_A)
+                var b = tab.get(sp, I_B)
+                var ta = basis.atom[a]
+                var tb = basis.atom[b]
+                var i0 = basis.ao_loc[a]
+                var na = basis.ao_loc[a + 1] - i0
+                var j0 = basis.ao_loc[b]
+                var nb = basis.ao_loc[b + 1] - j0
+                var nab = na * nb
+                var gts = padded(nab)
+                var qab = pq[unsafe_offset=sp]
+                var q21ab = pq21[unsafe_offset=sp]
+                var q6ab = pq6[unsafe_offset=sp]
+                for side in range(2):
+                    var nket = nket3 if side == 0 else nket2
+                    var oket = poket3 if side == 0 else poket2
+                    for ik in range(nket):
+                        var spk = oket[unsafe_offset=ik]
+                        var npk = tab.get(spk, I_NP)
+                        if npk > npb or (npk == npb and spk > sp):
                             continue
-                        var c = o[unsafe_offset=2]
-                        var d = o[unsafe_offset=3]
-                        var tc = o[unsafe_offset=4]
-                        var td = o[unsafe_offset=5]
-                        if tc == td and (not one_ab or ta == tc):
-                            continue
-                        var qq = qab * kq[unsafe_offset=3 * j + 1]
-                        if not one_ab:
-                            qq = max(max(qq, q21ab * kq[unsafe_offset=3 * j]), q6ab * kq[unsafe_offset=3 * j + 2])
+                        var c = tab.get(spk, I_A)
+                        var d = tab.get(spk, I_B)
+                        var qq = q21ab * pq[unsafe_offset=spk]
+                        if side == 0:
+                            qq = max(max(qq, qab * pq21[unsafe_offset=spk]), q6ab * pq6[unsafe_offset=spk])
                         if qq < tol or qq * spec.gmax(a, b, c, d) < tol:
                             continue
-                        var nc = o[unsafe_offset=7]
-                        var nd = o[unsafe_offset=9]
-                        var gs = padded(nc * nd)
-                        spec.fill(g, i0, na, j0, nb, o[unsafe_offset=6], nc, o[unsafe_offset=8], nd, gs)
+                        var k0 = basis.ao_loc[c]
+                        var nc = basis.ao_loc[c + 1] - k0
+                        var l0 = basis.ao_loc[d]
+                        var nd = basis.ao_loc[d + 1] - l0
+                        var lcd = tab.get(spk, I_LAB)
+                        # G[kl][ij], the pair symmetry of G
+                        spec.fill(g, k0, nc, l0, nd, i0, na, j0, nb, gts)
                         var wgt = _quartet_weight(a, b, c, d, sp, spk)
-                        # the ket pass, grouped by (atom of b, degree)
-                        var key = tb * 64 + lab
-                        var ny = npb * nherm(lab) * gs
-                        if ga.np[j] > 0 and (ga.key[j] != key or not ga.fits(j, npb, ny)):
-                            _hess_flush_ket(tab21, spk, ga, j, ht, boys, ws, hx, hq, acc, natm, tc, td)
-                        _fused_y(tab, sp, g, nab, gs, ga.ytail(j), 1, wgt)
-                        ga.add(j, tab, sp, ny)
-                        ga.key[j] = key
-                        ga.t1[j] = tb
-                        if one_ab:
-                            continue
-                        # the mixed pass, grouped by (atom of a, atom of b, degree)
-                        var keym = (ta * natm + tb) * 64 + lab
-                        var nym = npb * nherm(lab + 1) * 3 * gs
-                        if gb.np[j] > 0 and (gb.key[j] != keym or not gb.fits(j, npb, nym)):
-                            _hess_flush_mixed(tab2, spk, gb, j, ht, boys, ws, hx, hq, acc, natm, tc, td)
-                        _fused_y(tab1, sp, g, nab, gs, gb.ytail(j), 3, wgt)
-                        gb.add(j, tab1, sp, nym)
-                        gb.key[j] = keym
-                        gb.t0[j] = ta
-                        gb.t1[j] = tb
-                for j in range(nblk):
-                    var o = ki.unsafe_offset(10 * j)
-                    if ga.np[j] > 0:
-                        _hess_flush_ket(tab21, o[unsafe_offset=0], ga, j, ht, boys, ws, hx, hq, acc, natm, o[unsafe_offset=4], o[unsafe_offset=5])
-                    if gb.np[j] > 0:
-                        _hess_flush_mixed(tab2, o[unsafe_offset=0], gb, j, ht, boys, ws, hx, hq, acc, natm, o[unsafe_offset=4], o[unsafe_offset=5])
-                continue
-            # bra sweep: the nabla_a nabla_a pass and the one-centre kets of a two-centre bra
-            var sp = pobras[unsafe_offset=it - nkblk]
-            var npb = tab.get(sp, I_NP)
-            var a = tab.get(sp, I_A)
-            var b = tab.get(sp, I_B)
-            var ta = basis.atom[a]
-            var tb = basis.atom[b]
-            var i0 = basis.ao_loc[a]
-            var na = basis.ao_loc[a + 1] - i0
-            var j0 = basis.ao_loc[b]
-            var nb = basis.ao_loc[b + 1] - j0
-            var nab = na * nb
-            var gts = padded(nab)
-            var qab = pq[unsafe_offset=sp]
-            var q21ab = pq21[unsafe_offset=sp]
-            var q6ab = pq6[unsafe_offset=sp]
-            for side in range(2):
-                var nket = nket3 if side == 0 else nket2
-                var oket = poket3 if side == 0 else poket2
-                for ik in range(nket):
-                    var spk = oket[unsafe_offset=ik]
-                    var npk = tab.get(spk, I_NP)
-                    if npk > npb or (npk == npb and spk > sp):
-                        continue
-                    var c = tab.get(spk, I_A)
-                    var d = tab.get(spk, I_B)
-                    var qq = q21ab * pq[unsafe_offset=spk]
-                    if side == 0:
-                        qq = max(max(qq, qab * pq21[unsafe_offset=spk]), q6ab * pq6[unsafe_offset=spk])
-                    if qq < tol or qq * spec.gmax(a, b, c, d) < tol:
-                        continue
-                    var k0 = basis.ao_loc[c]
-                    var nc = basis.ao_loc[c + 1] - k0
-                    var l0 = basis.ao_loc[d]
-                    var nd = basis.ao_loc[d + 1] - l0
-                    var lcd = tab.get(spk, I_LAB)
-                    # G[kl][ij], the pair symmetry of G
-                    spec.fill(g, k0, nc, l0, nd, i0, na, j0, nb, gts)
-                    var wgt = _quartet_weight(a, b, c, d, sp, spk)
-                    var tc = basis.atom[c]
-                    var key = lcd if side == 0 else tc * 64 + lcd
-                    var ny = npk * nherm(lcd) * gts
-                    if ga.np[0] > 0 and (ga.key[0] != key or not ga.fits(0, npk, ny)):
+                        var tc = basis.atom[c]
+                        var key = lcd if side == 0 else tc * 64 + lcd
+                        var ny = npk * nherm(lcd) * gts
+                        if ga.np[0] > 0 and (ga.key[0] != key or not ga.fits(0, npk, ny)):
+                            _hess_flush_bra(tab21 if side == 1 else tabaa, sp, side == 1, ga, ht, boys, ws, hx, hq, acc, natm, ta, tb)
+                        _fused_y(tab, spk, g, nc * nd, gts, ga.ytail(0), 1, wgt)
+                        ga.add(0, tab, spk, ny)
+                        ga.key[0] = key
+                        ga.t0[0] = tc
+                    if ga.np[0] > 0:
                         _hess_flush_bra(tab21 if side == 1 else tabaa, sp, side == 1, ga, ht, boys, ws, hx, hq, acc, natm, ta, tb)
-                    _fused_y(tab, spk, g, nc * nd, gts, ga.ytail(0), 1, wgt)
-                    ga.add(0, tab, spk, ny)
-                    ga.key[0] = key
-                    ga.t0[0] = tc
-                if ga.np[0] > 0:
-                    _hess_flush_bra(tab21 if side == 1 else tabaa, sp, side == 1, ga, ht, boys, ws, hx, hq, acc, natm, ta, tb)
         _ = ws^
         _ = gbuf^
         _ = ga^
@@ -1232,8 +1241,8 @@ def hess2e_core(
         parallelize(work, nworkers)
     for i in range(per):
         var v = 0.0
-        for w2 in range(nworkers):
-            v += pacc[unsafe_offset=w2 * per + i]
+        for c in range(nchunk):
+            v += pacc[unsafe_offset=c * per + i]
         hess[unsafe_offset=i] = v
     _ = accl^
     _ = cj^
@@ -1377,8 +1386,8 @@ def df_grad_rhs(
                         var cs = orbs.unsafe_offset(st * nao * m)
                         try:
                             # U (m x nao) = C^T E, Q_P (m x m) = U C
-                            blas_seq.gemm(True, False, m, nao, nao, 1.0, cs, e, 0.0, u)
-                            blas_seq.gemm(False, False, m, m, nao, 1.0, u, cs, 0.0, qm)
+                            blas_seq.gemm_small(True, False, m, nao, nao, 1.0, cs, e, 0.0, u)
+                            blas_seq.gemm_small(False, False, m, m, nao, 1.0, u, cs, 0.0, qm)
                         except:
                             pass
                         var qp = q.unsafe_offset((st * naux + pp) * mp)
@@ -1512,7 +1521,7 @@ def grad_df3c_core(
     var nthreads = max(1, parallelism_level())
     var nwork = 2 * nthreads
     var per = 3 * natm
-    var accl = List[Float64](length=nthreads * per + 1, fill=0.0)
+    var accl = List[Float64](length=NCHUNK * per + 1, fill=0.0)    # per chunk of tasks, over all blocks
     var pacc = list_ptr(accl)
     var mp = m * (m + 1) // 2
     var wsz = n2 + m * nao + m * m
@@ -1558,7 +1567,7 @@ def grad_df3c_core(
                         try:
                             # T (nao x m) = Cn X_P; lower triangle of F (+)= -kfac Cn X_P Cn^T
                             # = -kfac/2 (T Cn^T + Cn T^T) (X_P is symmetric)
-                            blas_seq.gemm(False, False, nao, m, m, 1.0, cn, xm, 0.0, t)
+                            blas_seq.gemm_small(False, False, nao, m, m, 1.0, cn, xm, 0.0, t)
                             blas_seq.syr2k_lower(nao, m, -0.5 * kfac, t, cn, 0.0 if st == 0 else 1.0, f)
                         except:
                             pass
@@ -1575,61 +1584,65 @@ def grad_df3c_core(
         blas_seq.serial_end(nthr)
         counter.store(0)
         var ntask = s1 - s0
+        var nchunk = max(1, min(ntask, NCHUNK))
 
-        def work(w: Int) {imm basis, imm aux, imm boys, imm ht, imm tab2, imm atab, imm pq2, imm pqa, imm pacc, imm pcount, imm npairs, imm per, imm s0, imm ntask, imm p0, imm npair, imm gam, imm tol, imm pkcls, imm nclass}:
+        def work(w: Int) {imm basis, imm aux, imm boys, imm ht, imm tab2, imm atab, imm pq2, imm pqa, imm pacc, imm pcount, imm npairs, imm per, imm s0, imm ntask, imm p0, imm npair, imm gam, imm tol, imm pkcls, imm nclass, imm nchunk}:
             var ws = EriWork(tab2.maxcomp, tab2.maxlab, atab.maxcomp, atab.maxlab)
             var wb = EriBatch(atab.maxcomp, tab2.maxcomp)
             var queue = KetQueue(nclass)
-            var acc = pacc.unsafe_offset(w * per)
             while True:
-                var task = Int(pcount[].fetch_add(1))
-                if task >= ntask:
+                var chunk = Int(pcount[].fetch_add(1))
+                if chunk >= nchunk:
                     break
-                var pshell = s0 + task
-                var qp = pqa[unsafe_offset=pshell]
-                if qp == 0.0:
-                    continue
-                var f0 = aux.ao_loc[pshell] - p0
-                var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
-                var grows = gam.unsafe_offset(f0 * npair)
-                var pp = acc.unsafe_offset(3 * aux.atom[pshell])
-                # the derivative pairs are the lanes of eri_batch (bra P) where that pays off
-                var batch_bra = batch_supported(atab.get(pshell, I_LAB), 0)
-                for sp in range(npairs):
-                    var qab = pq2[unsafe_offset=sp] * qp
-                    if qab < tol:
+                # a fixed set of tasks per chunk (every nchunk-th of the cost-ordered list), summed into
+                # the chunk's own accumulator: the result does not depend on which worker takes which chunk
+                var acc = pacc.unsafe_offset(chunk * per)
+                for task in range(chunk, ntask, nchunk):
+                    var pshell = s0 + task
+                    var qp = pqa[unsafe_offset=pshell]
+                    if qp == 0.0:
                         continue
-                    var a = tab2.get(sp, I_A)
-                    var b = tab2.get(sp, I_B)
-                    var i0 = basis.ao_loc[a]
-                    var na = basis.ao_loc[a + 1] - i0
-                    var j0 = basis.ao_loc[b]
-                    var nb = basis.ao_loc[b + 1] - j0
-                    var gmax = 0.0
-                    for fp in range(npf):
-                        var grow = grows.unsafe_offset(fp * npair)
-                        for i in range(na):
-                            for j in range(nb):
-                                var ii = max(i0 + i, j0 + j)
-                                var jj = min(i0 + i, j0 + j)
-                                gmax = max(gmax, abs(grow[unsafe_offset=ii * (ii + 1) // 2 + jj]))
-                    if qab * gmax < tol:
-                        continue
-                    var kc = pkcls[unsafe_offset=sp] if batch_bra else -1
-                    if kc >= 0 and lanes_preferred(atab, pshell, tab2, sp):
-                        var npk = tab2.get(sp, I_NP)
-                        if queue.full(kc, npk):
+                    var f0 = aux.ao_loc[pshell] - p0
+                    var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
+                    var grows = gam.unsafe_offset(f0 * npair)
+                    var pp = acc.unsafe_offset(3 * aux.atom[pshell])
+                    # the derivative pairs are the lanes of eri_batch (bra P) where that pays off
+                    var batch_bra = batch_supported(atab.get(pshell, I_LAB), 0)
+                    for sp in range(npairs):
+                        var qab = pq2[unsafe_offset=sp] * qp
+                        if qab < tol:
+                            continue
+                        var a = tab2.get(sp, I_A)
+                        var b = tab2.get(sp, I_B)
+                        var i0 = basis.ao_loc[a]
+                        var na = basis.ao_loc[a + 1] - i0
+                        var j0 = basis.ao_loc[b]
+                        var nb = basis.ao_loc[b + 1] - j0
+                        var gmax = 0.0
+                        for fp in range(npf):
+                            var grow = grows.unsafe_offset(fp * npair)
+                            for i in range(na):
+                                for j in range(nb):
+                                    var ii = max(i0 + i, j0 + j)
+                                    var jj = min(i0 + i, j0 + j)
+                                    gmax = max(gmax, abs(grow[unsafe_offset=ii * (ii + 1) // 2 + jj]))
+                        if qab * gmax < tol:
+                            continue
+                        var kc = pkcls[unsafe_offset=sp] if batch_bra else -1
+                        if kc >= 0 and lanes_preferred(atab, pshell, tab2, sp):
+                            var npk = tab2.get(sp, I_NP)
+                            if queue.full(kc, npk):
+                                df3c_batch(basis, atab, pshell, tab2, queue.kets(kc), queue.cnt[kc], boys, ws, wb, npf, grows, npair, acc, pp)
+                                queue.clear(kc)
+                            queue.push(kc, sp, npk)
+                            continue
+                        if not eri_quartet(tab2, sp, atab, pshell, ht, boys, ws):
+                            continue
+                        df3c_contract(basis, tab2, sp, npf, grows, npair, list_ptr(ws.out), npf, 1, acc, pp)
+                    for kc in range(nclass):
+                        if queue.cnt[kc] > 0:
                             df3c_batch(basis, atab, pshell, tab2, queue.kets(kc), queue.cnt[kc], boys, ws, wb, npf, grows, npair, acc, pp)
                             queue.clear(kc)
-                        queue.push(kc, sp, npk)
-                        continue
-                    if not eri_quartet(tab2, sp, atab, pshell, ht, boys, ws):
-                        continue
-                    df3c_contract(basis, tab2, sp, npf, grows, npair, list_ptr(ws.out), npf, 1, acc, pp)
-                for kc in range(nclass):
-                    if queue.cnt[kc] > 0:
-                        df3c_batch(basis, atab, pshell, tab2, queue.kets(kc), queue.cnt[kc], boys, ws, wb, npf, grows, npair, acc, pp)
-                        queue.clear(kc)
             _ = ws^
             _ = wb^
             _ = queue^
@@ -1643,8 +1656,8 @@ def grad_df3c_core(
         s0 = s1
     for i in range(per):
         var v = 0.0
-        for w2 in range(nthreads):
-            v += pacc[unsafe_offset=w2 * per + i]
+        for c in range(NCHUNK):
+            v += pacc[unsafe_offset=c * per + i]
         de[unsafe_offset=i] = v
     _ = accl^
     _ = fbuf^
@@ -1684,38 +1697,42 @@ def grad2c_core(var aux: Basis, var boys: BoysTable, wmat: F64Ptr, natm: Int, de
     var dtab = PairTable(aux, aux, sa, sb, ht, 1)
     var nworkers = min(parallelism_level(), nsh) if nsh >= 8 else 1
     var per = 3 * natm
-    var accl = List[Float64](length=max(nworkers * per, 1), fill=0.0)
+    var nchunk = max(1, min(nsh, NCHUNK))
+    var accl = List[Float64](length=max(nchunk * per, 1), fill=0.0)
     var pacc = list_ptr(accl)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
 
-    def work(w: Int) {imm aux, imm boys, imm ht, imm atab, imm dtab, imm pacc, imm pcount, imm nsh, imm naux, imm per, imm wmat}:
+    def work(w: Int) {imm aux, imm boys, imm ht, imm atab, imm dtab, imm pacc, imm pcount, imm nsh, imm naux, imm per, imm wmat, imm nchunk}:
         var ws = EriWork(dtab.maxcomp, dtab.maxlab, atab.maxcomp, atab.maxlab)
-        var acc = pacc.unsafe_offset(w * per)
         while True:
-            var task = Int(pcount[].fetch_add(1))
-            if task >= nsh:
+            var chunk = Int(pcount[].fetch_add(1))
+            if chunk >= nchunk:
                 break
-            var ps = nsh - 1 - task
-            var p0 = aux.ao_loc[ps]
-            var npf = aux.ao_loc[ps + 1] - p0
-            var pp = acc.unsafe_offset(3 * aux.atom[ps])
-            for qs in range(ps):
-                if aux.atom[qs] == aux.atom[ps]:
-                    continue        # equal and opposite on the same atom
-                if not eri_quartet(dtab, ps, atab, qs, ht, boys, ws):
-                    continue
-                var q0 = aux.ao_loc[qs]
-                var nqf = aux.ao_loc[qs + 1] - q0
-                var blk = list_ptr(ws.out)
-                var pq = acc.unsafe_offset(3 * aux.atom[qs])
-                for x in range(3):
-                    var g = 0.0
-                    for fp in range(npf):
-                        g += vdot_serial(blk.unsafe_offset((x * npf + fp) * nqf), wmat.unsafe_offset((p0 + fp) * naux + q0), nqf)
-                    # -1/2 * 2 (P>Q) * d/dR_P (P|Q) = +(nabla P|Q)
-                    pp[unsafe_offset=x] += g
-                    pq[unsafe_offset=x] -= g
+            # a fixed set of tasks per chunk (every nchunk-th of the cost-ordered list), summed into
+            # the chunk's own accumulator: the result does not depend on which worker takes which chunk
+            var acc = pacc.unsafe_offset(chunk * per)
+            for task in range(chunk, nsh, nchunk):
+                var ps = nsh - 1 - task
+                var p0 = aux.ao_loc[ps]
+                var npf = aux.ao_loc[ps + 1] - p0
+                var pp = acc.unsafe_offset(3 * aux.atom[ps])
+                for qs in range(ps):
+                    if aux.atom[qs] == aux.atom[ps]:
+                        continue        # equal and opposite on the same atom
+                    if not eri_quartet(dtab, ps, atab, qs, ht, boys, ws):
+                        continue
+                    var q0 = aux.ao_loc[qs]
+                    var nqf = aux.ao_loc[qs + 1] - q0
+                    var blk = list_ptr(ws.out)
+                    var pq = acc.unsafe_offset(3 * aux.atom[qs])
+                    for x in range(3):
+                        var g = 0.0
+                        for fp in range(npf):
+                            g += vdot_serial(blk.unsafe_offset((x * npf + fp) * nqf), wmat.unsafe_offset((p0 + fp) * naux + q0), nqf)
+                        # -1/2 * 2 (P>Q) * d/dR_P (P|Q) = +(nabla P|Q)
+                        pp[unsafe_offset=x] += g
+                        pq[unsafe_offset=x] -= g
         _ = ws^
 
     if nworkers == 1:
@@ -1724,8 +1741,8 @@ def grad2c_core(var aux: Basis, var boys: BoysTable, wmat: F64Ptr, natm: Int, de
         parallelize(work, nworkers)
     for i in range(per):
         var v = 0.0
-        for w2 in range(nworkers):
-            v += pacc[unsafe_offset=w2 * per + i]
+        for c in range(nchunk):
+            v += pacc[unsafe_offset=c * per + i]
         de[unsafe_offset=i] = v
     _ = accl^
     _ = counter^
@@ -1921,7 +1938,7 @@ def hess_df3c_core(
     var nthreads = max(1, parallelism_level())
     var nwork = 2 * nthreads
     var per = natm * natm * 9
-    var accl = List[Float64](length=nthreads * per + 1, fill=0.0)
+    var accl = List[Float64](length=NCHUNK * per + 1, fill=0.0)    # per chunk of tasks, over all blocks
     var pacc = list_ptr(accl)
     var mp = m * (m + 1) // 2
     var wsz = n2 + m * nao + m * m
@@ -1964,7 +1981,7 @@ def hess_df3c_core(
                                 xm[unsafe_offset=j * m + i] = v
                             k += i + 1
                         try:
-                            blas_seq.gemm(False, False, nao, m, m, 1.0, cn, xm, 0.0, t)
+                            blas_seq.gemm_small(False, False, nao, m, m, 1.0, cn, xm, 0.0, t)
                             blas_seq.syr2k_lower(nao, m, -0.5 * kfac, t, cn, 0.0 if st == 0 else 1.0, f)
                         except:
                             pass
@@ -1981,44 +1998,48 @@ def hess_df3c_core(
         blas_seq.serial_end(nthr)
         counter.store(0)
         var ntask = s1 - s0
+        var nchunk = max(1, min(ntask, NCHUNK))
 
-        def work(w: Int) {imm basis, imm aux, imm boys, imm ht, imm tab3, imm atab, imm pq2, imm pqa, imm pacc, imm pcount, imm npairs, imm per, imm s0, imm ntask, imm p0, imm npair, imm gam, imm tol, imm natm}:
+        def work(w: Int) {imm basis, imm aux, imm boys, imm ht, imm tab3, imm atab, imm pq2, imm pqa, imm pacc, imm pcount, imm npairs, imm per, imm s0, imm ntask, imm p0, imm npair, imm gam, imm tol, imm natm, imm nchunk}:
             var ws = EriWork(tab3.maxcomp, tab3.maxlab, atab.maxcomp, atab.maxlab)
-            var acc = pacc.unsafe_offset(w * per)
             while True:
-                var task = Int(pcount[].fetch_add(1))
-                if task >= ntask:
+                var chunk = Int(pcount[].fetch_add(1))
+                if chunk >= nchunk:
                     break
-                var pshell = s0 + task
-                var qp = pqa[unsafe_offset=pshell]
-                if qp == 0.0:
-                    continue
-                var f0 = aux.ao_loc[pshell] - p0
-                var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
-                var grows = gam.unsafe_offset(f0 * npair)
-                for sp in range(npairs):
-                    var qab = pq2[unsafe_offset=sp] * qp
-                    if qab < tol:
+                # a fixed set of tasks per chunk (every nchunk-th of the cost-ordered list), summed into
+                # the chunk's own accumulator: the result does not depend on which worker takes which chunk
+                var acc = pacc.unsafe_offset(chunk * per)
+                for task in range(chunk, ntask, nchunk):
+                    var pshell = s0 + task
+                    var qp = pqa[unsafe_offset=pshell]
+                    if qp == 0.0:
                         continue
-                    var a = tab3.get(sp, I_A)
-                    var b = tab3.get(sp, I_B)
-                    var i0 = basis.ao_loc[a]
-                    var na = basis.ao_loc[a + 1] - i0
-                    var j0 = basis.ao_loc[b]
-                    var nb = basis.ao_loc[b + 1] - j0
-                    var gmax = 0.0
-                    for fp in range(npf):
-                        var grow = grows.unsafe_offset(fp * npair)
-                        for i in range(na):
-                            for j in range(nb):
-                                var ii = max(i0 + i, j0 + j)
-                                var jj = min(i0 + i, j0 + j)
-                                gmax = max(gmax, abs(grow[unsafe_offset=ii * (ii + 1) // 2 + jj]))
-                    if qab * gmax < tol:
-                        continue
-                    if not eri_quartet(tab3, sp, atab, pshell, ht, boys, ws):
-                        continue
-                    df3c_hess_contract(basis, aux, pshell, tab3, sp, npf, grows, npair, list_ptr(ws.out), natm, acc)
+                    var f0 = aux.ao_loc[pshell] - p0
+                    var npf = aux.ao_loc[pshell + 1] - aux.ao_loc[pshell]
+                    var grows = gam.unsafe_offset(f0 * npair)
+                    for sp in range(npairs):
+                        var qab = pq2[unsafe_offset=sp] * qp
+                        if qab < tol:
+                            continue
+                        var a = tab3.get(sp, I_A)
+                        var b = tab3.get(sp, I_B)
+                        var i0 = basis.ao_loc[a]
+                        var na = basis.ao_loc[a + 1] - i0
+                        var j0 = basis.ao_loc[b]
+                        var nb = basis.ao_loc[b + 1] - j0
+                        var gmax = 0.0
+                        for fp in range(npf):
+                            var grow = grows.unsafe_offset(fp * npair)
+                            for i in range(na):
+                                for j in range(nb):
+                                    var ii = max(i0 + i, j0 + j)
+                                    var jj = min(i0 + i, j0 + j)
+                                    gmax = max(gmax, abs(grow[unsafe_offset=ii * (ii + 1) // 2 + jj]))
+                        if qab * gmax < tol:
+                            continue
+                        if not eri_quartet(tab3, sp, atab, pshell, ht, boys, ws):
+                            continue
+                        df3c_hess_contract(basis, aux, pshell, tab3, sp, npf, grows, npair, list_ptr(ws.out), natm, acc)
             _ = ws^
 
         var nw = min(nthreads, ntask)
@@ -2030,8 +2051,8 @@ def hess_df3c_core(
         s0 = s1
     for i in range(per):
         var v = 0.0
-        for w2 in range(nthreads):
-            v += pacc[unsafe_offset=w2 * per + i]
+        for c in range(NCHUNK):
+            v += pacc[unsafe_offset=c * per + i]
         hess[unsafe_offset=i] = v
     _ = accl^
     _ = fbuf^

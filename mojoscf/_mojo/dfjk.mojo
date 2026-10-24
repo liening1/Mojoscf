@@ -268,7 +268,7 @@ def df_jk_core(
                     if m > 0:
                         # U_q (m x nao) = C_s^T (m x nao) . E_q (nao x nao)
                         try:
-                            blas_seq.gemm(
+                            blas_seq.gemm_small(
                                 True, False, m, nao, nao, 1.0, pcorb.unsafe_offset(s * nao * mmax), e, 0.0,
                                 pu.unsafe_offset(s * ustride + (q - q0) * m * nao),
                             )

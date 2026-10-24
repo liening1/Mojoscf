@@ -44,8 +44,8 @@ def df_mo_core(
             unpack_row(cderi.unsafe_offset(q * npair), nao, e)
             try:
                 # U (nl x nao) = C_l^T E_Q, then L_Q = U C_r
-                blas_seq.gemm(True, False, nl, nao, nao, 1.0, cl, e, 0.0, u)
-                blas_seq.gemm(False, False, nl, nr, nao, 1.0, u, cr, 0.0, dst.unsafe_offset(q * nl * nr))
+                blas_seq.gemm_small(True, False, nl, nao, nao, 1.0, cl, e, 0.0, u)
+                blas_seq.gemm_small(False, False, nl, nr, nao, 1.0, u, cr, 0.0, dst.unsafe_offset(q * nl * nr))
             except:
                 pass
             q += nwork
@@ -94,8 +94,8 @@ def casscf_mo_core(
             var l = dst.unsafe_offset(q * n2)
             unpack_row(cderi.unsafe_offset(q * npair), nao, e)
             try:
-                blas_seq.gemm(True, False, nmo, nao, nao, 1.0, mo, e, 0.0, u)
-                blas_seq.gemm(False, False, nmo, nmo, nao, 1.0, u, mo, 0.0, l)
+                blas_seq.gemm_small(True, False, nmo, nao, nao, 1.0, mo, e, 0.0, u)
+                blas_seq.gemm_small(False, False, nmo, nmo, nao, 1.0, u, mo, 0.0, l)
                 if ncore > 0:
                     blas_seq.syrk_upper(nmo, ncore, 1.0, l, 1.0, kacc)
             except:
@@ -167,8 +167,8 @@ def df_sandwich_core(
         var q = c
         while q < nq:
             try:
-                blas_seq.gemm(False, False, m, nvec * k2, k1, 1.0, a.unsafe_offset(q * a_qs), x, 0.0, t)
-                blas_seq.gemm(False, False, m * nvec, p, k2, 1.0, t, b.unsafe_offset(q * b_qs), 1.0, acc)
+                blas_seq.gemm_small(False, False, m, nvec * k2, k1, 1.0, a.unsafe_offset(q * a_qs), x, 0.0, t)
+                blas_seq.gemm_small(False, False, m * nvec, p, k2, 1.0, t, b.unsafe_offset(q * b_qs), 1.0, acc)
             except:
                 pass
             q += nwork
@@ -229,12 +229,12 @@ def cphf_k_core(
         while q < nq:
             try:
                 # T (p, n, i) = x (oo|Q) for all vectors, P (n, j, i) = x_n^T (po|Q)
-                blas_seq.gemm(False, False, nmo * nset, nocc, nocc, 1.0, xs, loo.unsafe_offset(q * nocc * nocc), 0.0, t)
-                blas_seq.gemm(False, False, nset * nocc, nocc, nmo, 1.0, xts, lmo.unsafe_offset(q * nmo * nocc), 0.0, p)
+                blas_seq.gemm_small(False, False, nmo * nset, nocc, nocc, 1.0, xs, loo.unsafe_offset(q * nocc * nocc), 0.0, t)
+                blas_seq.gemm_small(False, False, nset * nocc, nocc, nmo, 1.0, xts, lmo.unsafe_offset(q * nmo * nocc), 0.0, p)
                 for j in range(nocc):
                     for n in range(nset):
                         vaxpy(t.unsafe_offset((j * nset + n) * nocc), nocc, 1.0, p.unsafe_offset((n * nocc + j) * nocc))
-                blas_seq.gemm(False, False, nmo, nset * nocc, nmo, 1.0, lfull.unsafe_offset(q * nmo * nmo), t, 1.0, acc)
+                blas_seq.gemm_small(False, False, nmo, nset * nocc, nmo, 1.0, lfull.unsafe_offset(q * nmo * nmo), t, 1.0, acc)
             except:
                 pass
             q += nwork
@@ -503,7 +503,7 @@ def hess_dfk_contract_core(
         while p < nw:
             try:
                 var r = rt.unsafe_offset(p * nat3 * nbo)
-                blas_seq.gemm(False, True, nat3, nat3, nbo, 1.0, r, r, 1.0, acc)
+                blas_seq.gemm_small(False, True, nat3, nat3, nbo, 1.0, r, r, 1.0, acc)
             except:
                 pass
             p += nwork
@@ -601,7 +601,7 @@ def hess_df_ip1_k_core(
 
         def work_mk(p: Int) {imm blas_seq, imm nao, imm p0, imm nocc, imm co, imm ck, imm mk}:
             try:
-                blas_seq.gemm(False, False, nao, nocc, nocc, 1.0, co, ck.unsafe_offset((p0 + p) * nocc * nocc), 0.0,
+                blas_seq.gemm_small(False, False, nao, nocc, nocc, 1.0, co, ck.unsafe_offset((p0 + p) * nocc * nocc), 0.0,
                               mk.unsafe_offset(p * nao * nocc))
             except:
                 pass
