@@ -25,7 +25,7 @@ from std.math import sqrt, floor, exp
 from std.memory import Pointer, bitcast
 from std.runtime import parallelism_level
 from max.algorithm import parallelize
-from _mojo.linalg import F64Ptr, Blas, list_ptr, vfill, vcopy, vaxpy
+from _mojo.linalg import F64Ptr, Blas, list_ptr, vfill, vcopy, vaxpy, transpose
 from _mojo.integrals import Basis, ncart, W, aligned_addr
 
 comptime BLK = 128              # grid points per block
@@ -1395,6 +1395,92 @@ def xc_grad_dm_core(
     _ = rcut^
 
 
+def _rho1_factors(kind: Int, nrow: Int, rank: Int, rk: Int, abuf: F64Ptr, bbuf: F64Ptr, ao: F64Ptr, cs: Int,
+                  x: F64Ptr, r1: F64Ptr):
+    """First-order density of one set on a block from its factors, A_c = L^T d_c phi and B_c = R^T d_c phi
+    ([c][rank][BLK], c = 0..3): rho = sum_k A_0k B_0k and d_c rho = sum_k (A_ck B_0k + A_0k B_ck), where
+    for GGA (``kind`` 1, A_0 only) sum_k A_ck B_0k = sum_i d_c phi_i X_i with X = L B_0 (nrow x BLK), and
+    meta-GGA (all four A_c) adds tau = 1/2 sum_c sum_k A_ck B_ck.  r1: [component][BLK].  The sums run
+    row by row (contiguous runs of BLK) into r1, which stays in L1."""
+    var cb = rk * BLK
+    var nc = 5 if kind == 2 else 4
+    vfill(r1, nc * BLK, 0.0)
+    for k in range(rank):
+        var a0r = abuf.unsafe_offset(k * BLK)
+        var b0r = bbuf.unsafe_offset(k * BLK)
+        for v in range(NV):
+            var o = v * W
+            var a0 = a0r.unsafe_load[width=W](o)
+            var b0 = b0r.unsafe_load[width=W](o)
+            var b1 = b0r.unsafe_load[width=W](cb + o)
+            var b2 = b0r.unsafe_load[width=W](2 * cb + o)
+            var b3 = b0r.unsafe_load[width=W](3 * cb + o)
+            var t0 = r1.unsafe_load[width=W](o) + a0 * b0
+            var t1 = r1.unsafe_load[width=W](BLK + o) + a0 * b1
+            var t2 = r1.unsafe_load[width=W](2 * BLK + o) + a0 * b2
+            var t3 = r1.unsafe_load[width=W](3 * BLK + o) + a0 * b3
+            if kind == 2:
+                var a1 = a0r.unsafe_load[width=W](cb + o)
+                var a2 = a0r.unsafe_load[width=W](2 * cb + o)
+                var a3 = a0r.unsafe_load[width=W](3 * cb + o)
+                t1 += a1 * b0
+                t2 += a2 * b0
+                t3 += a3 * b0
+                r1.unsafe_store(4 * BLK + o, r1.unsafe_load[width=W](4 * BLK + o) + a1 * b1 + a2 * b2 + a3 * b3)
+            r1.unsafe_store(o, t0)
+            r1.unsafe_store(BLK + o, t1)
+            r1.unsafe_store(2 * BLK + o, t2)
+            r1.unsafe_store(3 * BLK + o, t3)
+    if kind == 1:
+        for i in range(nrow):
+            var xr = x.unsafe_offset(i * BLK)
+            var pr = ao.unsafe_offset(i * BLK)
+            for v in range(NV):
+                var o = v * W
+                var xv = xr.unsafe_load[width=W](o)
+                r1.unsafe_store(BLK + o, r1.unsafe_load[width=W](BLK + o) + pr.unsafe_load[width=W](cs + o) * xv)
+                r1.unsafe_store(2 * BLK + o, r1.unsafe_load[width=W](2 * BLK + o) + pr.unsafe_load[width=W](2 * cs + o) * xv)
+                r1.unsafe_store(3 * BLK + o, r1.unsafe_load[width=W](3 * BLK + o) + pr.unsafe_load[width=W](3 * cs + o) * xv)
+    if kind == 2:
+        for v in range(NV):
+            r1.unsafe_store(4 * BLK + v * W, r1.unsafe_load[width=W](4 * BLK + v * W) * 0.5)
+
+
+def _ut_rows(kind: Int, rank: Int, rk: Int, wb: F64Ptr, bt: F64Ptr, ut: F64Ptr):
+    """U^T = sum_c w_c B_c^T (BLK x rank; c = 0, or 0..3 for GGA and meta-GGA) from the transposed
+    B_c^T ([c][BLK][rank]) and the response weights wb ([c][BLK])."""
+    var cb = rk * BLK
+    for p in range(BLK):
+        var w0 = wb[unsafe_offset=p]
+        var dst = ut.unsafe_offset(p * rank)
+        var s0 = bt.unsafe_offset(p * rank)
+        if kind == 0:
+            var k = 0
+            while k + W <= rank:
+                dst.unsafe_store(k, s0.unsafe_load[width=W](k) * w0)
+                k += W
+            while k < rank:
+                dst[unsafe_offset=k] = s0[unsafe_offset=k] * w0
+                k += 1
+            continue
+        var w1 = wb[unsafe_offset=BLK + p]
+        var w2 = wb[unsafe_offset=2 * BLK + p]
+        var w3 = wb[unsafe_offset=3 * BLK + p]
+        var s1 = s0.unsafe_offset(cb)
+        var s2 = s0.unsafe_offset(2 * cb)
+        var s3 = s0.unsafe_offset(3 * cb)
+        var k = 0
+        while k + W <= rank:
+            var t = s0.unsafe_load[width=W](k) * w0 + s1.unsafe_load[width=W](k) * w1
+            t += s2.unsafe_load[width=W](k) * w2 + s3.unsafe_load[width=W](k) * w3
+            dst.unsafe_store(k, t)
+            k += W
+        while k < rank:
+            dst[unsafe_offset=k] = (s0[unsafe_offset=k] * w0 + s1[unsafe_offset=k] * w1
+                                    + s2[unsafe_offset=k] * w2 + s3[unsafe_offset=k] * w3)
+            k += 1
+
+
 def xc_fxc_core(
     blas: Blas,
     basis: Basis,
@@ -1419,31 +1505,37 @@ def xc_fxc_core(
     dms[a][s] (nspin x nset x nao x nao).  With ``rank`` > 0 the same density
     is also the symmetric part of L_{a,s} R_a^T (lfac: nspin x nset x nao x
     rank, rfac: nspin x nao x rank; transition densities C_v z^T C_o^T), and
-    blocks where that is cheaper use the factors: with A = L_sub^T phi and
-    B = R_sub^T phi (shared by all sets), rho = sum_k A_k B_k (LDA), or
-    Y = D phi = (L_sub B + R_sub A) / 2 (GGA; three GEMMs of rank x nrow
-    instead of one of nrow x nrow) and tau = 1/2 sum_c sum_k (L^T d_c phi)_k
-    (R^T d_c phi)_k (meta-GGA).  On each block the response weights are
-    w_(b,y) = weight sum_(a,x) fxc[(a,x)][(b,y)] rho1_(a,x) (fxc:
-    (nspin nvar) x (nspin nvar) x ngrid, pyscf's layout), with w_0 halved and
-    w_tau quartered as for the potential, and vmat_out[b][s] += phi Z^T (and the
-    tau term) as in ``xc_vmat_core``: not symmetrised, overwritten.  The
-    basis functions are evaluated once per block for both halves.
+    blocks where that is cheaper use the factors (with ``project`` every
+    block, except for GGA with fewer than three sets: dms is then not read and
+    may be empty).  With A_c = L_sub^T d_c phi and B_c = R_sub^T d_c phi
+    (shared by all sets), rho = sum_k A_0k B_0k, d_c rho = sum_k (A_ck B_0k +
+    A_0k B_ck) and tau = 1/2 sum_c sum_k A_ck B_ck (``_rho1_factors``).  GGA
+    forms sum_k A_ck B_0k = sum_i d_c phi_i X_i from X = L_sub B_0, two GEMMs
+    of rank x nrow per set; meta-GGA the four A_c, in place of the four GEMMs
+    of nrow x nrow of the dense densities.  GGA with fewer than three sets,
+    which do not pay for B_1..B_3, takes Y = D phi = (L_sub B_0 + R_sub A_0) / 2
+    instead (three GEMMs).  On each block the response weights are w_(b,y) =
+    weight sum_(a,x) fxc[(a,x)][(b,y)] rho1_(a,x) (fxc: (nspin nvar) x
+    (nspin nvar) x ngrid, pyscf's layout), with w_0 halved and w_tau quartered
+    as for the potential, and vmat_out[b][s] += phi Z^T (and the tau term) as
+    in ``xc_vmat_core``: not symmetrised, overwritten.  The basis functions are
+    evaluated once per block for both halves.
 
     With ``project`` (``rank`` > 0) only V_{b,s} R_b is formed, V the
     symmetrised matrix: vmat_out is (nspin x nset x nao x rank) and on a
-    block (V + V^T)_sub R_sub = phi U^T + Z B_0^T (+ 2 sum_c (w_tau d_c phi)
-    B_c^T) with U = sum_c w_c B_c and B_c = R_sub^T d_c phi shared by all
-    sets: two GEMMs of nrow x rank instead of one of nrow x nrow, and the
-    per-thread sums are nao x rank.  The linear-response operators need no
-    more (C_v^T V C_o).  For GGA with fewer than three sets (the one vector
-    per call of second-order SCF) U = R_sub^T Z is formed per set instead,
-    one GEMM in place of the three of B_1..B_3.
+    block (V + V^T)_sub R_sub = phi U + Z B_0^T (+ 2 sum_c (w_tau d_c phi)
+    B_c^T) with U = sum_c w_c B_c^T: two GEMMs of nrow x rank instead of one
+    of nrow x nrow, and the per-thread sums are nao x rank.  The B_c^T are
+    kept as BLK x rank copies so that both products are row-major A B, about
+    1.6x the rate of A B^T in OpenBLAS for these shapes.  The linear-response
+    operators need no more (C_v^T V C_o).  For GGA with fewer than three sets
+    (the one vector per call of second-order SCF) U = Z^T R_sub is formed per
+    set instead, one GEMM in place of the three of B_1..B_3.
     """
     var nderiv = 0 if kind == 0 else 1
     var nvar = _nrho(kind)
     var nv2 = nspin * nvar
-    var nb = 4 if kind == 2 else 1             # components of B (and A) kept per spin
+    var na = 4 if kind == 2 else 1             # components A_c = L^T d_c phi formed per set
     var grid = Grid(ngrid, coords)
     var rcut = _rcuts(basis, nderiv)
     var nao = basis.nao
@@ -1452,35 +1544,37 @@ def xc_fxc_core(
     var nblk = grid.nblk
     var nworkers = max(1, min(parallelism_level(), nblk))
     var total = nspin * nset * (nao * rank if project else n2)
-    # GGA with fewer than three sets: U = R^T Z per set (one GEMM) instead of B_1..B_3 shared by the sets
-    var zproj = project and kind == 1 and nset < 3
-    var nbc = (1 if kind == 0 or zproj else 4) if project else nb     # components of B computed per spin
+    # GGA with fewer than three sets: no B_1..B_3 (densities through Y; projected U = Z^T R per set)
+    var few = kind == 1 and nset < 3
+    var zproj = project and few
+    var nbc = 1 if kind == 0 or few else 4     # components B_c = R^T d_c phi formed per spin
     var accl = List[Float64](length=nworkers * total + 1, fill=0.0)
     var pacc = list_ptr(accl)
     var counter = Atomic[Int64](0)
     var pcount = Pointer(to=counter)
     var rk = max(rank, 1)
 
-    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nvar, imm nv2, imm nb, imm kind, imm nspin, imm nset, imm fxc, imm weights, imm dms, imm rank, imm rk, imm lfac, imm rfac, imm pacc, imm total, imm ngrid, imm project, imm nbc, imm zproj, imm nworkers}:
+    def work(w: Int) {imm blas, imm basis, imm grid, imm rcut, imm pcount, imm nblk, imm nao, imm n2, imm ncomp, imm nderiv, imm nvar, imm nv2, imm na, imm kind, imm nspin, imm nset, imm fxc, imm weights, imm dms, imm rank, imm rk, imm lfac, imm rfac, imm pacc, imm total, imm ngrid, imm project, imm nbc, imm few, imm zproj, imm nworkers}:
         var ws = AOWork(nao, basis.nbas, ncomp, basis.lmax, basis.nctr_max)
         var acc = pacc.unsafe_offset(w * total)
         var n_rsub = nspin * nao * rk
         var n_b = nspin * 4 * rk * BLK
         var n_lsub = nao * rk
-        var n_a = nb * rk * BLK
+        var n_a = na * rk * BLK
         var n_r1 = nv2 * BLK
         var n_u = rk * BLK
         var n_wb = nao * rk
-        var scratch = List[Float64](length=n_rsub + n_b + n_lsub + n_a + 2 * n_r1 + BLK + n_u + n_wb + 10 * W, fill=0.0)
+        var scratch = List[Float64](length=n_rsub + 2 * n_b + n_lsub + n_a + 2 * n_r1 + BLK + n_u + n_wb + 12 * W, fill=0.0)
         var base = F64Ptr(unsafe_from_address=aligned_addr(scratch))
         var rsub = base
-        var bbuf = rsub.unsafe_offset((n_rsub + W - 1) // W * W)
-        var lsub = bbuf.unsafe_offset((n_b + W - 1) // W * W)
+        var bbuf = rsub.unsafe_offset((n_rsub + W - 1) // W * W)    # B_c: [spin][c][rank][BLK]
+        var btbuf = bbuf.unsafe_offset((n_b + W - 1) // W * W)     # B_c^T: [spin][c][BLK][rank] (project)
+        var lsub = btbuf.unsafe_offset((n_b + W - 1) // W * W)
         var abuf = lsub.unsafe_offset((n_lsub + W - 1) // W * W)
         var rho1 = abuf.unsafe_offset((n_a + W - 1) // W * W)
         var wvb = rho1.unsafe_offset(n_r1)
         var tau = wvb.unsafe_offset(n_r1)
-        var ubuf = tau.unsafe_offset(BLK)
+        var ubuf = tau.unsafe_offset(BLK)                           # U: BLK x rank
         var wblk = ubuf.unsafe_offset(n_u)
         var it = 0
         while True:
@@ -1498,24 +1592,26 @@ def xc_fxc_core(
             eval_block(basis, grid, blk, nderiv, sel[0], nrow, ws)
             nrow = prune_rows(nrow, ncomp, ws)
             var cs = nrow * BLK
-            var use_lr = False
-            if rank > 0:
-                if kind == 0:
-                    use_lr = rank * 10 < nrow * 9
-                elif kind == 1:
-                    use_lr = 3 * rank * 10 < nrow * 9
+            # densities from the factors: on every block in project mode (but GGA with fewer than three
+            # sets), elsewhere where their GEMMs (rank rows) are cheaper than the dense ones
+            var use_lr = project and not few
+            if rank > 0 and not use_lr:
+                if kind == 1:
+                    use_lr = (3 if few else 2) * rank * 10 < nrow * 9
                 else:
-                    use_lr = 6 * rank * 10 < 4 * nrow * 9
+                    use_lr = rank * 10 < nrow * 9
             if use_lr or project:
                 for a in range(nspin):
                     var ra = rsub.unsafe_offset(a * nao * rk)
                     gather_rows_to(rfac.unsafe_offset(a * nao * rank), rank, ws, ra)
-                    for c in range(nbc if project else nb):
+                    for c in range(nbc):
+                        var bc = bbuf.unsafe_offset((a * 4 + c) * rk * BLK)
                         try:
-                            blas.gemm(True, False, rank, BLK, nrow, 1.0, ra, ws.ao().unsafe_offset(c * cs), 0.0,
-                                      bbuf.unsafe_offset((a * 4 + c) * rk * BLK))
+                            blas.gemm_small(True, False, rank, BLK, nrow, 1.0, ra, ws.ao().unsafe_offset(c * cs), 0.0, bc)
                         except:
                             pass
+                        if project:
+                            transpose(btbuf.unsafe_offset((a * 4 + c) * rk * BLK), bc, rank, BLK)
             for s in range(nset):
                 # ---- first-order densities of every spin on this block
                 for a in range(nspin):
@@ -1525,28 +1621,36 @@ def xc_fxc_core(
                         var ra = rsub.unsafe_offset(a * nao * rk)
                         var b0 = bbuf.unsafe_offset(a * 4 * rk * BLK)
                         gather_rows_to(lfac.unsafe_offset((a * nset + s) * nao * rank), rank, ws, lsub)
-                        for c in range(nb):
+                        for c in range(na):
                             try:
-                                blas.gemm(True, False, rank, BLK, nrow, 1.0, lsub, ws.ao().unsafe_offset(c * cs), 0.0,
-                                          abuf.unsafe_offset(c * rk * BLK))
+                                blas.gemm_small(True, False, rank, BLK, nrow, 1.0, lsub, ws.ao().unsafe_offset(c * cs), 0.0,
+                                                abuf.unsafe_offset(c * rk * BLK))
                             except:
                                 pass
                         if kind == 0:
-                            for v in range(NV):
-                                var t = F64V(0.0)
-                                for k in range(rank):
-                                    t += abuf.unsafe_load[width=W](k * BLK + v * W) * b0.unsafe_load[width=W](k * BLK + v * W)
-                                r1.unsafe_store(v * W, t)
+                            vfill(r1, BLK, 0.0)
+                            for k in range(rank):
+                                for v in range(NV):
+                                    var o = k * BLK + v * W
+                                    r1.unsafe_store(v * W, r1.unsafe_load[width=W](v * W) + abuf.unsafe_load[width=W](o) * b0.unsafe_load[width=W](o))
+                            continue
+                        if nbc == 4:
+                            if kind == 1:
+                                try:
+                                    blas.gemm_small(False, False, nrow, BLK, rank, 1.0, lsub, b0, 0.0, y)
+                                except:
+                                    pass
+                            _rho1_factors(kind, nrow, rank, rk, abuf, b0, ws.ao(), cs, y, r1)
                             continue
                         try:
-                            blas.gemm(False, False, nrow, BLK, rank, 0.5, lsub, b0, 0.0, y)
-                            blas.gemm(False, False, nrow, BLK, rank, 0.5, ra, abuf, 1.0, y)
+                            blas.gemm_small(False, False, nrow, BLK, rank, 0.5, lsub, b0, 0.0, y)
+                            blas.gemm_small(False, False, nrow, BLK, rank, 0.5, ra, abuf, 1.0, y)
                         except:
                             pass
                     else:
                         gather_block(dms.unsafe_offset((a * nset + s) * n2), nao, nrow, ws)
                         try:
-                            blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ws.ao(), 0.0, y)
+                            blas.gemm_small(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ws.ao(), 0.0, y)
                         except:
                             pass
                     for c in range(ncomp):
@@ -1558,30 +1662,20 @@ def xc_fxc_core(
                                 t += ac.unsafe_load[width=W](i * BLK + v * W) * y.unsafe_load[width=W](i * BLK + v * W)
                             r1.unsafe_store(c * BLK + v * W, t * fac)
                     if kind == 2:
+                        # dense densities (the factors' tau is in _rho1_factors)
                         vfill(tau, BLK, 0.0)
-                        if use_lr:
-                            var b0 = bbuf.unsafe_offset(a * 4 * rk * BLK)
-                            for c in range(1, 4):
-                                var ab = abuf.unsafe_offset(c * rk * BLK)
-                                var bb = b0.unsafe_offset(c * rk * BLK)
-                                for v in range(NV):
-                                    var t = tau.unsafe_load[width=W](v * W)
-                                    for k in range(rank):
-                                        t += ab.unsafe_load[width=W](k * BLK + v * W) * bb.unsafe_load[width=W](k * BLK + v * W)
-                                    tau.unsafe_store(v * W, t)
-                        else:
-                            var yc = ws.y2(nrow)
-                            for c in range(1, 4):
-                                var ac = ws.ao().unsafe_offset(c * cs)
-                                try:
-                                    blas.gemm(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ac, 0.0, yc)
-                                except:
-                                    pass
-                                for v in range(NV):
-                                    var t = tau.unsafe_load[width=W](v * W)
-                                    for i in range(nrow):
-                                        t += ac.unsafe_load[width=W](i * BLK + v * W) * yc.unsafe_load[width=W](i * BLK + v * W)
-                                    tau.unsafe_store(v * W, t)
+                        var yc = ws.y2(nrow)
+                        for c in range(1, 4):
+                            var ac = ws.ao().unsafe_offset(c * cs)
+                            try:
+                                blas.gemm_small(False, False, nrow, BLK, nrow, 1.0, ws.dsub(), ac, 0.0, yc)
+                            except:
+                                pass
+                            for v in range(NV):
+                                var t = tau.unsafe_load[width=W](v * W)
+                                for i in range(nrow):
+                                    t += ac.unsafe_load[width=W](i * BLK + v * W) * yc.unsafe_load[width=W](i * BLK + v * W)
+                                tau.unsafe_store(v * W, t)
                         for v in range(NV):
                             r1.unsafe_store(4 * BLK + v * W, tau.unsafe_load[width=W](v * W) * 0.5)
                 # ---- response weights w_(b,y) = weight sum_(a,x) fxc[(a,x)][(b,y)] rho1_(a,x)
@@ -1602,54 +1696,45 @@ def xc_fxc_core(
                 for b in range(nspin):
                     var wb = wvb.unsafe_offset(b * nvar * BLK)
                     var z = ws.y()
-                    if project and not zproj:
-                        var bb = bbuf.unsafe_offset(b * 4 * rk * BLK)
-                        # U = sum_c w_c B_c (rank x BLK)
-                        for k in range(rank):
+                    # Z = sum_c w_c d_c phi, row by row (contiguous runs of BLK)
+                    if ncomp == 1:
+                        for i in range(nrow):
                             for v in range(NV):
-                                var o = k * BLK + v * W
-                                var t = wb.unsafe_load[width=W](v * W) * bb.unsafe_load[width=W](o)
-                                if kind > 0:
-                                    for c in range(1, 4):
-                                        t += wb.unsafe_load[width=W](c * BLK + v * W) * bb.unsafe_load[width=W](c * rk * BLK + o)
-                                ubuf.unsafe_store(o, t)
-                    for v in range(NV):
-                        var w0 = wb.unsafe_load[width=W](v * W)
-                        if ncomp == 1:
-                            for i in range(nrow):
-                                z.unsafe_store(i * BLK + v * W, ws.ao().unsafe_load[width=W](i * BLK + v * W) * w0)
-                        else:
-                            var w1 = wb.unsafe_load[width=W](BLK + v * W)
-                            var w2 = wb.unsafe_load[width=W](2 * BLK + v * W)
-                            var w3 = wb.unsafe_load[width=W](3 * BLK + v * W)
-                            var ax = ws.ao().unsafe_offset(cs)
-                            var ay = ws.ao().unsafe_offset(2 * cs)
-                            var az = ws.ao().unsafe_offset(3 * cs)
-                            for i in range(nrow):
                                 var o = i * BLK + v * W
-                                var t = ws.ao().unsafe_load[width=W](o) * w0 + ax.unsafe_load[width=W](o) * w1
-                                t += ay.unsafe_load[width=W](o) * w2 + az.unsafe_load[width=W](o) * w3
+                                z.unsafe_store(o, ws.ao().unsafe_load[width=W](o) * wb.unsafe_load[width=W](v * W))
+                    else:
+                        var ax = ws.ao().unsafe_offset(cs)
+                        var ay = ws.ao().unsafe_offset(2 * cs)
+                        var az = ws.ao().unsafe_offset(3 * cs)
+                        for i in range(nrow):
+                            for v in range(NV):
+                                var o = i * BLK + v * W
+                                var t = ws.ao().unsafe_load[width=W](o) * wb.unsafe_load[width=W](v * W)
+                                t += ax.unsafe_load[width=W](o) * wb.unsafe_load[width=W](BLK + v * W)
+                                t += ay.unsafe_load[width=W](o) * wb.unsafe_load[width=W](2 * BLK + v * W)
+                                t += az.unsafe_load[width=W](o) * wb.unsafe_load[width=W](3 * BLK + v * W)
                                 z.unsafe_store(o, t)
                     if project:
-                        # (V + V^T)_sub R_sub = phi U^T + Z B_0^T (+ 2 sum_c (w_tau d_c phi) B_c^T)
-                        var bb = bbuf.unsafe_offset(b * 4 * rk * BLK)
+                        # (V + V^T)_sub R_sub = phi U + Z B_0^T (+ 2 sum_c (w_tau d_c phi) B_c^T), U = sum_c w_c B_c^T
+                        var bt = btbuf.unsafe_offset(b * 4 * rk * BLK)
                         try:
                             if zproj:
-                                blas.gemm(True, False, rank, BLK, nrow, 1.0, rsub.unsafe_offset(b * nao * rk), z, 0.0, ubuf)
-                            blas.gemm(False, True, nrow, rank, BLK, 1.0, ws.ao(), ubuf, 0.0, wblk)
-                            blas.gemm(False, True, nrow, rank, BLK, 1.0, z, bb, 1.0, wblk)
+                                blas.gemm_small(True, False, BLK, rank, nrow, 1.0, z, rsub.unsafe_offset(b * nao * rk), 0.0, ubuf)
+                            else:
+                                _ut_rows(kind, rank, rk, wb, bt, ubuf)
+                            blas.gemm_small(False, False, nrow, rank, BLK, 1.0, ws.ao(), ubuf, 0.0, wblk)
+                            blas.gemm_small(False, False, nrow, rank, BLK, 1.0, z, bt, 1.0, wblk)
                         except:
                             pass
                         if kind == 2:
                             for c in range(1, 4):
                                 var ac = ws.ao().unsafe_offset(c * cs)
-                                for v in range(NV):
-                                    var w4 = wb.unsafe_load[width=W](4 * BLK + v * W)
-                                    for i in range(nrow):
+                                for i in range(nrow):
+                                    for v in range(NV):
                                         var o = i * BLK + v * W
-                                        z.unsafe_store(o, ac.unsafe_load[width=W](o) * w4)
+                                        z.unsafe_store(o, ac.unsafe_load[width=W](o) * wb.unsafe_load[width=W](4 * BLK + v * W))
                                 try:
-                                    blas.gemm(False, True, nrow, rank, BLK, 2.0, z, bb.unsafe_offset(c * rk * BLK), 1.0, wblk)
+                                    blas.gemm_small(False, False, nrow, rank, BLK, 2.0, z, bt.unsafe_offset(c * rk * BLK), 1.0, wblk)
                                 except:
                                     pass
                         var dst = acc.unsafe_offset((b * nset + s) * nao * rank)

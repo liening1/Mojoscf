@@ -588,8 +588,10 @@ def fxc_matrices(mol, grids, kind, fxc, dms=None, factors=None, project=False):
     then forms them from the factors on the blocks where that is cheaper.
     With ``project`` (factors required) only ``V R`` is formed, shape
     (nspin, nset, nao, max r_a) (columns past r_a zero): all a
-    linear-response operator needs, at a fraction of the cost.  The sets are
-    processed in chunks that keep the per-thread sums within about 512 MB.
+    linear-response operator needs, at a fraction of the cost; the densities
+    then come from the factors on every block, so the dense ones are not built
+    (except for GGA with fewer than three sets).  The sets are processed in
+    chunks that keep the per-thread sums within about 512 MB.
     """
     import os
 
@@ -620,14 +622,19 @@ def fxc_matrices(mol, grids, kind, fxc, dms=None, factors=None, project=False):
         if factors is not None:
             lfac = np.zeros((nspin, n, nao, rank))
             rfac = np.zeros((nspin, nao, rank))
-            d = np.empty((nspin, n, nao, nao))
+            # projected, the kernel forms every block's densities from the factors (GGA with fewer than
+            # three sets excepted)
+            dense = not project or (kind == 1 and n < 3)
+            d = np.empty((nspin, n, nao, nao) if dense else (nspin, n, 0, 0))
             for a, (lf, rf) in enumerate(factors):
                 r = rf.shape[1]
                 lfac[a, :, :, :r] = lf[s0:s1]
                 rfac[a, :, :r] = rf
-                d[a] = lf[s0:s1] @ rf.T
-            d += d.transpose(0, 1, 3, 2)
-            d *= 0.5
+                if dense:
+                    d[a] = lf[s0:s1] @ rf.T
+            if dense:
+                d += d.transpose(0, 1, 3, 2)
+                d *= 0.5
         else:
             d = 0.5 * (dms[:, s0:s1] + dms[:, s0:s1].transpose(0, 1, 3, 2))
             lfac = np.zeros((nspin, n, nao, 0))

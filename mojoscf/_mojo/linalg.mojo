@@ -428,6 +428,7 @@ struct Blas(Movable):
     var path: String
     var ilp64: Bool
     var suffix: String          # "_" (LP64) or "_64_" (ILP64)
+    var small_mnk: Int          # products of up to this many multiply-adds have unpacked kernels (0: none)
 
     def __init__(out self, path: String, prefix: String, verify: Bool = False):
         self.path = path
@@ -435,6 +436,7 @@ struct Blas(Movable):
         self.handle = None
         self.ilp64 = False
         self.suffix = "_"
+        self.small_mnk = 0
         if path.byte_length() > 0:
             try:
                 var h = OwnedDLHandle(path)
@@ -450,6 +452,52 @@ struct Blas(Movable):
                     self.handle = h^
             except:
                 pass
+        if self.handle:
+            self.small_mnk = self._small_kernels()
+
+    def _small_kernels(self) -> Int:
+        """1e6 for an OpenBLAS from 0.3.17 on a SkylakeX-family core (SkylakeX, Cooperlake,
+        SapphireRapids, which AVX-512 AMD cores also use), else 0.  Those multiply products of up to
+        1e6 multiply-adds in small-matrix kernels without packing (column-major NN, NT and TT; TN only
+        for tiny C): here 75-85 GFlop/s per thread for the per-block GEMMs of the grid kernels, against
+        50-60 for the same shapes through the blocked path."""
+        try:
+            var cfg = self._cstr_of(self._thread_sym("openblas_get_config"))
+            var core = self._cstr_of(self._thread_sym("openblas_get_corename")).lower()
+            if core != "skylakex" and core != "cooperlake" and core != "sapphirerapids":
+                return 0
+            # "OpenBLAS 0.3.31 ...": small-matrix kernels from 0.3.17
+            var words = cfg.split(" ")
+            if len(words) < 2 or String(words[0]) != "OpenBLAS":
+                return 0
+            var ver = String(words[1]).split(".")
+            if len(ver) < 3:
+                return 0
+            var major = atol(String(ver[0]))
+            var minor = atol(String(ver[1]))
+            var patch = atol(String(ver[2]))
+            if major > 0 or minor > 3 or (minor == 3 and patch >= 17):
+                return 1000000
+        except:
+            pass
+        return 0
+
+    def _cstr_of(self, name: String) raises -> String:
+        """The C string returned by the library's function ``name()`` (empty without the symbol)."""
+        var out = String()
+        if not self.handle.value().check_symbol(name):
+            return out
+        var f = self.handle.value().get_function[Int](name)
+        var addr = f()
+        if addr == 0:
+            return out
+        var p = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
+        for i in range(256):
+            var ch = p[unsafe_offset=i]
+            if ch == 0:
+                break
+            out += chr(Int(ch))
+        return out
 
     def sym(self, name: String) -> String:
         """Symbol of the Fortran routine ``name`` (e.g. "dgemm") in this library."""
@@ -601,6 +649,56 @@ struct Blas(Movable):
             anyptr(tb), anyptr(ta), anyptr(nn), anyptr(mm), anyptr(kk),
             anyptr(al), b, anyptr(lb), a, anyptr(la), anyptr(be), c, anyptr(lc),
         )
+
+    def gemm_small(
+        self,
+        transa: Bool,
+        transb: Bool,
+        m: Int,
+        n: Int,
+        k: Int,
+        alpha: Float64,
+        a: F64Ptr,
+        b: F64Ptr,
+        beta: Float64,
+        c: F64Ptr,
+    ) raises:
+        """``gemm`` for the per-block products of worker threads.  With a library that has small-matrix
+        kernels (``small_mnk``) a larger product is issued in pieces within that size: blocks of rows of
+        C, or of K when op(A) is stored transposed and K is the longer side.  Row-major A B^T (whose
+        column-major form those kernels do not take) and shapes that would need very thin pieces are
+        issued whole."""
+        var lim = self.small_mnk
+        if lim == 0 or m * n * k <= lim or (transb and not transa):
+            self.gemm(transa, transb, m, n, k, alpha, a, b, beta, c)
+            return
+        var lda = m if transa else k
+        var ldb = k if transb else n
+        if transa and k > m:
+            var kmax = lim // (m * n)
+            if kmax >= 16:
+                var npc = (k + kmax - 1) // kmax
+                var kb = (k + npc - 1) // npc
+                var k0 = 0
+                while k0 < k:
+                    var kk = min(kb, k - k0)
+                    var bp = b.unsafe_offset(k0 if transb else k0 * n)
+                    self.gemm_ld(transa, transb, m, n, kk, alpha, a.unsafe_offset(k0 * m), lda, bp, ldb,
+                                 beta if k0 == 0 else 1.0, c, n)
+                    k0 += kk
+                return
+        var mmax = lim // (n * k)
+        if mmax < 8:
+            self.gemm(transa, transb, m, n, k, alpha, a, b, beta, c)
+            return
+        var npc = (m + mmax - 1) // mmax
+        var mb = (m + npc - 1) // npc
+        var i0 = 0
+        while i0 < m:
+            var mm = min(mb, m - i0)
+            var ap = a.unsafe_offset(i0 if transa else i0 * k)
+            self.gemm_ld(transa, transb, mm, n, k, alpha, ap, lda, b, ldb, beta, c.unsafe_offset(i0 * n), n)
+            i0 += mm
 
     def syrk_upper(self, n: Int, k: Int, alpha: Float64, a: F64Ptr, beta: Float64, c: F64Ptr) raises:
         """Symmetric rank-k update C (n x n) = alpha * A^T A + beta * C, A (k x n) row-major.

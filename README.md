@@ -821,14 +821,26 @@ initial guesses and analysis and replaces the operator:
   hybrids add the same with the long-range tensor.
 * **XC kernel in one fused pass.**  `xc_fxc_core` evaluates a block's basis
   functions once, forms the response densities from the factors `C_v z^T`
-  and `C_o` (three GEMMs of nocc x nrow instead of one of nrow x nrow),
-  contracts them with the kernel on the spot and returns `V C_o` rather
-  than V: `phi U^T + Z B^T` with `B = C_o^T phi` shared by all vectors, so
-  the nrow x nrow GEMM and the nao x nao matrices disappear.  For
-  ferrocene/def2-SVP a trial vector costs 0.30 s, against 0.44 s with
-  separate density and potential passes.  `cache_xc_kernel`, `nr_rks_fxc`,
-  `nr_rks_fxc_st` and `nr_uks_fxc` of `mojoscf.dft.NumInt` run on the same
-  pass (CPHF, polarisabilities, ...).
+  and `C_o`, contracts them with the kernel on the spot and returns `V C_o`
+  rather than V.  With `A = (C_v z^T)^T phi` per vector and
+  `B_c = C_o^T d_c phi` shared by all vectors, the density is
+  `sum_k A_k B_0k` and its gradient `sum_i d_c phi_i X_i + sum_k A_k B_ck`
+  with `X = (C_v z^T) B_0`: two GEMMs of nocc x nrow per vector (meta-GGA:
+  the four `A_c`, whose products also give tau) where a dense density needs
+  one of nrow x nrow.  The potential is `phi U + Z B_0^T` with
+  `U = sum_c w_c B_c^T`, two more, so the nrow x nrow GEMMs and the nao x nao
+  matrices disappear.  The `B_c^T` are kept as transposed copies so that
+  every product is row-major `A B`: OpenBLAS runs `A B^T` of these shapes in
+  its blocked path, at 45-55 GFlop/s per thread here, but `A B` of up to 1e6
+  multiply-adds in small-matrix kernels without packing, at 75-85 GFlop/s,
+  and larger per-block products are issued as blocks of rows (or of K)
+  within that size (`Blas.gemm_small`; with OpenBLAS 0.3.17 or later on the
+  SkylakeX-family cores that have those kernels).  For ferrocene/def2-SVP
+  PBE0 a trial vector costs 0.088 s in a batch of 40 (0.32 s alone), against
+  0.157 s (0.37 s) with three density GEMMs per vector and `A B^T`
+  potential products.  `cache_xc_kernel`, `nr_rks_fxc`, `nr_rks_fxc_st` and
+  `nr_uks_fxc` of `mojoscf.dft.NumInt` run on the same pass (CPHF,
+  polarisabilities, ...).
 * **Exact integrals** (pyscf's default, no density fitting) go the same
   way.  ERIs pyscf keeps in core are transformed once to `(ia|jb)`,
   `(ij|ab)` and `(ib|ja)`, each an (ov) x (ov) matrix, after which every
@@ -1224,11 +1236,12 @@ solution the Coulomb/exchange partial Hessian terms agree with pyscf's to
 projected Fock derivatives to 1e-13 and whole Hessians to 1e-8 or better,
 also for a Pd complex with def2 effective core potentials
 (`tests/test_hessian.py`); range-separated functionals to about 1e-9 (their
-long-range metric is numerically singular).  In the ferrocene PBE0 run about 60% of mojoscf's
-time is the XC response in the CPHF iterations, which, like the other XC
-kernels, is bound by the throughput of its per-block GEMMs (stacking the
-response vectors of a block into larger GEMMs made it 18% slower: the
-per-vector GEMMs, rows x 128 points x rows, are already of medium size).
+long-range metric is numerically singular).  In the ferrocene PBE0 run the
+largest part of mojoscf's time is the XC response in the CPHF iterations,
+which, like the other XC kernels, is bound by the throughput of its
+per-block GEMMs.  Stacking the response vectors of a block into larger
+GEMMs makes it slower: products beyond 1e6 multiply-adds leave OpenBLAS's
+small-matrix kernels (XC kernel item of the TDDFT section).
 
 `auxbasis_response < 2`, objects with a `get_jk` of their own and
 short-range operators with omega < 0 run pyscf's code for the
