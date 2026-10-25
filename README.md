@@ -804,6 +804,39 @@ paths); on the same SCF solution pyscf's and mojoscf's gradients agree to
   gradients agree with pyscf to 1e-13 (exact integrals) and 1e-9 (DF, the
   long-range metric).  In the ωB97M-V rows the pair sums are most of
   mojoscf's time.
+* **Grids of large molecules.**  `Grids.build` (once per geometry) cuts the
+  space into atomic cells with Becke's partition: the weight of a point of
+  atom A's grid is vol P_A / sum_B P_B, every cell function P_B a product
+  of smoothed steps s(mu_BC) over all other atoms C.  pyscf's C loop
+  (`VXCgen_grid`) evaluates all natm^2 / 2 atom pairs at every point, 11.8 s
+  of the 1.37 million points of C40H82 (122 atoms).  `mojoscf.dft` replaces
+  `gen_grid.get_partition` with a Mojo kernel.  Below 40 atoms it runs the
+  same pair loop SIMD over the points (Stratmann's scheme included, which
+  pyscf loops over in NumPy).  From 40 atoms only the cell functions that
+  matter at a point are formed, about ten for these molecules: point by
+  point, SIMD over the atoms, the row of steps of an atom C gives P_C in
+  full and, from the same polynomials, one factor of every other cell
+  function, so the running products bound them.  Rows are taken for the
+  owner and then for the atom of the largest bound, until every bound is
+  below 1e-20 times the largest cell function (11 rows per point for
+  C40H82, where the pair loop does the work of 61).  The weights are
+  pyscf's to rounding (<= 8e-15 of the largest weight).  Grouping the
+  points into boxes (`arg_group_grids`) sorts one integer key instead of
+  calling `numpy.unique` on the (n, 3) box indices.
+
+  | `Grids.build`, level 3   | atoms | grid points | pyscf [s] | mojoscf [s] |     x |
+  |--------------------------|------:|------------:|----------:|------------:|------:|
+  | Fe(II) porphine          |    37 |      476568 |      0.89 |        0.30 |  2.9x |
+  | C20H42                   |    62 |      694296 |      2.46 |        0.40 |  6.1x |
+  | C40H82                   |   122 |     1368976 |     12.98 |        1.28 | 10.1x |
+  | (H2O)40                  |   120 |     1347920 |     12.75 |        1.37 |  9.3x |
+
+  The partition alone for C40H82: 11.8 s in pyscf, 2.2 s for the Mojo pair
+  loop, 0.51 s screened.  Of mojoscf's `Grids.build` that is now under half:
+  pyscf's shell screening mask (`make_screen_index`) takes 0.35 s and the
+  grouping 0.33 s.  In a C40H82/6-31G* B3LYP DF calculation the grids are
+  now 1.8 s against 110 s for the SCF, most of it the density-fitted
+  exchange (8.3 s per cycle, about 1.6e12 flops at the rate of `dgemm`).
 * **Thread pools.**  With pyscf's loop around the kernels, NumPy calls
   (DIIS, `make_rdm1`) alternate with Mojo passes, and every threaded OpenBLAS
   call leaves its worker threads spinning for about 0.13 s.  mojoscf now uses
@@ -1936,6 +1969,7 @@ but slow for more than a few dozen orbitals.
 | nuclear gradients (`nuc_grad_method().kernel()`), exact or DF | C (libcint derivative integrals, `libcvhf` J/K, `libao2mo`) + NumPy/SciPy | Mojo derivative integrals and contractions (`_mojo/gradients.mojo`, `int1e_ip_core`); DF metric solves in SciPy; terms assembled as in pyscf |
 | Kohn-Sham XC (`NumInt.nr_rks`/`nr_uks`, LDA/GGA/meta-GGA), with `mojoscf.dft.accelerate` | Python loop over blocks: C AO values, NumPy/C GEMMs, libxc per block | Mojo (`_mojo/numint.mojo`): two passes over the grid (densities; potential matrix) around one libxc call; screened shells per block of 128 points, SIMD AO values, per-block GEMMs; pyscf's grids and libxc |
 | Kohn-Sham gradients (`grad.rks`/`uks`, DF or not) | pyscf `get_vxc` (C AO second derivatives, NumPy contractions) + J/K derivative matrices | Mojo: XC term contracted with the density inside one pass over AO second derivatives; Coulomb/exact-exchange term from `grad2e`/`grad2e_df` |
+| Kohn-Sham grids (`Grids.build`: Becke partition `get_partition`, `arg_group_grids`) and the grid response of the gradients (`grid_response = True`) | C loop over all atom pairs at every point (`VXCgen_grid`; a NumPy loop for Stratmann's scheme), `numpy.unique` on the box indices; for the response per atom's grid the Becke weight derivatives as (natm, natm, 3) NumPy arrays per point and AO second derivatives per block | Mojo (`_mojo/grids.mojo`): from 40 atoms only the cell functions near each point (about ten), SIMD over the atoms, below that the pair loop SIMD over the points; grouping by one sorted integer key; for the response the weight derivatives contracted with the energy density point by point and the orbital terms from the XC gradient kernel |
 | spin-free X2C one-electron gradient term (`x2c.sfx2c1e_grad.hcore_grad_generator`) | NumPy: per atom and coordinate the first-order X2C response in the uncontracted basis (2n x 2n eigenvector response, `X1`, `R1`, `h_FW1`) | NumPy (`mojoscf/x2c.py`): the density taken backwards through that chain once, the effective densities contracted with the derivative integrals of all atoms (nuclear-attraction operator term in one Mojo pass) |
 | VV10 non-local correlation (`numint._vv10nlc` in `nr_nlc_vxc` and the NLC gradient) | C double loop over all ordered pairs of grid points (OpenMP), scalar; densities and potential by the Python block loop | Mojo (`_mojo/nlc.mojo`): SIMD over cached tiles, each unordered pair once (symmetric denominators), one division per four vectors of pairs; densities, potential matrix and gradient contraction from the XC kernels |
 | VV10 terms of the analytical Hessian (`pyscf.hessian.rks`: `_get_enlc_deriv2`, `_get_vnlc_deriv1`, `get_vnlc_resp` in every CPHF iteration) | C double loops over all ordered pairs of NLC grid points, three divisions per pair, the pair terms evaluated again for every six trial densities (`f_t`) or every grid-weight derivative | Mojo (`_mojo/nlc.mojo`, `mojoscf.nlchess`): the symmetric sums once per unordered pair, the trial and weight-derivative sums as GEMMs of tiles of pair coefficients, the grid-response sums per atom; the CPHF response from the XC kernels with the ground-state sums once |
@@ -2088,7 +2122,10 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   without `paaa_only`), the second-order potentials (`get_pdft_feff`:
   L-PDFT and CMS-PDFT gradients) and the weight derivatives of the LKO grid
   partition keep pyscf's code.  `Grids.build` everywhere groups the points
-  with `mojoscf.dft.group_grids` (pyscf's order, without `numpy.unique`).
+  with `mojoscf.dft.group_grids` (pyscf's order, without `numpy.unique`) and
+  takes the Becke partition from `mojoscf.dft.get_partition` (original and
+  Stratmann schemes with or without the Treutler and Becke radii
+  adjustments; LKO and other schemes keep pyscf's code).
 * The native J/K build covers plain `pyscf.df.DF` objects with the tensor in
   core, the in-core 8-fold ERI path (used when `mol.incore_anyway` or pyscf's
   own memory check allows it) and integral-direct J/K otherwise (pyscf's
