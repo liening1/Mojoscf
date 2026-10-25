@@ -451,6 +451,13 @@ def test_partition_matches_pyscf(variant):
     assert abs(w1 - w0).max() < 1e-14 * abs(w0).max()
     cs, ws = mdft.get_partition(mol, tab, *args, concat=False)
     assert len(ws) == mol.natm and abs(np.hstack(ws) - w0).max() < 1e-14 * abs(w0).max()
+    if variant != "lko":
+        # the sweep over all atom pairs and the screened one, point by point, either way round
+        setup = mdft.partition_setup(mol, *args)
+        for screen in (False, True):
+            w = [mdft.becke_response(mol, setup, cs[ia], tab[mol.atom_symbol(ia)][1], ia, screen=screen)[0]
+                 for ia in range(mol.natm)]
+            assert abs(np.hstack(w) - w0).max() < 1e-14 * abs(w0).max(), screen
     grids.build()       # through the patched pyscf function
     ref = dft.gen_grid.Grids(mol)
     ref.__dict__.update(grids.__dict__)
@@ -461,6 +468,29 @@ def test_partition_matches_pyscf(variant):
     finally:
         gen_grid.get_partition = saved
     assert abs(grids.weights - ref.weights).max() < 1e-14 * abs(ref.weights).max()
+
+
+@pytest.mark.parametrize("variant", ["treutler", "stratmann"])
+def test_partition_screened_matches_pyscf(variant):
+    """From 40 atoms the weights come from the screened sweep (a cluster of 14 waters): pyscf's weights."""
+    from pyscf.dft import gen_grid
+
+    atoms = []
+    for i in range(14):
+        x, y, z = 2.9 * (i % 3), 2.9 * (i // 3 % 3), 2.9 * (i // 9)
+        atoms += [("O", (x, y, z)), ("H", (x + 0.76, y + 0.59, z)), ("H", (x - 0.76, y + 0.59, z + 0.1))]
+    mol = gto.M(atom=atoms, basis="sto-3g", verbose=0)
+    assert mol.natm >= 40
+    grids = dft.gen_grid.Grids(mol)
+    grids.level = 0
+    if variant == "stratmann":
+        grids.becke_scheme = gen_grid.stratmann
+    tab = grids.gen_atomic_grids(mol, grids.atom_grid, grids.radi_method, grids.level, grids.prune)
+    args = (grids.radii_adjust, grids.atomic_radii, grids.becke_scheme)
+    c0, w0 = gen_grid.get_partition._mojoscf_orig(mol, tab, *args)
+    c1, w1 = mdft.get_partition(mol, tab, *args)
+    assert np.array_equal(c0, c1)
+    assert abs(w1 - w0).max() < 1e-14 * abs(w0).max()
 
 
 def _water_nlc():

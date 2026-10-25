@@ -993,9 +993,11 @@ def partition_setup(mol, radii_adjust, atomic_radii, becke_scheme):
 
 def get_partition(mol, atom_grids_tab, radii_adjust=None, atomic_radii=None, becke_scheme=None, concat=True):
     """pyscf's ``gen_grid.get_partition`` (the Becke weights of the atomic grids, ``vol P_A / sum_B P_B``) from
-    the Mojo kernel of :func:`becke_response`, SIMD over the points: pyscf's C loop over all atom pairs per point
-    for the original scheme (O(natm^2) per point: 22 s of the grid of C40H82, 122 atoms) and its NumPy loop over
-    the pairs for Stratmann's.  Other schemes and radii adjustments run pyscf's code."""
+    the Mojo kernel of :func:`becke_response`: in place of pyscf's C loop over all atom pairs per point for the
+    original scheme (O(natm^2) per point: 11.8 s of the grid of C40H82, 122 atoms) and its NumPy loop over the
+    pairs for Stratmann's, the same loop SIMD over the points for small molecules, and from 40 atoms the cell
+    functions of the atoms near each point alone, about ten of them (0.5 s for C40H82).  Other schemes and
+    radii adjustments run pyscf's code."""
     from pyscf.dft import gen_grid, radi
 
     if atomic_radii is None:
@@ -1066,19 +1068,22 @@ def becke_setup(grids):
     return np.ascontiguousarray(a), 1, scheme
 
 
-def becke_response(mol, setup, coords, vol, owner, eot=None):
+def becke_response(mol, setup, coords, vol, owner, eot=None, screen=None):
     """Becke weights ``w0`` of the points ``coords`` (quadrature weights ``vol``) of the grid of atom
     ``owner`` and, with the energy density ``eot``, ``de`` (natm, 3) = sum_r eot(r) dw(r)/dR: pyscf's
     ``grids_response_becke`` (``w0``, and its ``w1`` contracted with ``eot``) from the Mojo kernel
-    (``setup`` from :func:`becke_setup`)."""
+    (``setup`` from :func:`becke_setup` or :func:`partition_setup`).  The weights alone come from the sweep
+    over all atom pairs below 40 atoms and from the screened sweep, point by point, from there; ``screen``
+    True or False forces the one or the other."""
     adj, use_adj, scheme = setup
     coords = np.ascontiguousarray(coords, dtype=np.float64)
     vol = np.ascontiguousarray(vol, dtype=np.float64)
     w0 = np.empty(vol.size)
     de = np.zeros((mol.natm, 3))
     e = np.zeros(1) if eot is None else np.ascontiguousarray(eot, dtype=np.float64)
+    mode = 1 if eot is not None else {None: 0, False: 2, True: 3}[screen]
     get_extension().becke_response(np.ascontiguousarray(mol.atom_coords(), dtype=np.float64), adj, int(use_adj),
-                                   int(scheme), coords, vol, int(owner), e, 0 if eot is None else 1, w0, de)
+                                   int(scheme), coords, vol, int(owner), e, mode, w0, de)
     return w0, de
 
 
