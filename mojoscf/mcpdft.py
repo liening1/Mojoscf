@@ -206,29 +206,6 @@ def _grad_ok(ot, mol) -> bool:
     )
 
 
-def _atom_grids(grids):
-    """Per atom: (atom, points, weights, w0, setup) of pyscf's ``grids_response_cc`` with the Becke
-    weights ``w0`` from the Mojo kernel (points grouped by boxes for the kernels' screening), or pyscf's
-    generator (``setup`` None, its weight derivatives ``w1`` in place of the points' quadrature
-    weights) for partitions the kernel does not cover."""
-    from pyscf.grad import rks as rks_grad
-
-    setup = dft.becke_setup(grids)
-    if setup is None:
-        for ia, (coords, w0, w1) in enumerate(rks_grad.grids_response_cc(grids)):
-            yield ia, np.ascontiguousarray(coords, dtype=np.float64), w1, np.asarray(w0, dtype=np.float64), None
-        return
-    mol = grids.mol
-    tab = grids.gen_atomic_grids(mol, grids.atom_grid, grids.radi_method, grids.level, grids.prune)
-    atm = mol.atom_coords()
-    for ia in range(mol.natm):
-        coords, vol = tab[mol.atom_symbol(ia)]
-        coords = coords + atm[ia]
-        idx = dft.group_grids(mol, coords)
-        coords, vol = np.ascontiguousarray(coords[idx]), np.ascontiguousarray(vol[idx])
-        yield ia, coords, vol, dft.becke_response(mol, setup, coords, vol, ia)[0], setup
-
-
 def ontop_grad_terms(ot, mol, mo_occ, occ, ncas, cascm2):
     """The on-top energy's integrand terms of pyscf's ``mcpdft_HellmanFeynman_grad``, each (natm, 3):
     the derivatives of the orbitals in rho and Pi (``de_xc``), of the grid points (``de_grid``) and of
@@ -257,7 +234,7 @@ def ontop_grad_terms(ot, mol, mo_occ, occ, ncas, cascm2):
     no_orbs, no_occs = np.zeros((1, nao, 0)), np.zeros((1, 0))
     de_xc, de_grid, de_wgt = np.zeros((natm, 3)), np.zeros((natm, 3)), np.zeros((natm, 3))
     part, part_pi = np.empty((natm, 3)), np.empty((natm, 3))
-    for ia, coords, vol, w0, setup in _atom_grids(ot.grids):
+    for ia, coords, vol, w0, setup in dft.atom_grids(ot.grids):
         rho2, pi, _ = ontop_densities(mol, coords, kind, mo_core, mo_cas, casdm1s, cascm2, 0)
         rho = rho2[0]
         eot, (vrho, vpi) = ot.eval_ot(rho2, pi, weights=w0)[:2]

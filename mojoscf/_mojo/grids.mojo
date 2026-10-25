@@ -3,7 +3,9 @@
     becke_response_core   for the grid of one atom: the Becke weights
                           w0 = vol P_A / sum_B P_B and, contracted with an
                           energy density e(r), the derivative sum_r e(r) dw(r)/dR
-                          of the weights with respect to every nucleus
+                          of the weights with respect to every nucleus; the
+                          weights alone are pyscf's ``gen_grid.get_partition``
+                          (``mojoscf.dft.get_partition``)
 
 pyscf's ``grad.rks.grids_response_becke`` forms, for every point of an
 atom's grid, the cell functions P_B of all atoms (products of the smoothed
@@ -54,6 +56,21 @@ def _smooth(g: F64V, scheme: Int) -> Tuple[F64V, F64V]:
     t = lo.select(F64V(0.0), t)
     t = hi.select(F64V(0.0), t)
     return (g1, t)
+
+
+@always_inline
+def _smooth0(g: F64V, scheme: Int) -> F64V:
+    """The value of ``_smooth`` alone (the weights without their derivatives)."""
+    if scheme == 0:
+        var p1 = (3.0 - g * g) * g * 0.5
+        var p2 = (3.0 - p1 * p1) * p1 * 0.5
+        return (3.0 - p2 * p2) * p2 * 0.5
+    var a = 0.64
+    var ma = g / a
+    var ma2 = ma * ma
+    var g1 = (1.0 / 16.0) * (ma * (35.0 + ma2 * (-35.0 + ma2 * (21.0 - 5.0 * ma2))))
+    g1 = g.le(F64V(-a)).select(F64V(-1.0), g1)
+    return g.ge(F64V(a)).select(F64V(1.0), g1)
 
 
 def becke_response_core(
@@ -129,9 +146,10 @@ def becke_response_core(
                     var vz = atm[unsafe_offset=3 * a + 2] - z
                     var d = sqrt(vx * vx + vy * vy + vz * vz) + 1e-200
                     dist.unsafe_store(a * W, d)
-                    unit.unsafe_store((3 * a) * W, vx / d)
-                    unit.unsafe_store((3 * a + 1) * W, vy / d)
-                    unit.unsafe_store((3 * a + 2) * W, vz / d)
+                    if mode == 1:
+                        unit.unsafe_store((3 * a) * W, vx / d)
+                        unit.unsafe_store((3 * a + 1) * W, vy / d)
+                        unit.unsafe_store((3 * a + 2) * W, vz / d)
                     cell.unsafe_store(a * W, F64V(1.0))
                 var kp = 0
                 for a in range(natm):
@@ -140,20 +158,24 @@ def becke_response_core(
                         var db = dist.unsafe_load[width=W](b * W)
                         var g = (da - db) * pd[unsafe_offset=4 * kp]
                         var gp = g
-                        var gadj = F64V(1.0)
                         if use_adj == 1:
-                            var aab = adj[unsafe_offset=a * natm + b]
-                            gp = g + aab * (1.0 - g * g)
-                            gadj = 1.0 - 2.0 * aab * g
-                        var st = _smooth(gp, scheme)
-                        var s_ab = 0.5 * (1.0 - st[0] + 1e-200)
-                        var s_ba = 0.5 * (1.0 + st[0] + 1e-200)
-                        cell.unsafe_store(a * W, cell.unsafe_load[width=W](a * W) * s_ab)
-                        cell.unsafe_store(b * W, cell.unsafe_load[width=W](b * W) * s_ba)
+                            gp = g + adj[unsafe_offset=a * natm + b] * (1.0 - g * g)
                         if mode == 1:
+                            var gadj = F64V(1.0)
+                            if use_adj == 1:
+                                gadj = 1.0 - 2.0 * adj[unsafe_offset=a * natm + b] * g
+                            var st = _smooth(gp, scheme)
+                            var s_ab = 0.5 * (1.0 - st[0] + 1e-200)
+                            var s_ba = 0.5 * (1.0 + st[0] + 1e-200)
+                            cell.unsafe_store(a * W, cell.unsafe_load[width=W](a * W) * s_ab)
+                            cell.unsafe_store(b * W, cell.unsafe_load[width=W](b * W) * s_ba)
                             pairs.unsafe_store((3 * kp) * W, s_ab)
                             pairs.unsafe_store((3 * kp + 1) * W, s_ba)
                             pairs.unsafe_store((3 * kp + 2) * W, st[1] * (0.5 * gadj))
+                        else:
+                            var sv = _smooth0(gp, scheme)
+                            cell.unsafe_store(a * W, cell.unsafe_load[width=W](a * W) * (0.5 * (1.0 - sv + 1e-200)))
+                            cell.unsafe_store(b * W, cell.unsafe_load[width=W](b * W) * (0.5 * (1.0 + sv + 1e-200)))
                         kp += 1
                 var tot = F64V(0.0)
                 for a in range(natm):

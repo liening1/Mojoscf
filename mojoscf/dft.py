@@ -671,10 +671,11 @@ def _rho_orbitals(mol, coords, kind, mo_coeffs, mo_occs):
     return _rho(mol, coords, kind, np.ascontiguousarray(np.array(dms)), (po, pn))
 
 
-def _grad_weights(ni, xc_code, rho, weights, spin):
+def _grad_weights(ni, xc_code, rho, weights, spin, exc_out=None):
     """Weighted XC potential on the grid in pyscf's gradient convention (GGA: w_0 halved).
 
-    ``rho`` (nset * (1 + spin), ncomp, ngrid); returns the same shape.
+    ``rho`` (nset * (1 + spin), ncomp, ngrid); returns the same shape.  ``exc_out``, a list, receives
+    libxc's energy per particle of each set.
     """
     xctype = ni._xc_type(xc_code)
     wv = np.empty_like(rho)
@@ -685,8 +686,10 @@ def _grad_weights(ni, xc_code, rho, weights, spin):
             r = (ra[0], rb[0]) if xctype == "LDA" else (ra, rb)
         else:
             r = rho[i, 0] if xctype == "LDA" else rho[i]
-        vxc = np.asarray(ni.eval_xc_eff(xc_code, r, deriv=1, xctype=xctype, spin=spin)[1])
-        vxc = vxc.reshape(1 + spin, -1, weights.size)
+        exc, vxc = ni.eval_xc_eff(xc_code, r, deriv=1, xctype=xctype, spin=spin)[:2]
+        if exc_out is not None:
+            exc_out.append(np.asarray(exc).ravel())
+        vxc = np.asarray(vxc).reshape(1 + spin, -1, weights.size)
         for k in range(1 + spin):
             j = k * nset + i
             wv[j] = weights * vxc[k]
@@ -759,6 +762,78 @@ def grad_xc(ni, mol, grids, xc_code, dms, spin=0):
     de = np.zeros((mol.natm, 3))
     for ia, (p0, p1) in enumerate(mol.aoslice_by_atom()[:, 2:]):
         de[ia] = 2 * np.einsum("sxij,sij->x", vxc[:, :, p0:p1], dm[:, p0:p1])
+    return de
+
+
+def atom_grids(grids):
+    """Per atom: (atom, points, weights, w0, setup) of pyscf's ``grids_response_cc`` with the Becke
+    weights ``w0`` from the Mojo kernel (points grouped by boxes for the kernels' screening), or pyscf's
+    generator (``setup`` None, its weight derivatives ``w1`` in place of the points' quadrature
+    weights) for partitions the kernel does not cover."""
+    from pyscf.grad import rks as rks_grad
+
+    setup = becke_setup(grids)
+    if setup is None:
+        for ia, (coords, w0, w1) in enumerate(rks_grad.grids_response_cc(grids)):
+            yield ia, np.ascontiguousarray(coords, dtype=np.float64), w1, np.asarray(w0, dtype=np.float64), None
+        return
+    mol = grids.mol
+    tab = grids.gen_atomic_grids(mol, grids.atom_grid, grids.radi_method, grids.level, grids.prune)
+    atm = mol.atom_coords()
+    for ia in range(mol.natm):
+        coords, vol = tab[mol.atom_symbol(ia)]
+        coords = coords + atm[ia]
+        idx = group_grids(mol, coords)
+        coords, vol = np.ascontiguousarray(coords[idx]), np.ascontiguousarray(vol[idx])
+        yield ia, coords, vol, becke_response(mol, setup, coords, vol, ia)[0], setup
+
+
+def grid_response_ok(ni, mol, grids, xc_code):
+    """True if :func:`grad_xc_grid_response` covers this functional and grid (LDA, GGA, meta-GGA on
+    :class:`NumInt`; the original or Stratmann partition)."""
+    return (
+        isinstance(ni, NumInt)
+        and _kind(ni, xc_code) is not None
+        and integrals.engine() == "mojo"
+        and supported(mol)
+        and becke_setup(grids) is not None
+    )
+
+
+def grad_xc_grid_response(ni, mol, grids, xc_code, dms, spin=0):
+    """XC term of the nuclear gradient with the response of the grid (``grid_response = True``), (natm, 3).
+
+    pyscf's ``grad.rks``/``uks`` ``get_vxc_full_response`` loops over the
+    atoms' grids (``grids_response_cc``: each grid's points and Becke weights
+    with their derivatives with respect to every nucleus, (natm, 3) per point
+    as NumPy arrays) and adds per grid the derivative matrices of the XC
+    potential (contracted with the density by atom of the basis functions),
+    the motion of the grid's points with their atom (2 tr(V_grid D) on that
+    atom) and sum_r e(r) dw(r)/dR with the energy density e = exc rho.  Here
+    each grid's fixed-point term is the Mojo XC gradient contraction, (natm,
+    3) forces g_A whose sum is minus the motion term (moving the points with
+    all basis functions changes nothing), and the weight term the Becke kernel
+    of :func:`becke_response` contracted with e point by point.
+    """
+    nao = mol.nao_nr()
+    dm = np.ascontiguousarray(np.asarray(dms, dtype=np.float64).reshape(-1, nao, nao))
+    kind = _kind(ni, xc_code)
+    orbitals = _orbitals(dms, dm.shape[0], nao)
+    orbs = orbitals if orbitals is not None else (np.zeros((dm.shape[0], nao, 0)), np.zeros((dm.shape[0], 0)))
+    orbs = (np.ascontiguousarray(orbs[0]), np.ascontiguousarray(orbs[1]))
+    path, prefix = worker_blas()
+    tables = integrals.basis_tables(mol)
+    de = np.zeros((mol.natm, 3))
+    g = np.empty((mol.natm, 3))
+    for ia, coords, vol, w0, setup in atom_grids(grids):
+        rho = _rho(mol, coords, kind, dm, orbitals)
+        exc = []
+        wv = _grad_weights(ni, xc_code, rho, w0, spin, exc)
+        get_extension().xc_grad_dm(tables, coords, int(kind), np.ascontiguousarray(wv), dm, orbs[0], orbs[1], g,
+                                   path, prefix)
+        de += g
+        de[ia] -= g.sum(axis=0)
+        de += becke_response(mol, setup, coords, vol, ia, exc[0] * rho[:, 0].sum(axis=0))[1]
     return de
 
 
@@ -881,6 +956,87 @@ def _install_group_grids():
 
 
 _install_group_grids()
+
+
+def partition_setup(mol, radii_adjust, atomic_radii, becke_scheme):
+    """``(adj, use_adj, scheme)`` of pyscf's ``gen_grid.get_partition`` for these arguments (the radii from the
+    elements' proton numbers, as pyscf's radii adjustments take them), or None when the Mojo kernel does not
+    cover them (LKO and custom schemes, custom radii adjustments)."""
+    from pyscf.data.elements import _std_symbol_without_ghost
+    from pyscf.data.elements import charge as elements_proton
+    from pyscf.dft import gen_grid, radi
+
+    if becke_scheme is gen_grid.original_becke:
+        scheme = 0
+    elif becke_scheme is gen_grid.stratmann:
+        scheme = 1
+    else:
+        return None
+    natm = mol.natm
+    if not callable(radii_adjust) or atomic_radii is None:
+        return np.zeros((natm, natm)), 0, scheme
+    if radii_adjust is radi.treutler_atomic_radii_adjust:
+        root = True
+    elif radii_adjust is radi.becke_atomic_radii_adjust:
+        root = False
+    else:
+        return None
+    charges = [elements_proton(_std_symbol_without_ghost(x)) for x in mol.elements]
+    rad = np.asarray(atomic_radii)[charges]
+    rad = (np.sqrt(rad) if root else rad) + 1e-200
+    rr = rad.reshape(-1, 1) * (1.0 / rad)
+    a = 0.25 * (rr.T - rr)
+    a[a < -0.5] = -0.5
+    a[a > 0.5] = 0.5
+    return np.ascontiguousarray(a), 1, scheme
+
+
+def get_partition(mol, atom_grids_tab, radii_adjust=None, atomic_radii=None, becke_scheme=None, concat=True):
+    """pyscf's ``gen_grid.get_partition`` (the Becke weights of the atomic grids, ``vol P_A / sum_B P_B``) from
+    the Mojo kernel of :func:`becke_response`, SIMD over the points: pyscf's C loop over all atom pairs per point
+    for the original scheme (O(natm^2) per point: 22 s of the grid of C40H82, 122 atoms) and its NumPy loop over
+    the pairs for Stratmann's.  Other schemes and radii adjustments run pyscf's code."""
+    from pyscf.dft import gen_grid, radi
+
+    if atomic_radii is None:
+        atomic_radii = radi.BRAGG_RADII
+    if becke_scheme is None:
+        becke_scheme = gen_grid.original_becke
+    orig = getattr(gen_grid.get_partition, "_mojoscf_orig", None) or gen_grid.get_partition
+    setup = partition_setup(mol, radii_adjust, atomic_radii, becke_scheme)
+    if setup is None or mol.natm == 0:
+        return orig(mol, atom_grids_tab, radii_adjust, atomic_radii, becke_scheme, concat)
+    atm_coords = np.asarray(mol.atom_coords(), order="C")
+    coords_all = []
+    weights_all = []
+    for ia in range(mol.natm):
+        coords, vol = atom_grids_tab[mol.atom_symbol(ia)]
+        coords = coords + atm_coords[ia]
+        coords_all.append(coords)
+        weights_all.append(becke_response(mol, setup, coords, vol, ia)[0])
+    if concat:
+        return np.vstack(coords_all), np.hstack(weights_all)
+    return coords_all, weights_all
+
+
+def _install_partition():
+    """``gen_grid.get_partition`` (``Grids.build``, ``Grids.get_partition``) as :func:`get_partition`."""
+    from pyscf.dft import gen_grid, radi
+
+    orig = gen_grid.get_partition
+    if getattr(orig, "_mojoscf_orig", None) is not None:
+        return
+
+    def patched(mol, atom_grids_tab, radii_adjust=None, atomic_radii=radi.BRAGG_RADII,
+                becke_scheme=gen_grid.original_becke, concat=True):
+        return get_partition(mol, atom_grids_tab, radii_adjust, atomic_radii, becke_scheme, concat)
+
+    patched.__doc__ = orig.__doc__
+    patched._mojoscf_orig = orig
+    gen_grid.get_partition = patched
+
+
+_install_partition()
 
 
 def becke_setup(grids):

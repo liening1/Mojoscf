@@ -221,13 +221,47 @@ def test_ks_gradients(df, xc):
     if xc == "pbe":
         g = mf.nuc_grad_method()
         g.grid_response = True
-        assert not g._direct_2e()
+        assert g._direct_2e()
         g1 = ref.nuc_grad_method()
         g1.grid_response = True
         assert abs(g.kernel() - g1.kernel()).max() < 1e-7
         mf._numint = numint.NumInt()                     # pyscf's XC code inside the Mojo gradient
         g = mf.nuc_grad_method()
         assert g._direct_2e() and abs(g.kernel() - g0).max() < 1e-7
+
+
+@pytest.mark.parametrize(
+    "xc, spin, df, scheme",
+    [("lda,vwn", 0, False, "becke"), ("pbe", 0, True, "becke"), ("pbe", 1, False, "stratmann"),
+     ("tpss", 0, True, "becke"), ("b3lyp", 1, True, "becke")],
+)
+def test_grid_response_gradients(xc, spin, df, scheme):
+    """grid_response=True gradients (the Becke weights' and the points' response) from the Mojo kernels equal
+    pyscf's get_vxc_full_response on the same SCF, on a coarse grid where the response matters."""
+    from pyscf.df.grad import rks as df_rks_grad
+    from pyscf.df.grad import uks as df_uks_grad
+    from pyscf.dft import gen_grid
+    from pyscf.grad import rks as rks_grad
+    from pyscf.grad import uks as uks_grad
+
+    mol = gto.M(atom=WATER, basis="def2-svp", charge=spin, spin=spin, verbose=0)
+    mf = (dft.UKS if spin else dft.RKS)(mol, xc=xc)
+    mf.grids.level = 1
+    if scheme == "stratmann":
+        mf.grids.becke_scheme = gen_grid.stratmann
+    if df:
+        mf = mf.density_fit()
+    mf = mdft.accelerate(mf).run(conv_tol=1e-11)
+    g = mf.nuc_grad_method()
+    g.grid_response = True
+    assert g._direct_2e()
+    module = {(0, False): rks_grad, (1, False): uks_grad, (0, True): df_rks_grad, (1, True): df_uks_grad}[(spin, df)]
+    ref = module.Gradients(mf)
+    ref.grid_response = True
+    gref = ref.kernel()
+    assert abs(g.kernel() - gref).max() < 1e-9
+    fixed = mf.nuc_grad_method().kernel()
+    assert abs(fixed - gref).max() > 1e-6       # the response is not negligible on this grid
 
 
 @pytest.mark.parametrize("df", [True, False])
@@ -382,6 +416,51 @@ def test_becke_response_matches_pyscf(variant):
         assert abs(w - w0).max() < 1e-12 * max(1.0, abs(w0).max())
         ref = np.tensordot(e, w1, axes=(0, 2))
         assert abs(de - ref).max() < 1e-10 * max(1.0, abs(ref).max()), (variant, ia)
+
+
+@pytest.mark.parametrize("variant", ["treutler", "becke-radii", "no-adjust", "stratmann", "ecp-ghost", "lko"])
+def test_partition_matches_pyscf(variant):
+    """Grids.build's Becke partition (gen_grid.get_partition, patched by mojoscf.dft) gives pyscf's weights:
+    radii adjustments, Stratmann's scheme, element radii for ECP and ghost atoms, LKO left to pyscf."""
+    from pyscf.dft import gen_grid, radi
+
+    orig = getattr(gen_grid.get_partition, "_mojoscf_orig", None)
+    assert orig is not None
+    if variant == "ecp-ghost":
+        mol = gto.M(atom="Pt 0 0 0; Cl 0 0 2.3; ghost-H 0 1.9 0.4", basis={"Pt": "def2-svp", "default": "sto-3g"},
+                    ecp={"Pt": "def2-svp"}, charge=-1, verbose=0)
+    else:
+        mol = gto.M(atom="Fe 0 0 0; O 2.1 0 0.1; O 0 2.0 0; H 2.6 0.8 0; H 2.6 -0.8 0.2", basis="sto-3g",
+                    charge=2, verbose=0)
+    grids = dft.gen_grid.Grids(mol)
+    grids.level = 1
+    if variant == "becke-radii":
+        grids.radii_adjust = radi.becke_atomic_radii_adjust
+    elif variant == "no-adjust":
+        grids.radii_adjust = None
+    elif variant == "stratmann":
+        grids.becke_scheme = gen_grid.stratmann
+    elif variant == "lko":
+        grids.becke_scheme = gen_grid.becke_lko
+    tab = grids.gen_atomic_grids(mol, grids.atom_grid, grids.radi_method, grids.level, grids.prune)
+    args = (grids.radii_adjust, grids.atomic_radii, grids.becke_scheme)
+    assert (mdft.partition_setup(mol, *args) is None) == (variant == "lko")
+    c0, w0 = orig(mol, tab, *args)
+    c1, w1 = mdft.get_partition(mol, tab, *args)
+    assert np.array_equal(c0, c1)
+    assert abs(w1 - w0).max() < 1e-14 * abs(w0).max()
+    cs, ws = mdft.get_partition(mol, tab, *args, concat=False)
+    assert len(ws) == mol.natm and abs(np.hstack(ws) - w0).max() < 1e-14 * abs(w0).max()
+    grids.build()       # through the patched pyscf function
+    ref = dft.gen_grid.Grids(mol)
+    ref.__dict__.update(grids.__dict__)
+    ref.coords = ref.weights = None
+    gen_grid.get_partition, saved = orig, gen_grid.get_partition
+    try:
+        ref.build()
+    finally:
+        gen_grid.get_partition = saved
+    assert abs(grids.weights - ref.weights).max() < 1e-14 * abs(ref.weights).max()
 
 
 def _water_nlc():

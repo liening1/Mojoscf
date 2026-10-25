@@ -2024,10 +2024,11 @@ tools/gen_eri_kernel.py  generates the register-blocked ERI kernels (single quar
   covers LDA, GGA and meta-GGA functionals (not those using the laplacian
   of the density) with symmetric real densities, and their response
   kernels, and VV10 non-local correlation (`nlc`) in the SCF and the
-  gradient; the grid response of the gradient (`grid_response = True`)
-  uses pyscf's code (with the Mojo VV10 pair sums), as do
-  short-range-only (`omega < 0`) exchange and DF objects other than pyscf's
-  plain `df.DF` (in memory or on disk).
+  gradient, also with the response of the grid (`grid_response = True`:
+  `dft.grad_xc_grid_response`); with VV10 the grid response keeps pyscf's
+  code (with the Mojo VV10 pair sums), as do short-range-only
+  (`omega < 0`) exchange and DF objects other than pyscf's plain `df.DF`
+  (in memory or on disk).
 * **Excited states**: `mojoscf.tdscf` (what `mf.TDA()`, `mf.TDDFT()` and
   `mf.CasidaTDDFT()` of accelerated objects create) builds the response of
   RHF/UHF/RKS/UKS references with in-core density fitting or exact integrals

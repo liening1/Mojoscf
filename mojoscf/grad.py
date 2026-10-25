@@ -35,10 +35,12 @@ all one-electron pieces do, the two-electron part still from the engine.  With
 pyscf's spin-free X2C the one-electron term is :func:`mojoscf.x2c.hcore_grad_dm`
 (the density taken back through the X2C transformation once instead of
 pyscf's response of it per atom and coordinate; ``hcore_deriv_dm``).
-Range-separated operators and
-functionals, non-local correlation, ``grid_response``, ``only_dfj``,
-``auxbasis_response = False`` and subclasses that override ``get_veff`` or
-``get_jk`` use pyscf's own implementation.
+Kohn-Sham gradients with ``grid_response = True`` take the response of the grid
+(Becke weights and the points moving with their atoms) from
+:func:`mojoscf.dft.grad_xc_grid_response`.  Short-range-only operators
+(omega < 0), ``only_dfj``, ``auxbasis_response = False``, the grid response
+with VV10 or a subclass's ``extra_force``, and subclasses that override
+``get_veff`` or ``get_jk`` use pyscf's own implementation.
 
 >>> mf = mojoscf.RHF(mol).run()                  # or .density_fit().run()
 >>> g = mf.nuc_grad_method().kernel()
@@ -467,9 +469,29 @@ class _MojoKSGradMixin:
     add :func:`mojoscf.dft.grad_nlc` on the NLC grid.  Range-separated
     functionals add the long-range exchange term from the attenuated
     integrals (``grad2e(omega=...)``, with density fitting
-    ``grad2e_df(omega=...)``); short-range-only exchange (omega < 0) and
-    ``grid_response`` keep pyscf's ``get_veff``.
+    ``grad2e_df(omega=...)``).  With ``grid_response`` the XC term is
+    :func:`mojoscf.dft.grad_xc_grid_response` (the response of the Becke
+    weights and of the moving points included) where it applies (no VV10, no
+    ``extra_force`` of a subclass); short-range-only exchange (omega < 0) and
+    the other grid-response cases keep pyscf's ``get_veff``.
     """
+
+    def _grid_response_ok(self):
+        from . import dft
+
+        mf = self.base
+        grids = self.grids if self.grids is not None else mf.grids
+        return (
+            not mf.do_nlc()
+            and type(self).extra_force is self._pyscf_grad.extra_force
+            and dft.grid_response_ok(mf._numint, self.mol, grids, mf.xc)
+        )
+
+    def _extra_force(self, atom_id, envs):
+        # pyscf's Kohn-Sham classes add the grid response here (``vhf.exc1_grid``); grad_2e includes it
+        if self.grid_response and type(self).extra_force is self._pyscf_grad.extra_force:
+            return 0
+        return super()._extra_force(atom_id, envs)
 
     def _hybrid(self):
         """(supported, exact-exchange fraction, long-range fraction, omega) of the functional.
@@ -478,7 +500,7 @@ class _MojoKSGradMixin:
         hyb) K_LR(omega).
         """
         mf = self.base
-        if self.grid_response:
+        if self.grid_response and not self._grid_response_ok():
             return False, 0.0, 0.0, 0.0
         omega, alpha, hyb = mf._numint.rsh_and_hybrid_coeff(mf.xc, spin=self.mol.spin)
         if omega == 0:
@@ -499,7 +521,10 @@ class _MojoKSGradMixin:
         grids, nlcgrids = rks_grad._initialize_grids(self)
         ni = mf._numint
         spin = int(self._unrestricted)
-        de += dft.grad_xc(ni, mol, grids, mf.xc, dm0, spin=spin)
+        if self.grid_response:
+            de += dft.grad_xc_grid_response(ni, mol, grids, mf.xc, dm0, spin=spin)
+        else:
+            de += dft.grad_xc(ni, mol, grids, mf.xc, dm0, spin=spin)
         if mf.do_nlc():
             xc = mf.xc if ni.libxc.is_nlc(mf.xc) else mf.nlc
             de += dft.grad_nlc(ni, mol, nlcgrids, xc, dm0, spin=spin)
