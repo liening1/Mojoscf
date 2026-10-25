@@ -834,9 +834,18 @@ paths); on the same SCF solution pyscf's and mojoscf's gradients agree to
   The partition alone for C40H82: 11.8 s in pyscf, 2.2 s for the Mojo pair
   loop, 0.51 s screened.  Of mojoscf's `Grids.build` that is now under half:
   pyscf's shell screening mask (`make_screen_index`) takes 0.35 s and the
-  grouping 0.33 s.  In a C40H82/6-31G* B3LYP DF calculation the grids are
-  now 1.8 s against 110 s for the SCF, most of it the density-fitted
-  exchange (8.3 s per cycle, about 1.6e12 flops at the rate of `dgemm`).
+  grouping 0.33 s.  In a C40H82/6-31G* B3LYP DF calculation (724 basis
+  and 4686 auxiliary functions) the grids are now 1.8 s against 110 s for
+  the SCF, most of it the density-fitted exchange: 7.8 s per J/K build,
+  about 1.6e12 flops at the rate of `dgemm`, where pyscf's `df_jk.get_jk`
+  takes 26 s (3.3x; the DF tensor itself 46 s against pyscf's 76 s).
+  Exploiting the sparsity of the exchange with localized factors of the
+  density (pivoted Cholesky, blocks of columns with the basis functions they
+  reach) does not pay at this size: the B3LYP density matrix of C20H42
+  still has elements of 3e-3 between atoms 20 Bohr apart and 4e-5 at 40
+  Bohr, the length of the chain, so every block of factor columns reaches
+  all basis functions above 1e-8 and a block-sparse K would do the dense
+  work.
 * **Grid response.**  With `grid_response = True` the XC gradient adds the
   derivative of the grid itself: the points move with their atom and the
   Becke weights depend on every nucleus.  pyscf's `get_vxc_full_response`
