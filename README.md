@@ -60,11 +60,10 @@ iteration then runs without touching Python or pyscf's C code at all.
 * **Excited states** (`mojoscf.tdscf`, `mojoscf.tdgrad`): `mf.TDA()`/`mf.TDDFT()`
   of accelerated objects build the linear response in the occupied-virtual
   space (Coulomb and exchange through MO-basis DF tensors or exact
-  integrals, the XC kernel in one fused pass): 3.3 to 8.6x faster than
+  integrals, the XC kernel in one fused pass): 9.5 to 18x faster than
   pyscf's operators for benzene, ferrocene and Cu(II) complexes, with the
-  same excitation energies (15 to 16x in implicit solvent, PCM and SMD, as
-  re-measured with the current XC response kernel);
-  excited-state gradients 3.9 to 4.5x faster,
+  same excitation energies (15 to 16x in implicit solvent, PCM and SMD);
+  excited-state gradients 4.3 to 7.2x faster,
   the SCF stability analysis on the same operators 8 to 24x, and
   second-order SCF (`mf.newton()`, also ROKS and with solvent models)
   2.6 to 4.5x.
@@ -1065,18 +1064,19 @@ excited state (`td.nuc_grad_method()`, `bench_tddft.py --grad`), on the
 2.1 GHz machine of the SCF tables:
 
 | system                                              | nao | states | TD pyscf [s] | mojoscf [s] | x | gradient pyscf [s] | mojoscf [s] | x | SCF pyscf [s] | mojoscf [s] | max \|dE\| [eV] |
-|-----------------------------------------------------|----:|---:|------:|-----:|-----:|------:|-----:|-----:|------:|-----:|--------:|
-| benzene / def2-SVP B3LYP, TDDFT                     | 114 | 10 |  64.3 |  9.0 | 7.2x |  13.8 |  3.4 | 4.1x |   7.0 |  2.2 | 5.5e-12 |
-| benzene / def2-SVP CAM-B3LYP, TDA                   | 114 | 10 |  53.5 |  6.2 | 8.6x |  22.2 |  5.0 | 4.5x |  11.2 |  3.0 | 3.3e-12 |
-| ferrocene / def2-SVP PBE0, TDA                      | 221 | 10 | 536.4 | 78.7 | 6.8x | 101.9 | 22.6 | 4.5x | 109.5 | 31.0 | 1.0e-04 |
-| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP, TDA (UKS)    | 147 |  8 | 183.3 | 26.2 | 7.0x |  58.5 | 14.9 | 3.9x |  23.4 |  6.5 | 6.5e-12 |
+|-----------------------------------------------------|----:|---:|------:|-----:|------:|------:|-----:|-----:|------:|-----:|--------:|
+| benzene / def2-SVP B3LYP, TDDFT                     | 114 | 10 |  77.2 |  6.8 | 11.3x |  18.0 |  2.7 | 6.7x |   7.5 |  1.4 | 5.7e-12 |
+| benzene / def2-SVP CAM-B3LYP, TDA                   | 114 | 10 |  60.6 |  4.7 | 12.8x |  26.0 |  3.6 | 7.2x |  12.1 |  2.4 | 2.2e-12 |
+| ferrocene / def2-SVP PBE0, TDA                      | 221 | 10 | 613.7 | 63.2 |  9.7x | 126.8 | 21.1 | 6.0x | 121.0 | 27.9 | 9.2e-05 |
+| [Cu(NH3)4]2+ doublet / def2-SVP B3LYP, TDA (UKS)    | 147 |  8 | 214.1 | 22.4 |  9.5x |  61.9 | 14.4 | 4.3x |  26.0 |  5.6 | 6.8e-12 |
 
-The gradients agree with pyscf's to 5e-10 Eh/bohr for benzene and the Cu(II)
-complex.  The first excited state of (eclipsed, D5h) ferrocene is one of a
-degenerate pair (2.32 eV, as are the next ones), so its gradient depends on
-the combination of the pair each Davidson run ends with: the two codes'
-gradients differ by up to 9e-4 Eh/bohr here, while on the same TD solution
-they agree to 1e-11 (`tests/test_tdgrad.py`).
+(re-measured after the changes to the XC kernels).  The gradients agree
+with pyscf's to 2e-10 Eh/bohr for benzene and the Cu(II) complex.  The first
+excited state of (eclipsed, D5h) ferrocene is one of a degenerate pair (2.32
+eV, as are the next ones), so its gradient depends on the combination of the
+pair each Davidson run ends with: the two codes' gradients differ by up to
+2e-4 Eh/bohr here, while on the same TD solution they agree to 1e-11
+(`tests/test_tdgrad.py`).
 
 ### SCF stability analysis
 
