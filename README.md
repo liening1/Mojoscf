@@ -837,6 +837,26 @@ paths); on the same SCF solution pyscf's and mojoscf's gradients agree to
   grouping 0.33 s.  In a C40H82/6-31G* B3LYP DF calculation the grids are
   now 1.8 s against 110 s for the SCF, most of it the density-fitted
   exchange (8.3 s per cycle, about 1.6e12 flops at the rate of `dgemm`).
+* **Grid response.**  With `grid_response = True` the XC gradient adds the
+  derivative of the grid itself: the points move with their atom and the
+  Becke weights depend on every nucleus.  pyscf's `get_vxc_full_response`
+  takes, for each atom's grid, the weights and their derivatives as
+  (natm, natm, 3) NumPy arrays per point (`grids_response_cc`) and the AO
+  second derivatives block by block.  `mojoscf.dft.grad_xc_grid_response`
+  takes each grid's fixed-point term from the XC gradient kernel, the motion
+  of its points from the same per-atom sums (minus their total, on the
+  grid's atom), and the weight term from the Becke kernel, contracted with
+  the energy density point by point.  PBE/def2-SVP (DF), each code on its
+  own SCF:
+
+  | gradient with `grid_response`      | atoms | pyscf [s] | mojoscf [s] |     x | of which grid term pyscf [s] | mojoscf [s] | max \|dg\| [Eh/Bohr] |
+  |------------------------------------|------:|----------:|------------:|------:|-----------------------------:|------------:|----------------------:|
+  | ferrocene                          |    21 |      15.6 |         1.7 |  9.3x |                          6.3 |        0.40 |               4.0e-07 |
+  | Zn(II) porphine                    |    37 |      98.5 |         8.0 | 12.3x |                         53.8 |        2.39 |               4.0e-11 |
+
+  (the grid term is the difference to the same gradient without it; it
+  shifts the gradient by 8e-5 and 9e-5 Eh/Bohr, the same in both codes; the
+  ferrocene SCFs agree to 3e-10 Eh, so their gradients only to 4e-7).
 * **Thread pools.**  With pyscf's loop around the kernels, NumPy calls
   (DIIS, `make_rdm1`) alternate with Mojo passes, and every threaded OpenBLAS
   call leaves its worker threads spinning for about 0.13 s.  mojoscf now uses
